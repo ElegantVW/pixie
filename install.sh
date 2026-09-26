@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/bin" "$HOME/.config/pixie" "$HOME/.local/share/pixie/models" "$HOME/.cache/pixie"
-for f in pixie pixie_mind.py pixie-session pixie-screen menagerie menagerie-run menagerie-registry.py menagerie-tui.py imp ask ask-web llama-server fae_termart.py; do
+for f in pixie pixie_mind.py pixie-session pixie-screen pixie-art menagerie menagerie-run menagerie-registry.py menagerie-tui.py imp ask ask-web llama-server fae_termart.py; do
   cp -f "$ROOT/bin/$f" "$HOME/bin/$f"
   chmod +x "$HOME/bin/$f" 2>/dev/null || true
 done

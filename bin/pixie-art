@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# pixie-art — committed term mascots. No JPGs, no chafa, no downloads.
+# Sources: kit assets (faeOS or pixie repo) first, legacy ~/.local TXT last.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+SEARCH=(
+  "$here/../assets/mascots"
+  "$HOME/pixie/assets/mascots"
+  "$HOME/faeOS/assets/mascots"
+  "$HOME/faeos/assets/mascots"
+)
+LEGACY="$HOME/.local/share/pixie/art"
+
+color_for() {
+  case "$1" in
+    pixie) printf '\033[31m' ;;   # Rose
+    wizard) printf '\033[35m' ;;  # Violet
+    *) printf '\033[95m' ;;       # Lilac
+  esac
+}
+
+find_src() {
+  local n="$1" d
+  for d in "${SEARCH[@]}"; do
+    if [[ -f "$d/$n.txt" ]]; then printf '%s' "$d/$n.txt"; return 0; fi
+  done
+  if [[ -f "$LEGACY/$n.txt" ]]; then printf '%s' "$LEGACY/$n.txt"; return 0; fi
+  return 1
+}
+
+render() {
+  local n="$1" src
+  if src="$(find_src "$n")"; then
+    color_for "$n"; cat "$src"; printf '\033[0m'
+  else
+    echo "(missing art for $n)" >&2; return 1
+  fi
+}
+
+case "${1:-both}" in
+  pixie|wizard) render "$1" ;;
+  both)
+    printf '%s\n' "── pixie ──"; render pixie
+    printf '\n%s\n' "── wizard ──"; render wizard
+    ;;
+  --list)
+    echo "kit mascots: pixie wizard (committed TXT, CP437, house palette)"
+    ;;
+  -h|--help|help)
+    echo "Usage: pixie-art [pixie|wizard|both|--list]"
+    echo "  Committed term art only. No images, no viewer deps."
+    ;;
+  *) echo "Usage: pixie-art [pixie|wizard|both|--list]" >&2; exit 1 ;;
+esac
