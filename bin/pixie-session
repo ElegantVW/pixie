@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Pixie session helpers: last reply, event log, grace period, idle wait lines."""
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+# Import fae_termart for shared color palette
+import sys as _sys
+_sys.path.insert(0, str(Path.home() / "bin"))
+import fae_termart as art  # noqa: E402
+
+from fae_termart import Palette as P, PIXIE_SCREEN
+
+CACHE = Path.home() / ".cache" / "pixie"
+LAST_REPLY = CACHE / "last-reply.txt"
+LAST_EVENT = CACHE / "last-event.txt"
+EVENTS = CACHE / "events.log"
+GRACE = CACHE / "grace_until"
+MAX_EVENTS = 200
+DEFAULT_GRACE = float(os.environ.get("PIXIE_READ_SEC", "45"))
+
+# Idle: Pixie waiting on the human (shown on system tick)
+PIXIE_IDLE = (
+    "Pixie is waiting for you…",
+    "Pixie taps her foot patiently…",
+    "Pixie is humming until you type something…",
+    "Pixie has tea ready when you are…",
+    "Pixie is daydreaming in the prompt…",
+    "Pixie left a sticky note: 'your turn'…",
+    "Pixie is polishing the cursor for you…",
+    "Pixie is watching the prompt sparkle…",
+    "Pixie won't rush you (much)…",
+    "Pixie is practicing patience magic…",
+    "Pixie is counting the seconds kindly…",
+    "Pixie is ready when you are…",
+    "Pixie folded her wings. Your move…",
+    "Pixie is browsing the void. Call her anytime…",
+    "Pixie saved you a seat at the prompt…",
+)
+
+USE_COLOR = art.color_ok()
+
+
+def paint(s: str, *codes: str) -> str:
+    return art.paint(s, *codes)
+
+
+def ensure() -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+
+
+def _screen(argv: list[str]) -> None:
+    """Best-effort call into central pixie-screen policy."""
+    import subprocess
+
+    try:
+        subprocess.run(
+            [str(PIXIE_SCREEN), *argv],
+            check=False,
+            timeout=2,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def set_grace(seconds: float | None = None) -> None:
+    ensure()
+    sec = DEFAULT_GRACE if seconds is None else float(seconds)
+    GRACE.write_text(str(time.time() + sec), encoding="utf-8")
+    _screen(["hold", "grace", str(sec)])
+
+
+def clear_grace() -> None:
+    """End read-grace immediately (user entered a command / empty Enter)."""
+    ensure()
+    try:
+        GRACE.write_text("0", encoding="utf-8")
+    except OSError:
+        pass
+    _screen(["release", "grace"])
+
+
+def in_grace() -> bool:
+    try:
+        until = float(GRACE.read_text(encoding="utf-8").strip())
+        if time.time() < until:
+            return True
+    except (OSError, ValueError):
+        pass
+    # also true if pixie-screen has any grace-like hold
+    try:
+        import subprocess
+
+        r = subprocess.run(
+            [str(PIXIE_SCREEN), "allowed"],
+            check=False,
+            timeout=1,
+            capture_output=True,
+        )
+        # if not allowed, might still be scry/busy — treat grace file as source of truth for "in grace"
+    except Exception:
+        pass
+    return False
+
+
+def grace_left() -> int:
+    try:
+        until = float(GRACE.read_text(encoding="utf-8").strip())
+        return max(0, int(until - time.time()))
+    except (OSError, ValueError):
+        return 0
+
+
+def log_event(kind: str, text: str) -> None:
+    ensure()
+    text = text.rstrip() + "\n"
+    stamp = time.strftime("%H:%M:%S")
+    block = f"===== {stamp} · {kind} =====\n{text}\n"
+    LAST_EVENT.write_text(block, encoding="utf-8")
+    if kind == "reply":
+        LAST_REPLY.write_text(text, encoding="utf-8")
+    try:
+        prev = EVENTS.read_text(encoding="utf-8") if EVENTS.exists() else ""
+    except OSError:
+        prev = ""
+    parts = re.split(r"(?=^===== )", prev, flags=re.M)
+    parts = [p for p in parts if p.strip()]
+    parts.append(block)
+    parts = parts[-MAX_EVENTS:]
+    EVENTS.write_text("".join(parts), encoding="utf-8")
+
+
+def idle_message() -> str:
+    return random.choice(PIXIE_IDLE)
+
+
+def print_idle_box() -> None:
+    msg = idle_message()
+    body = f"☕  {msg}"
+    print(art.box(body, title="Pixie", accent=P.PINK_DIM, body_style=(P.PINK,)))
+
+
+def _box_text(title: str, body: str) -> str:
+    """Simple pink box for re-shown replies."""
+    return art.box(body, title=title, accent=P.PINK_DIM, body_style=(P.SILVER,))
+
+
+def _histfile() -> Path | None:
+    """Locate shell history (zsh / bash)."""
+    for key in ("HISTFILE",):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_file():
+                return p
+    home = Path.home()
+    for name in (".histfile", ".zsh_history", ".bash_history"):
+        p = home / name
+        if p.is_file():
+            return p
+    return None
+
+
+def _parse_history_lines(text: str) -> list[str]:
+    """Return command strings newest-last (chronological)."""
+    cmds: list[str] = []
+    # zsh EXTENDED_HISTORY: `: 1234567890:0;command`
+    ext = re.compile(r"^:\s*\d+:\d+;(.*)$")
+    for line in text.splitlines():
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        m = ext.match(line)
+        if m:
+            cmds.append(m.group(1))
+        elif line.startswith(":"):
+            # malformed ext — skip
+            continue
+        else:
+            cmds.append(line)
+    return cmds
+
+
+def show_shell_history(n: int = 40) -> int:
+    """Box the last N shell commands from HISTFILE."""
+    n = max(1, min(int(n), 200))
+    path = _histfile()
+    if not path:
+        print(paint("(no shell history file found — set HISTFILE)", P.MUTED))
+        return 1
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(paint(f"(cannot read history: {e})", P.MUTED))
+        return 1
+    cmds = _parse_history_lines(raw)
+    # drop the trailing `up` itself if present
+    while cmds and re.match(r"^up(\s|$)", cmds[-1].strip()):
+        cmds.pop()
+    slice_ = cmds[-n:] if cmds else []
+    if not slice_:
+        print(paint("(history empty)", P.MUTED))
+        return 1
+    # number from oldest in slice to newest
+    start = max(1, len(cmds) - len(slice_) + 1)
+    lines = []
+    for i, c in enumerate(slice_):
+        num = start + i
+        # keep one line per command; trim long
+        c1 = c.replace("\t", " ").strip()
+        if len(c1) > 100:
+            c1 = c1[:99] + "…"
+        lines.append(f"{num:>4}  {c1}")
+    body = "\n".join(lines)
+    print(_box_text(f"shell history · last {len(slice_)} · {path.name}", body))
+    print(
+        paint(
+            f"(held {grace_left()}s — tick paused · up message = Pixie · up events = log)",
+            P.PINK_DIM,
+        )
+    )
+    return 0
+
+
+def show_up(arg: str | None) -> int:
+    """Shell history (default), Pixie reply, or event log — with read-grace."""
+    ensure()
+    set_grace()
+
+    a = (arg or "").strip().lower()
+
+    # Default: all shell commands (recent history)
+    if a in ("", "history", "hist", "cmd", "cmds", "commands", "shell"):
+        return show_shell_history(40)
+
+    if a in ("message", "msg", "last", "pixie", "reply"):
+        if LAST_REPLY.exists():
+            body = LAST_REPLY.read_text(encoding="utf-8")
+            print(_box_text("last Pixie reply", body))
+            print(
+                paint(
+                    f"(held {grace_left()}s — tick paused; type to continue)",
+                    P.PINK_DIM,
+                )
+            )
+            return 0
+        print(paint("(no Pixie reply saved yet)", P.MUTED))
+        return 1
+
+    if a in ("events", "event", "log"):
+        if not EVENTS.exists():
+            print(paint("(no event log yet)", P.MUTED))
+            return 1
+        parts = re.split(r"(?=^===== )", EVENTS.read_text(encoding="utf-8"), flags=re.M)
+        parts = [p for p in parts if p.strip()][-15:]
+        print("".join(parts), end="")
+        print(paint(f"\n(held {grace_left()}s — tick paused)", P.PINK_DIM))
+        return 0
+
+    if a.isdigit():
+        return show_shell_history(int(a))
+
+    print("Usage: up [history|N|message|events]", file=sys.stderr)
+    print("  up / up history  — last shell commands (default)", file=sys.stderr)
+    print("  up 30            — last 30 shell commands", file=sys.stderr)
+    print("  up message       — last Pixie reply", file=sys.stderr)
+    print("  up events        — Pixie event log", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="pixie-session")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("idle-box", help="print idle 'waiting for you' box")
+    p = sub.add_parser("grace", help="set read-grace seconds after reply")
+    p.add_argument("seconds", nargs="?", type=float, default=DEFAULT_GRACE)
+    sub.add_parser("grace-left", help="print seconds left in grace")
+    sub.add_parser("in-grace", help="exit 0 if grace active")
+    sub.add_parser(
+        "grace-clear",
+        help="end read-grace now (user pressed Enter / ran a command)",
+    )
+    s = sub.add_parser("save-reply")
+    s.add_argument("file", nargs="?", help="read from file or stdin")
+    u = sub.add_parser("up")
+    u.add_argument("arg", nargs="?", default="message")
+    args = ap.parse_args()
+    if args.cmd == "idle-box":
+        print_idle_box()
+        return 0
+    if args.cmd == "grace":
+        set_grace(args.seconds)
+        return 0
+    if args.cmd == "grace-clear":
+        clear_grace()
+        return 0
+    if args.cmd == "grace-left":
+        print(grace_left())
+        return 0
+    if args.cmd == "in-grace":
+        return 0 if in_grace() else 1
+    if args.cmd == "save-reply":
+        if args.file:
+            text = Path(args.file).read_text(encoding="utf-8")
+        else:
+            text = sys.stdin.read()
+        log_event("reply", text)
+        set_grace()
+        return 0
+    if args.cmd == "up":
+        return show_up(args.arg)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""imp — faeOS terminal art generator.
+
+Draws a themed TUI where you type a wish, and Imp (a local Qwen2.5 Coder on
+port 8082) conjures ANSI art into a pink ✦ box. Imp's Comment — a grumpy
+smollm2 haiku dragon on port 8081 — snarks about it. Every piece is saved
+to ~/pixie_art/ as .txt (+ .pdf, dependency-free) and indexed in a gallery.
+
+Usage:
+  imp                          TUI (type a wish, Enter to conjure)
+  imp "a moonlit mushroom"     one-shot: print art, save to gallery
+  imp "prompt" --style ascii --pdf
+  imp --gallery                list the gallery
+  imp --demo                   render a sample frame (no server needed)
+
+Keys in the TUI:
+  Enter   conjure      a       animate (multi-frame LLM sequence, optional prompt)
+  r       refine ("Make it more …")
+  s       save         g       gallery (fzf)
+  /       history (fzf)         Tab     cycle style
+  c       clear prompt  ↑↓/jk  browse history
+  ←/→     scrub frames (animated)     q/Esc   quit
+
+Env:
+  PIXIE_LLM_URL       http://127.0.0.1:8082   (imp generator)
+  IMP_LLM_MODEL       alias sent to llama-server (default "imp")
+  KUR_LLM_URL         http://127.0.0.1:8081   (comment dragon)
+  PIXIE_MAX_TOKENS    art token budget (default 3072)
+  IMP_TIMEOUT         art generation timeout, seconds (default 240)
+  PIXIE_ART_DIR       save dir (default ~/pixie_art)
+  PIXIE_UNICODE       1  → ✦ rounded boxes (set by default)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zlib
+from datetime import datetime
+from pathlib import Path
+
+# Shared faeOS art library (same pink theme as scry/ether/spellbook)
+sys.path.insert(0, str(Path.home() / "bin"))
+import fae_termart as art  # noqa: E402
+
+from fae_termart import Palette as P, PIXIE_SCREEN  # noqa: E402
+from fae_termart import _char_width as _cw  # noqa: E402
+
+os.environ["PIXIE_UNICODE"] = "1"
+
+# ---------------------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------------------
+
+IMP_URL = os.environ.get("PIXIE_LLM_URL", "http://127.0.0.1:8082").rstrip("/")
+KUR_URL = os.environ.get("KUR_LLM_URL", "http://127.0.0.1:8081").rstrip("/")
+
+
+def llm_url_allowed(url: str) -> bool:
+    """Loopback-only LLM endpoints unless IMP_ALLOW_REMOTE=1."""
+    if os.environ.get("IMP_ALLOW_REMOTE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def require_local_llm(url: str) -> None:
+    if not llm_url_allowed(url):
+        raise RuntimeError(
+            f"imp refuses non-loopback LLM at {url!r} "
+            "(set IMP_ALLOW_REMOTE=1 to allow remote models)"
+        )
+IMP_ALIAS = os.environ.get("IMP_LLM_ALIAS", "imp")
+KUR_ALIAS = os.environ.get("KUR_LLM_ALIAS", "kur")
+MAX_TOKENS = int(os.environ.get("PIXIE_MAX_TOKENS", "3072"))
+GEN_TIMEOUT = float(os.environ.get("IMP_TIMEOUT", "240"))
+COMMENT_TIMEOUT = float(os.environ.get("IMP_COMMENT_TIMEOUT", "15"))
+
+ART_DIR = Path(os.environ.get("PIXIE_ART_DIR", str(Path.home() / "pixie_art")))
+GALLERY_PATH = Path(
+    os.environ.get("PIXIE_IMP_GALLERY", str(Path.home() / ".cache" / "pixie" / "imp" / "gallery.json"))
+)
+
+STYLES = ("unicode", "ansi16", "ansi256", "truecolor", "ascii")
+ANIM_FRAMES = int(os.environ.get("IMP_FRAMES", "8"))
+ACCENT = P.PINK_DIM
+
+MARK = "✦"
+FRAME_DELIM = "--- FRAME {n}/{total} ---"
+
+# Imp's personality lives ONLY outside generation: errors + comments.
+ERR_MESSAGES = (
+    "The inkwell ran dry — no art today.",
+    "The sprite fell asleep at the easel.",
+    "Pixie's wand sputtered. Try again?",
+    "The aether swallowed the request.",
+    "Canvas torn. The muse has fled.",
+    "Imp dropped the brush mid-stroke.",
+    "The stars misaligned for that one.",
+)
+
+COMMENT_SYSTEM = (
+    "You are Imp, a grumpy but endearing terminal art critic. "
+    "Comment on this art in 1 short sentence (max 60 chars). "
+    "Be snarky but cute. No markdown."
+)
+
+ART_SYSTEM = (
+    "You are a terminal art generator. You output ONLY the requested art.\n"
+    "RULES:\n"
+    "- Output pure terminal art using box-drawing characters and ANSI color codes.\n"
+    "- Output ONLY the art. NO markdown fences, NO explanations, NO prose, NO code.\n"
+    "- Every line must be exactly {width} visible columns wide. ANSI codes and\n"
+    "  box-drawing characters do NOT add to the visible width.\n"
+    "- Output exactly {height} lines.\n"
+    "- End every line with the reset sequence ESC[0m. No trailing characters after it.\n"
+    "- Be economical with color: use whole-line or per-segment colors, not one escape\n"
+    "  per character. Keep the whole piece under ~1400 characters.\n"
+    "{style_hint}"
+    "- Scene: {prompt}"
+)
+
+STYLE_HINTS = {
+    "unicode": (
+        "COLORS: use ANSI 256-color foreground codes like ESC[38;5;Nm (N = 0-255), "
+        "bold ESC[1m, reset ESC[0m.\n"
+        "SHAPE: you may use Unicode box-drawing (─│┌┐└┘├┤┬┴┼╭╮╰╯) and stars (✦).\n"
+    ),
+    "ansi16": (
+        "COLORS: use ONLY basic colors ESC[3Xm (30-37) and bright ESC[9Xm (90-97). "
+        "No 38;5; or 38;2; codes.\n"
+    ),
+    "ansi256": (
+        "COLORS: use ANSI 256-color foreground codes ESC[38;5;Nm (N = 0-255), "
+        "bold ESC[1m, reset ESC[0m. No 38;2; codes.\n"
+    ),
+    "truecolor": (
+        "COLORS: use 24-bit color ESC[38;2;R;G;Bm (each 0-255), bold ESC[1m, "
+        "reset ESC[0m. No 38;5; codes.\n"
+    ),
+    "ascii": (
+        "COLORS: none — no ANSI color codes at all.\n"
+        "SHAPE: ASCII characters only (no Unicode). Boxes use +, -, |.\n"
+    ),
+}
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+UA = "imp/1.0 (faeOS terminal art)"
+
+# ---------------------------------------------------------------------------
+# themed error
+# ---------------------------------------------------------------------------
+
+
+class ImpError(Exception):
+    """Generation failure. message = Imp's personality line, technical = real reason."""
+
+    def __init__(self, message: str, technical: str = "") -> None:
+        super().__init__(message if not technical else f"{message} — {technical}")
+        self.message = message
+        self.technical = technical
+
+
+def _err_box(message: str, technical: str = "") -> str:
+    """╭─ ✦ Imp ✦ ─╮ / message / ✦ divider / technical / ╰…╯"""
+    tw = art.term_width()
+    body_w = tw - 4
+    lines: list[str] = []
+    label = f" {MARK} Imp {MARK} "
+    inner = tw - 2
+    fill = max(0, inner - art.vis_len(label) - 1)
+    lines.append(
+        art.paint("╭─", ACCENT)
+        + art.paint(label, P.BOLD, P.PINK)
+        + art.paint("─" * fill + "╮", ACCENT)
+    )
+    paras = (message, technical) if technical else (message,)
+    for i, para in enumerate(paras):
+        if i > 0:
+            lines.append(
+                art.paint("│", ACCENT)
+                + " "
+                + art.paint(art.pad_vis(f"{MARK}", body_w), P.PINK_DIM)
+                + " "
+                + art.paint("│", ACCENT)
+            )
+        for ln in art.wrap_plain(art.strip_ansi(para), body_w):
+            style = P.WARN if para == message else P.MUTED
+            lines.append(
+                art.paint("│", ACCENT)
+                + " "
+                + art.paint(art.pad_vis(ln, body_w), style)
+                + " "
+                + art.paint("│", ACCENT)
+            )
+    lines.append(art.paint("╰" + "─" * inner + "╯", ACCENT))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# ANSI art helpers
+# ---------------------------------------------------------------------------
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+def _sgr_ok(seq: str, style: str) -> bool:
+    """Is this SGR sequence allowed for the given art style?"""
+    body = seq[2:-1]
+    if body in ("", "0"):
+        return True
+    if style == "ascii":
+        return False
+    params: list[int] = []
+    for part in body.split(";"):
+        try:
+            params.append(int(part))
+        except ValueError:
+            return False
+    if style == "ansi16":
+        for x in params:
+            if x in (0, 1, 2, 22):
+                continue
+            if 30 <= x <= 37 or 90 <= x <= 97 or 39 <= x <= 49:
+                continue
+            return False
+        return True
+    if style == "ansi256":
+        for i, x in enumerate(params):
+            if x == 38:
+                if i + 2 < len(params) and params[i + 1] == 5:
+                    continue
+                return False
+            if x not in (0, 1):
+                return False
+        return True
+    if style == "truecolor":
+        for i, x in enumerate(params):
+            if x == 38:
+                if i + 4 < len(params) and params[i + 1] == 2:
+                    continue
+                return False
+            if x not in (0, 1):
+                return False
+        return True
+    return True  # unicode: anything SGR goes
+
+
+_ASCII_MAP = {
+    "─": "-", "━": "-", "┄": "-", "┅": "-", "┈": "-", "┉": "-", "╌": "-", "╍": "-",
+    "│": "|", "┃": "|", "┆": "|", "┇": "|", "┊": "|", "┋": "|", "╎": "|", "╏": "|",
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "├": "+", "┤": "+", "┬": "+", "┴": "+", "┼": "+",
+    "╭": "+", "╮": "+", "╰": "+", "╯": "+",
+    "✦": "*", "✧": "*", "★": "*", "☆": "*", "·": ".", "•": ".", "…": ".", "…": ".",
+}
+
+
+def _ascii_fallback(ch: str) -> str:
+    return _ASCII_MAP.get(ch, " ")
+
+
+def _clean_line(raw: str, style: str, width: int) -> str:
+    """One normalized art line: allowed SGR kept, clipped + padded to width."""
+    out: list[str] = []
+    vis = 0
+    i = 0
+    n = len(raw)
+    truncated = False
+    while i < n:
+        ch = raw[i]
+        if ch == "\x1b":
+            j = raw.find("m", i)
+            if j == -1:
+                truncated = True
+                break
+            seq = raw[i : j + 1]
+            if _SGR_RE.fullmatch(seq) and _sgr_ok(seq, style):
+                out.append(seq)
+            i = j + 1
+            continue
+        if ord(ch) < 32 or ch == "\x7f":
+            i += 1
+            continue
+        w = _cw(ch)
+        if vis + w > width:
+            truncated = True
+            break
+        out.append(_ascii_fallback(ch) if style == "ascii" and ord(ch) > 127 else ch)
+        vis += w
+        i += 1
+    out.append("\x1b[0m")
+    if vis < width:
+        out.append(" " * (width - vis))
+    return "".join(out)
+
+
+def normalize_art(text: str, style: str, width: int, height: int) -> str:
+    """Model text → clean art grid of exactly width×height visible cells."""
+    text = (text or "").replace("\r", "").strip("\n")
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        ln = _clean_line(raw, style, width)
+        if ln.strip() or lines:
+            lines.append(ln)
+    if len(lines) > height:
+        lines = lines[:height]
+    blank = " " * width
+    while len(lines) < height:
+        lines.append(blank)
+    return "\n".join(lines)
+
+
+def line_cells(line: str) -> list[tuple[str, tuple | None]]:
+    """Parse one art line → [(char, rgb|None)], SGR stripped."""
+    cells: list[tuple[str, tuple | None]] = []
+    color: tuple | None = None
+    i = 0
+    while i < len(line):
+        m = _SGR_RE.match(line, i)
+        if m:
+            color = _apply_sgr(color, m.group(1))
+            i = m.end()
+            continue
+        cells.append((line[i], color))
+        i += 1
+    return cells
+
+
+def ansi256_rgb(n: int) -> tuple[float, float, float]:
+    n = max(0, min(255, n))
+    if n < 16:
+        basic = [
+            (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0),
+            (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+            (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+            (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+        ]
+        v = basic[n]
+    elif n < 232:
+        n -= 16
+        cube = (0, 95, 135, 175, 215, 255)
+        v = (cube[n // 36], cube[(n // 6) % 6], cube[n % 6])
+    else:
+        g = 8 + 10 * (n - 232)
+        v = (g, g, g)
+    return (v[0] / 255.0, v[1] / 255.0, v[2] / 255.0)
+
+
+def _apply_sgr(color: tuple | None, body: str) -> tuple | None:
+    if body in ("", "0"):
+        return None
+    params = body.split(";")
+    i = 0
+    while i < len(params):
+        p = params[i]
+        if p == "38" and i + 2 < len(params) and params[i + 1] == "5":
+            color = ansi256_rgb(int(params[i + 2]))
+            i += 3
+            continue
+        if p == "38" and i + 4 < len(params) and params[i + 1] == "2":
+            color = (int(params[i + 2]) / 255.0, int(params[i + 3]) / 255.0, int(params[i + 4]) / 255.0)
+            i += 5
+            continue
+        if p == "39":
+            color = None
+        i += 1
+    return color
+
+
+# ---------------------------------------------------------------------------
+# LLM client + failover
+# ---------------------------------------------------------------------------
+
+
+def _http_json(url: str, body: dict, timeout: float) -> dict:
+    require_local_llm(url)
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": UA},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} from {url}: {e.read().decode('utf-8', 'replace')[:300]}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"no server at {url}: {e.reason}") from e
+
+
+def llm_up(url: str, timeout: float = 2.0) -> bool:
+    if not llm_url_allowed(url):
+        return False
+    for path in ("/health", "/v1/models"):
+        try:
+            with urllib.request.urlopen(f"{url}{path}", timeout=timeout) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def llm_chat(
+    url: str,
+    model: str,
+    messages: list[dict],
+    *,
+    temperature: float = 0.8,
+    max_tokens: int = MAX_TOKENS,
+    timeout: float = GEN_TIMEOUT,
+) -> str:
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    data = _http_json(f"{url}/v1/chat/completions", body, timeout)
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    return str((choices[0].get("message") or {}).get("content") or "")
+
+
+def pixie_llm_bin() -> str | None:
+    cands = [
+        os.environ.get("PIXIE_LLM_BIN", ""),
+        shutil.which("menagerie") or "",
+        str(Path.home() / "bin" / "menagerie"),
+        str(Path.home() / "faeos" / "bin" / "menagerie"),
+    ]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _restart_imp() -> bool:
+    """Re-summon imp's own llama-server instance; blocks until ready or fails."""
+    binpath = pixie_llm_bin()
+    if not binpath:
+        return False
+    try:
+        proc = subprocess.run(
+            [binpath, "ensure", "imp"], capture_output=True, text=True, timeout=120
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _stop_imp() -> None:
+    """Unload imp's model from RAM when the TUI quits (frees ~2GB)."""
+    binpath = pixie_llm_bin()
+    if not binpath:
+        return
+    try:
+        subprocess.run(
+            [binpath, "stop", "imp"], capture_output=True, text=True, timeout=30
+        )
+    except Exception:
+        pass
+
+
+def _build_user_prompt(prompt: str, style: str, width: int, height: int, previous: str | None, anim: str | None) -> str:
+    if previous is not None:
+        return (
+            f"Continue the animation frame by frame. Apply this change: "
+            f"'{anim or 'subtle motion'}'. Keep the exact same width ({width}), "
+            f"height ({height}), style ({style}), and palette as the previous "
+            f"frame — change only the motion and details.\n\n"
+            f"Previous frame:\n{previous}"
+        )
+    return f"Create terminal art for: {prompt}"
+
+
+def gen_art(
+    prompt: str,
+    style: str,
+    width: int,
+    height: int,
+    *,
+    previous: str | None = None,
+    anim: str | None = None,
+    on_status=None,
+) -> str:
+    """Generate art on 8082 (imp), failover: restart imp → retry → kur → error."""
+    style_hint = STYLE_HINTS.get(style, STYLE_HINTS["unicode"])
+    system = ART_SYSTEM.format(width=width, height=height, style_hint=style_hint, prompt=prompt)
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _build_user_prompt(prompt, style, width, height, previous, anim)},
+    ]
+    last_err = ""
+    attempts = [
+        (IMP_URL, IMP_ALIAS, "imp", GEN_TIMEOUT),
+        (IMP_URL, IMP_ALIAS, "imp", GEN_TIMEOUT),
+        (KUR_URL, KUR_ALIAS, "kur", 60),
+    ]
+    for i, (url, alias, label, timeout) in enumerate(attempts):
+        if on_status:
+            on_status(f"{label} is conjuring… (attempt {i + 1})")
+        try:
+            raw = llm_chat(url, alias, messages, temperature=0.85, max_tokens=MAX_TOKENS, timeout=timeout)
+            art_out = normalize_art(raw, style, width, height)
+            if art_out.strip():
+                return art_out
+            last_err = f"{label}: empty art"
+        except Exception as e:
+            last_err = f"{label}: {e}"
+        if i == 0:
+            _restart_imp()
+    raise ImpError(random.choice(ERR_MESSAGES), f"art generation failed ({last_err})")
+
+
+def gen_comment(art_text: str, prompt: str, style: str) -> str:
+    plain = art.strip_ansi(art_text)
+    preview = "\n".join(plain.splitlines()[:18])
+    if len(preview) > 1100:
+        preview = preview[:1100] + "…"
+    messages = [
+        {"role": "system", "content": COMMENT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"The wizard asked for terminal art about: {prompt} (style: {style}).\n\n"
+                f"Art:\n{preview}\n\n"
+                "Imp, what do you think? One short sentence, max 60 chars, no markdown."
+            ),
+        },
+    ]
+    try:
+        raw = llm_chat(
+            KUR_URL, KUR_ALIAS, messages, temperature=0.9, max_tokens=64, timeout=COMMENT_TIMEOUT
+        )
+    except Exception:
+        return ""
+    raw = re.sub(r"[*_`#]+", "", raw)
+    raw = re.sub(r"\s+", " ", art.strip_ansi(raw)).strip()
+    if raw.lower().startswith("imp"):
+        raw = raw[3:].lstrip(":,-— ")
+    return raw[:120]
+
+
+# ---------------------------------------------------------------------------
+# persistence (gallery + files)
+# ---------------------------------------------------------------------------
+
+
+def gallery_load() -> dict:
+    try:
+        return json.loads(GALLERY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"items": []}
+
+
+def gallery_save(data: dict) -> None:
+    GALLERY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GALLERY_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def gallery_add(item: dict) -> None:
+    data = gallery_load()
+    items = [e for e in data.get("items", []) if e.get("id") != item.get("id")]
+    items.insert(0, item)
+    data["items"] = items[:200]
+    gallery_save(data)
+
+
+def _pdf_saved(path: Path) -> Path | None:
+    return path if path.is_file() else None
+
+
+def save_piece(
+    item_id: str,
+    art_text: str,
+    prompt: str,
+    style: str,
+    *,
+    comment: str = "",
+    frames: list[str] | None = None,
+) -> list[str]:
+    """Save ANSI art (+ PDF) under ~/pixie_art and index in the gallery."""
+    ART_DIR.mkdir(parents=True, exist_ok=True)
+    files: list[str] = []
+    txt = ART_DIR / f"{item_id}.txt"
+    txt.write_text(art_text + "\n", encoding="utf-8")
+    files.append(str(txt))
+    pdf = art_to_pdf(art_text, ART_DIR / f"{item_id}.pdf")
+    if pdf:
+        files.append(str(pdf))
+
+    anim_files = save_anim(item_id, frames) if frames else []
+    files.extend(anim_files)
+
+    item = {
+        "id": item_id,
+        "prompt": prompt,
+        "style": style,
+        "files": files,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "animated": bool(frames),
+    }
+    if comment:
+        item["comment"] = comment
+    gallery_add(item)
+    return files
+
+
+def save_anim(item_id: str, frames: list[str]) -> list[str]:
+    if not frames:
+        return []
+    files: list[str] = []
+    anim_txt = ART_DIR / f"{item_id}_anim.txt"
+    with open(anim_txt, "w", encoding="utf-8") as f:
+        total = len(frames)
+        for i, fr in enumerate(frames, 1):
+            f.write(FRAME_DELIM.format(n=i, total=total) + "\n")
+            f.write(fr + "\n\n")
+    files.append(str(anim_txt))
+    pdf = art_to_pdf(frames, ART_DIR / f"{item_id}_anim.pdf")
+    if pdf:
+        files.append(str(pdf))
+    return files
+
+
+# ---------------------------------------------------------------------------
+# minimal PDF writer (stdlib only — embeds DejaVu Sans Mono)
+# ---------------------------------------------------------------------------
+
+FONT_CANDIDATES = (
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+)
+
+
+def _u16(d: bytes, o: int) -> int:
+    return struct.unpack_from(">H", d, o)[0]
+
+
+def _s16(d: bytes, o: int) -> int:
+    return struct.unpack_from(">h", d, o)[0]
+
+
+def _u32(d: bytes, o: int) -> int:
+    return struct.unpack_from(">I", d, o)[0]
+
+
+class TTFFont:
+    """Parse enough of a TTF to embed it in a PDF (cmap + metrics + raw data)."""
+
+    def __init__(self, path: str) -> None:
+        with open(path, "rb") as f:
+            self.data = f.read()
+        d = self.data
+        num_tables = _u16(d, 4)
+        tables: dict[str, tuple[int, int]] = {}
+        for i in range(num_tables):
+            off = 12 + i * 16
+            tag = d[off : off + 4].decode("latin-1")
+            tables[tag] = (_u32(d, off + 8), _u32(d, off + 12))
+        head = tables["head"][0]
+        self.upm = _u16(d, head + 18)
+        self.bbox = (
+            _s16(d, head + 36),
+            _s16(d, head + 38),
+            _s16(d, head + 40),
+            _s16(d, head + 42),
+        )
+        hhea = tables["hhea"][0]
+        self.ascent = _s16(d, hhea + 4)
+        self.descent = _s16(d, hhea + 6)
+        self.n_h_metrics = _u16(d, hhea + 34)
+        maxp = tables["maxp"][0]
+        self.num_glyphs = _u16(d, maxp + 4)
+        hmtx = tables["hmtx"][0]
+        self.advances = [_u16(d, hmtx + i * 4) for i in range(self.n_h_metrics)]
+        self.dw = self.advances[0] if self.advances else 600
+        self.cmap: dict[int, int] = {}
+        self._parse_cmap(tables["cmap"][0])
+
+    def _parse_cmap(self, off: int) -> None:
+        d = self.data
+        n = _u16(d, off + 2)
+        for i in range(n):
+            eo = off + 4 + i * 8
+            pid, plat, suboff = _u16(d, eo), _u16(d, eo + 2), _u32(d, eo + 4)
+            toff = off + suboff
+            fmt = _u16(d, toff)
+            if fmt not in (4, 12, 6):
+                continue
+            if (pid, plat) not in ((3, 1), (0, 3), (0, 4)):
+                continue
+            if fmt == 4:
+                self._cmap4(toff)
+            elif fmt == 12:
+                self._cmap12(toff)
+            else:
+                self._cmap6(toff)
+            if self.cmap:
+                return
+
+    def _cmap4(self, off: int) -> None:
+        d = self.data
+        seg_x2 = _u16(d, off + 6)
+        seg = seg_x2 // 2
+        end_code = off + 14
+        start_code = end_code + seg_x2 + 2
+        id_delta = start_code + seg_x2
+        id_range = id_delta + seg_x2
+        for i in range(seg):
+            end = _u16(d, end_code + 2 * i)
+            start = _u16(d, start_code + 2 * i)
+            delta = _s16(d, id_delta + 2 * i)
+            ro = _u16(d, id_range + 2 * i)
+            for c in range(start, end + 1):
+                if ro == 0:
+                    gid = (c + delta) & 0xFFFF
+                else:
+                    addr = id_range + 2 * i + ro + 2 * (c - start)
+                    gid = _u16(d, addr)
+                    if gid:
+                        gid = (gid + delta) & 0xFFFF
+                if gid:
+                    self.cmap[c] = gid
+
+    def _cmap12(self, off: int) -> None:
+        d = self.data
+        groups = _u32(d, off + 12)
+        for g in range(groups):
+            o = off + 16 + g * 12
+            s, e, sg = _u32(d, o), _u32(d, o + 4), _u32(d, o + 8)
+            for c in range(s, e + 1):
+                self.cmap[c] = sg + (c - s)
+
+    def _cmap6(self, off: int) -> None:
+        d = self.data
+        first = _u16(d, off + 6)
+        cnt = _u16(d, off + 8)
+        for i in range(cnt):
+            gid = _u16(d, off + 10 + 2 * i)
+            if gid:
+                self.cmap[first + i] = gid
+
+
+DEF_FG = (0.78, 0.78, 0.78)
+BG = (0.10, 0.04, 0.07)
+
+
+class TinyPDF:
+    """Zero-dependency multi-page PDF with an embedded monospace TTF."""
+
+    def __init__(self, font: TTFFont, font_size: float = 10.0) -> None:
+        self.font = font
+        self.fs = font_size
+        self.cell_w = font.dw / font.upm * font_size
+        self.line_h = font_size
+        self.pages: list[dict] = []
+        self.used: dict[int, int] = {}
+        self._cur: dict | None = None
+
+    def add_page(self, art_w: int, art_h: int) -> None:
+        margin = 16.0
+        w = margin * 2 + art_w * self.cell_w
+        h = margin * 2 + art_h * self.line_h
+        c = bytearray()
+        c += b"q\n"
+        c += f"{BG[0]:.3f} {BG[1]:.3f} {BG[2]:.3f} rg\n".encode()
+        c += f"0 0 {w:.2f} {h:.2f} re f\n".encode()
+        c += b"BT\n"
+        c += f"/F1 {self.fs} Tf\n".encode()
+        self._cur = {"width": w, "height": h, "content": c}
+        self.pages.append(self._cur)
+
+    def finish_page(self) -> None:
+        if self._cur is not None:
+            self._cur["content"] += b"ET\nQ\n"
+            self._cur = None
+
+    def draw_line(self, cells: list[tuple[str, tuple | None]], row: int, art_h: int) -> None:
+        if self._cur is None:
+            return
+        x = 16.0
+        y = 16.0 + (art_h - 1 - row) * self.line_h + self.line_h * 0.78
+        self._cur["content"] += f"1 0 0 1 {x:.2f} {y:.2f} Tm\n".encode()
+        runs: list[tuple[tuple, list[int]]] = []
+        for ch, rgb in cells:
+            gid = self.font.cmap.get(ord(ch), 0)
+            self.used[gid] = ord(ch)
+            col = rgb if rgb is not None else DEF_FG
+            if runs and runs[-1][0] == col:
+                runs[-1][1].append(gid)
+            else:
+                runs.append((col, [gid]))
+        for rgb, gids in runs:
+            self._cur["content"] += f"{rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg\n".encode()
+            payload = b"".join(struct.pack(">H", g) for g in gids)
+            esc = payload.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+            self._cur["content"] += b"(" + esc + b") Tj\n"
+
+    def save(self, path: str) -> None:
+        N = len(self.pages)
+        page_start = 3
+        content_start = page_start + N
+        type0 = content_start + N
+        cidfont, descr, file2, touni = type0 + 1, type0 + 2, type0 + 3, type0 + 4
+
+        objs: list[bytes] = []
+        objs.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+        kids = " ".join(f"{page_start + i} 0 R" for i in range(N))
+        objs.append(f"<< /Type /Pages /Kids [{kids}] /Count {N} >>".encode())
+        for i, pg in enumerate(self.pages):
+            w, h = pg["width"], pg["height"]
+            objs.append(
+                (
+                    f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w:.2f} {h:.2f}] "
+                    f"/Resources << /Font << /F1 {type0} 0 R >> >> "
+                    f"/Contents {content_start + i} 0 R >>"
+                ).encode()
+            )
+        for pg in self.pages:
+            data = zlib.compress(bytes(pg["content"]))
+            objs.append(
+                b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data) + data + b"\nendstream"
+            )
+
+        objs.append(
+            (
+                f"<< /Type /Font /Subtype /Type0 /BaseFont /DejaVuSansMono "
+                f"/Encoding /Identity-H /DescendantFonts [{cidfont} 0 R] "
+                f"/ToUnicode {touni} 0 R >>"
+            ).encode()
+        )
+        xmin, ymin, xmax, ymax = self.font.bbox
+        objs.append(
+            (
+                f"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /DejaVuSansMono "
+                f"/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> "
+                f"/FontDescriptor {descr} 0 R /DW {self.font.dw} >>"
+            ).encode()
+        )
+        objs.append(
+            (
+                f"<< /Type /FontDescriptor /FontName /DejaVuSansMono /Flags 32 "
+                f"/FontBBox [{xmin} {ymin} {xmax} {ymax}] /ItalicAngle 0 "
+                f"/Ascent {self.font.ascent} /Descent {self.font.descent} "
+                f"/CapHeight {self.font.ascent} /StemV 80 /FontFile2 {file2} 0 R >>"
+            ).encode()
+        )
+        fb = zlib.compress(self.font.data)
+        objs.append(
+            b"<< /Length %d /Filter /FlateDecode /Length1 %d >>\nstream\n" % (len(fb), len(self.font.data))
+            + fb
+            + b"\nendstream"
+        )
+
+        cmap_lines = [
+            "/CIDInit /ProcSet findresource begin",
+            "12 dict begin",
+            "begincmap",
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+            "/CMapName /Adobe-Identity-UCS def",
+            "/CMapType 2 def",
+            "1 begincodespacerange",
+            "<0000> <FFFF>",
+            "endcodespacerange",
+        ]
+        items = [f"<{gid:04X}> <{uni:04X}>" for gid, uni in sorted(self.used.items())]
+        if items:
+            cmap_lines.append(f"{len(items)} beginbfchar")
+            cmap_lines.extend(items)
+            cmap_lines.append("endbfchar")
+        cmap_lines += ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
+        cmap = ("\n".join(cmap_lines) + "\n").encode("latin-1")
+        objs.append(b"<< /Length %d >>\nstream\n" % len(cmap) + cmap + b"\nendstream")
+
+        out = bytearray(b"%PDF-1.4\n")
+        offsets: list[int] = []
+        for i, obj in enumerate(objs, 1):
+            offsets.append(len(out))
+            out += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objs) + 1}\n".encode()
+        out += b"0000000000 65535 f \n"
+        for off in offsets:
+            out += f"{off:010d} 00000 n \n".encode()
+        out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        Path(path).write_bytes(bytes(out))
+
+
+_font_cache: TTFFont | None = None
+
+
+def _load_font() -> TTFFont | None:
+    global _font_cache
+    if _font_cache is not None:
+        return _font_cache
+    for cand in FONT_CANDIDATES:
+        if os.path.isfile(cand):
+            try:
+                _font_cache = TTFFont(cand)
+                return _font_cache
+            except Exception:
+                continue
+    return None
+
+
+def art_to_pdf(arts: str | list[str], path: Path) -> Path | None:
+    font = _load_font()
+    if font is None:
+        return None
+    arts = arts if isinstance(arts, list) else [arts]
+    pdf = TinyPDF(font)
+    for a in arts:
+        lines = a.split("\n")
+        w = max((len(line_cells(ln)) for ln in lines), default=1)
+        h = len(lines)
+        pdf.add_page(w, h)
+        for i, ln in enumerate(lines):
+            pdf.draw_line(line_cells(ln), i, h)
+        pdf.finish_page()
+    try:
+        pdf.save(str(path))
+        return path
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# shared frame rendering (TUI + CLI)
+# ---------------------------------------------------------------------------
+
+
+def _top_border(title: str, w: int) -> str:
+    inner = w - 2
+    label = f" {MARK} {title} {MARK} "
+    if art.vis_len(label) > inner - 2:
+        keep = max(1, inner - 10)
+        label = f" {MARK} {title[:keep]}… "
+    fill = max(0, inner - art.vis_len(label) - 1)
+    return art.paint("╭─", ACCENT) + art.paint(label, P.BOLD, P.PINK) + art.paint("─" * fill + "╮", ACCENT)
+
+
+def _divider(title: str, w: int) -> str:
+    inner = w - 2
+    if title:
+        label = f" {MARK} {title} "
+        fill = max(0, inner - art.vis_len(label))
+        return art.paint("├─", ACCENT) + art.paint(label, P.BOLD, P.PINK) + art.paint("─" * fill + "┤", ACCENT)
+    return art.paint("├" + "─" * inner + "┤", ACCENT)
+
+
+def _bottom_border(w: int) -> str:
+    inner = w - 2
+    return art.paint("╰" + "─" * inner + "╯", ACCENT)
+
+
+def _row(content: str, w: int, style_codes: tuple[str, ...]) -> str:
+    body_w = w - 4
+    return (
+        art.paint("│", ACCENT)
+        + " "
+        + art.paint(art.pad_vis(content, body_w), *style_codes)
+        + " "
+        + art.paint("│", ACCENT)
+    )
+
+
+def _art_rows(art_text: str | None, body_w: int, art_h: int) -> list[str]:
+    lines = (art_text or "").split("\n") if art_text else []
+    lines = [ln for ln in lines if ln is not None]
+    if len(lines) < art_h:
+        lines = lines + [" " * body_w] * (art_h - len(lines))
+    elif len(lines) > art_h:
+        lines = lines[:art_h]
+    return lines
+
+
+def build_frame(
+    *,
+    art_text: str | None,
+    art_h: int,
+    comment: str,
+    runes: list[str],
+    orders: str,
+    status: str,
+    width: int,
+) -> str:
+    body_w = width - 4
+    lines = [_top_border("Imp", width)]
+    for ln in _art_rows(art_text, body_w, art_h):
+        lines.append(art.paint("│", ACCENT) + " " + ln + " " + art.paint("│", ACCENT))
+    lines.append(_divider("Imp's Comment", width))
+    comment_lines = art.wrap_plain(art.strip_ansi(comment or ""), body_w)[:2]
+    for ln in comment_lines or [""]:
+        lines.append(_row(ln, width, (P.PINK,)))
+    lines.append(_divider("Runes", width))
+    for ln in runes:
+        lines.append(_row(ln, width, (P.MUTED,)))
+    lines.append(_divider("Imp's Orders", width))
+    lines.append(_row(orders, width, (P.SILVER,)))
+    lines.append(_row(status, width, (P.MUTED,)))
+    lines.append(_bottom_border(width))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+RUNES = [
+    "Enter conjure · e edit · ↑↓ browse · a animate · r refine",
+    "s save · g gallery · / history · Tab style · c clear · q quit",
+]
+
+
+class ImpApp:
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self.prompt = ""
+        self._draft = ""
+        self.style = "unicode"
+        self.mode = "edit"  # "edit" = typing, "cmd" = letter commands
+        self._quit = False
+        self.history: list[dict] = []
+        self.idx = -1
+        self.frames: list[str] = []
+        self.frame_i = 0
+        self.comment = ""
+        self.comment_pending = False
+        self.status = ""
+        self.busy = False
+        self.busy_kind = ""
+        self.cancel = threading.Event()
+        self._worker: threading.Thread | None = None
+
+    # -- geometry ----------------------------------------------------------
+    def geometry(self) -> tuple[int, int, int, int]:
+        tw = art.term_width()
+        th = art.term_height()
+        body_w = max(20, tw - 4)
+        art_h = max(8, th - 12)
+        return tw, th, body_w, art_h
+
+    def current_art(self) -> str | None:
+        if self.frames:
+            return self.frames[min(self.frame_i, len(self.frames) - 1)]
+        if self.idx >= 0 and self.idx < len(self.history):
+            return self.history[self.idx].get("art")
+        return None
+
+    # -- prompt editing -----------------------------------------------------
+    def _edit(self, new_prompt: str) -> None:
+        self._draft = new_prompt
+        self.prompt = new_prompt
+        self.idx = -1
+        self.mode = "edit"
+
+    def _cycle_style(self) -> None:
+        self.style = STYLES[(STYLES.index(self.style) + 1) % len(STYLES)]
+        self.status = f"style: {self.style}"
+
+    # -- render ------------------------------------------------------------
+    def render(self) -> None:
+        tw, th, body_w, art_h = self.geometry()
+        if self.busy:
+            spin = SPINNER[int(time.monotonic() * 8) % len(SPINNER)]
+            if self.busy_kind == "anim":
+                comment = f"{spin}  Imp is animating…"
+            else:
+                comment = f"{spin}  Imp is conjuring…"
+        elif self.comment_pending:
+            comment = f"{SPINNER[0]}  Imp is pondering the canvas…"
+        elif self.comment:
+            comment = self.comment
+        else:
+            comment = "Imp awaits a wish. What shall I paint?"
+        caret = "█" if self.mode == "edit" and not self.busy else ""
+        orders = f"> {self.prompt}{caret}"
+        frame = build_frame(
+            art_text=self.current_art(),
+            art_h=art_h,
+            comment=comment,
+            runes=RUNES,
+            orders=orders,
+            status=self.status,
+            width=tw,
+        )
+        try:
+            art.paint_frame(self.fd, frame)
+        except OSError:
+            sys.stdout.write(art.clear_screen() + frame + "\n")
+            sys.stdout.flush()
+
+    # -- actions -----------------------------------------------------------
+    def do_generate(self) -> None:
+        p = self.prompt.strip()
+        if not p:
+            self.status = "Imp needs a wish — type something first."
+            return
+        if self.busy:
+            return
+        self._draft = p
+        self.busy = True
+        self.busy_kind = "gen"
+        self.mode = "cmd"
+        self.status = ""
+        self.comment_pending = True
+
+        def work() -> None:
+            try:
+                art_out = gen_art(p, self.style, *self.geometry()[2:], on_status=self._on_status)
+            except ImpError as e:
+                self.comment = e.technical or e.message
+                self.comment_pending = False
+                self.status = e.message
+                self.busy = False
+                self.busy_kind = ""
+                return
+            self._finish_generate(p, art_out)
+
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
+    def _on_status(self, msg: str) -> None:
+        self.status = msg
+
+    def _finish_generate(self, prompt: str, art_text: str) -> None:
+        item_id = uuid.uuid4().hex[:12]
+        self.frames = [art_text]
+        self.frame_i = 0
+        self.busy = False
+        self.busy_kind = ""
+        item = {
+            "id": item_id,
+            "prompt": prompt,
+            "style": self.style,
+            "art": art_text,
+            "comment": "",
+            "frames": [art_text],
+            "files": [],
+        }
+        self.history.append(item)
+        self.idx = len(self.history) - 1
+
+        def save_worker() -> None:
+            item["files"] = save_piece(item_id, art_text, prompt, self.style, frames=[art_text])
+
+        threading.Thread(target=save_worker, daemon=True).start()
+
+        def comment_worker() -> None:
+            try:
+                cm = gen_comment(art_text, prompt, self.style)
+                item["comment"] = cm
+                if self.idx == len(self.history) - 1:
+                    self.comment = cm
+            except Exception:
+                pass
+            self.comment_pending = False
+
+        self.comment = "Imp is pondering the canvas…"
+        threading.Thread(target=comment_worker, daemon=True).start()
+        self.status = f"saved to {ART_DIR}"
+
+    def do_refine(self) -> None:
+        if self.busy:
+            return
+        self._edit("Make it more " + self.prompt.lstrip())
+        self.status = "refine — finish the wish, then Enter"
+
+    def do_clear(self) -> None:
+        if self.busy:
+            return
+        self._edit("")
+        self.status = ""
+
+    def do_animate(self) -> None:
+        if self.busy:
+            return
+        if not self.frames:
+            self.status = "No art to animate yet — conjure something first."
+            return
+        anim_prompt = self._inline_input("animate: (Enter = auto motion, Esc = cancel) ")
+        if anim_prompt is None:
+            self.status = ""
+            return
+        self.cancel.clear()
+        self.busy = True
+        self.busy_kind = "anim"
+        start = self.frames[0]
+
+        def work() -> None:
+            frames = [start]
+            n = ANIM_FRAMES
+            for i in range(1, n):
+                if self.cancel.is_set():
+                    break
+                try:
+                    nxt = gen_art(
+                        self.prompt or "",
+                        self.style,
+                        self.geometry()[2],
+                        self.geometry()[3],
+                        previous=frames[-1],
+                        anim=anim_prompt or "subtle motion",
+                        on_status=lambda m: self._on_status(f"animating frame {i}/{n - 1}"),
+                    )
+                    frames.append(nxt)
+                except ImpError as e:
+                    self.status = e.message
+                    break
+            self.frames = frames
+            self.frame_i = 0
+            if self.idx >= 0 and self.idx < len(self.history):
+                self.history[self.idx]["frames"] = frames
+            self.busy = False
+            self.busy_kind = ""
+            item_id = self.history[self.idx]["id"] if self.idx >= 0 else None
+            if item_id:
+                extra = save_anim(item_id, frames)
+                if self.idx >= 0 and self.idx < len(self.history):
+                    self.history[self.idx]["files"] = list(dict.fromkeys(self.history[self.idx].get("files", []) + extra))
+            self.status = f"animation done — {len(frames)} frames (←/→ to scrub)"
+
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
+    def do_save(self) -> None:
+        art_text = self.current_art()
+        if not art_text:
+            self.status = "Nothing to save yet."
+            return
+        if self.idx >= 0 and self.idx < len(self.history):
+            item = self.history[self.idx]
+            files = save_piece(item["id"], art_text, item["prompt"], item.get("style", self.style))
+            item["files"] = files
+            self.status = "saved · " + files[0]
+        else:
+            item_id = uuid.uuid4().hex[:12]
+            save_piece(item_id, art_text, self.prompt, self.style)
+            self.status = f"saved to {ART_DIR}"
+
+    # -- navigation --------------------------------------------------------
+    def _nav(self, delta: int) -> None:
+        if not self.history:
+            return
+        if self.idx < 0:
+            nxt = len(self.history) - 1 if delta < 0 else 0
+        else:
+            nxt = self.idx + delta
+            if nxt >= len(self.history):
+                self.prompt = self._draft
+                self.idx = -1
+                self.frames = []
+                self.frame_i = 0
+                self.comment = ""
+                return
+            if nxt < 0:
+                nxt = 0
+        item = self.history[nxt]
+        self.prompt = item["prompt"]
+        self.idx = nxt
+        self.frames = item.get("frames") or ([item.get("art")] if item.get("art") else [])
+        self.frame_i = 0
+        self.comment = item.get("comment") or ""
+        self.comment_pending = False
+
+    def _scrub(self, delta: int) -> None:
+        if not self.frames:
+            return
+        self.frame_i = (self.frame_i + delta) % len(self.frames)
+        self.status = f"frame {self.frame_i + 1}/{len(self.frames)}"
+
+    def _fzf_pick(self, entries: list[dict], label: str) -> int | None:
+        if not shutil.which("fzf"):
+            self.status = "fzf not found — no jump list."
+            return None
+        art.tui_suspend()
+        lines = []
+        for i, e in enumerate(entries):
+            prompt = (e.get("prompt") or "")[:54]
+            created = (e.get("created") or "?")[:16]
+            lines.append(f"{i}\t{created}  {prompt}")
+        env = {
+            **os.environ,
+            "FZF_DEFAULT_OPTS": (
+                "--height=80% --layout=reverse --border=rounded --ansi --cycle "
+                "--color=fg:#c0c0c8,bg:#1a0a12,hl:#e879a0,fg+:#ffebf2,bg+:#2a1520,hl+:#ff2d55,"
+                "prompt:#e879a0,pointer:#ffb020,header:#c44d7a"
+            ),
+        }
+        try:
+            proc = subprocess.run(
+                ["fzf", f"--prompt={label} › ", "--delimiter=\t", "--with-nth=2",
+                 "--header=↑↓ move · Enter open · Esc cancel"],
+                input="\n".join(lines) + "\n",
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+        except OSError:
+            return None
+        finally:
+            art.tui_resume()
+        if proc.returncode != 0 or not (proc.stdout or "").strip():
+            return None
+        try:
+            return int(proc.stdout.strip().split("\t", 1)[0])
+        except ValueError:
+            return None
+
+    def do_gallery(self) -> None:
+        items = gallery_load().get("items", [])
+        if not items:
+            self.status = "The gallery is empty — conjure something first."
+            return
+        j = self._fzf_pick(items, "gallery")
+        if j is None or j >= len(items):
+            self.status = ""
+            return
+        item = items[j]
+        files = item.get("files") or []
+        art_text = item.get("art")
+        if not art_text and files:
+            try:
+                art_text = Path(files[0]).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                art_text = None
+        if not art_text:
+            self.status = "Could not read that gallery piece."
+            return
+        self.prompt = item.get("prompt") or ""
+        self._draft = self.prompt
+        self.frames = [art_text]
+        self.frame_i = 0
+        self.comment = item.get("comment") or ""
+        self.comment_pending = False
+        self.idx = -1
+        self.status = "gallery — Enter to re-conjure"
+
+    def do_history(self) -> None:
+        if not self.history:
+            self.status = "No history in this session yet."
+            return
+        j = self._fzf_pick(self.history, "history")
+        if j is None or j >= len(self.history):
+            self.status = ""
+            return
+        item = self.history[j]
+        self.prompt = item["prompt"]
+        self.idx = j
+        self.frames = item.get("frames") or ([item.get("art")] if item.get("art") else [])
+        self.frame_i = 0
+        self.comment = item.get("comment") or ""
+        self.comment_pending = False
+        self.status = ""
+
+    # -- inline prompt (animation) -----------------------------------------
+    def _inline_input(self, prefix: str) -> str | None:
+        buf = ""
+        self.status = prefix + buf
+        while True:
+            self.render()
+            key = art.tui_read_key(self.fd)
+            if key in ("enter",):
+                return buf.strip()
+            if key in ("esc", "ctrl-c", "q", "Q"):
+                return None
+            if key in ("backspace", "delete"):
+                buf = buf[:-1]
+            elif key == "space":
+                buf += " "
+            elif key in ("clear", "ctrl-u"):
+                buf = ""
+            elif len(key) == 1 and key.isprintable():
+                buf += key
+            self.status = prefix + buf
+
+    # -- main loop ---------------------------------------------------------
+    def run(self) -> None:
+        while True:
+            self.render()
+            if self.busy:
+                key = art.tui_read_key(self.fd, timeout=0.25)
+                if key in ("q", "esc", "ctrl-c") and self.busy_kind == "anim":
+                    self.cancel.set()
+                    self.status = "cancelling…"
+                elif key:
+                    self._handle(key)
+                continue
+            key = art.tui_read_key(self.fd)
+            if key in ("ctrl-c",):
+                break
+            self._handle(key)
+            if self._quit:
+                break
+
+    def _handle(self, key: str) -> None:
+        if self.mode == "edit":
+            self._handle_edit(key)
+        else:
+            self._handle_cmd(key)
+
+    def _handle_edit(self, key: str) -> None:
+        if key in ("enter",):
+            self.do_generate()
+        elif key == "esc":
+            self.mode = "cmd"
+            self.status = "view — e to edit · letters are commands"
+        elif key == "tab":
+            self._cycle_style()
+        elif key in ("backspace", "delete"):
+            self._edit(self.prompt[:-1])
+        elif key == "space":
+            self._edit(self.prompt + " ")
+        elif key in ("clear", "ctrl-u"):
+            self._edit("")
+        elif key in ("up", "down", "left", "right"):
+            pass
+        elif len(key) == 1 and key.isprintable():
+            self._edit(self.prompt + key)
+
+    def _handle_cmd(self, key: str) -> None:
+        if key in ("q", "Q", "esc"):
+            if not self.busy:
+                self._quit = True
+        elif key == "a":
+            self.do_animate()
+        elif key in ("r", "R"):
+            self.do_refine()
+        elif key in ("s", "S"):
+            self.do_save()
+        elif key == "g":
+            self.do_gallery()
+        elif key == "/":
+            self.do_history()
+        elif key in ("e", "E"):
+            self.mode = "edit"
+            self.status = ""
+        elif key in ("c", "C"):
+            self.do_clear()
+        elif key in ("enter",):
+            self.do_generate()
+        elif key == "tab":
+            self._cycle_style()
+        elif key in ("up", "k", "K"):
+            self._nav(-1)
+        elif key in ("down", "j", "J"):
+            self._nav(1)
+        elif key in ("left",):
+            self._scrub(-1)
+        elif key in ("right",):
+            self._scrub(1)
+        elif key in ("backspace", "delete", "space", "clear"):
+            pass
+        elif len(key) == 1 and key.isprintable():
+            self.status = "press e to edit the wish"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def cli_render(art_text: str, prompt: str, style: str, comment: str, files: list[str], width: int, art_h: int) -> str:
+    body_w = width - 4
+    lines = [_top_border("Imp", width)]
+    for ln in _art_rows(art_text, body_w, art_h):
+        lines.append(art.paint("│", ACCENT) + " " + ln + " " + art.paint("│", ACCENT))
+    lines.append(_divider("Imp's Comment", width))
+    for ln in (art.wrap_plain(comment, body_w) or [""])[:2]:
+        lines.append(_row(ln, width, (P.PINK,)))
+    lines.append(_divider("Runes", width))
+    for ln in RUNES:
+        lines.append(_row(ln, width, (P.MUTED,)))
+    lines.append(_divider("Imp's Orders", width))
+    lines.append(_row(f"> {prompt}", width, (P.SILVER,)))
+    if files:
+        lines.append(_row("saved · " + ", ".join(files[:3]) + (" …" if len(files) > 3 else ""), width, (P.MUTED,)))
+    lines.append(_bottom_border(width))
+    return "\n".join(lines)
+
+
+def _print_frame(frame: str) -> None:
+    print("\033[2J\033[H", end="")
+    print(frame)
+    sys.stdout.flush()
+
+
+def cmd_gallery_list() -> int:
+    items = gallery_load().get("items", [])
+    if not items:
+        print("(the gallery is empty — run imp \"a wish\" first)")
+        return 0
+    for e in items:
+        created = (e.get("created") or "?")[:16]
+        style = str(e.get("style") or "?")
+        prompt = (e.get("prompt") or "").replace("\n", " ")[:70]
+        files = e.get("files") or []
+        first = files[0] if files else "(no files)"
+        flag = "✦anim" if e.get("animated") else ""
+        print(f"{created}  {style:>8}  {flag:>6}  {prompt}\n    {first}")
+    return 0
+
+
+def cmd_generate(prompt: str, args: argparse.Namespace) -> int:
+    style = args.style or "unicode"
+    width = args.width or art.term_width()
+    height = args.height or max(8, art.term_height() - 12)
+    body_w = max(20, width - 4)
+    try:
+        art_text = gen_art(prompt, style, body_w, height)
+    except ImpError as e:
+        print(_err_box(e.message, e.technical))
+        return 1
+
+    item_id = uuid.uuid4().hex[:12]
+    frames = None
+    if args.animate:
+        frames = [art_text]
+        n = args.frames or ANIM_FRAMES
+        for i in range(1, n):
+            try:
+                frames.append(
+                    gen_art(prompt, style, body_w, height, previous=frames[-1], anim=args.anim_prompt or "subtle motion")
+                )
+            except ImpError as e:
+                print(f"(animation stopped at frame {i}: {e.message})", file=sys.stderr)
+                break
+        art_text = frames[0]
+
+    comment = ""
+    if not args.batch:
+        try:
+            comment = gen_comment(art_text, prompt, style)
+        except Exception:
+            comment = ""
+
+    files = save_piece(item_id, art_text, prompt, style, comment=comment, frames=frames)
+    if args.save:
+        out = Path(args.save)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(art_text + "\n", encoding="utf-8")
+        files = [str(out)] + [f for f in files if str(out) not in f]
+
+    if not args.batch:
+        art_h = height
+        frame = cli_render(art_text, prompt, style, comment, files, width, art_h)
+        _print_frame(frame)
+    else:
+        print(art_text)
+        print(f"# saved: {', '.join(files)}", file=sys.stderr)
+    return 0
+
+
+def cmd_demo() -> int:
+    sample = normalize_art(
+        "\033[38;5;175m╭─ ✦ a moonlit mushroom ✦ ─╮\033[0m\n"
+        "\033[38;5;220m    🍄\033[0m\033[38;5;105m   ··\033[0m\n"
+        "\033[38;5;105m   ╱══╲\033[0m\n"
+        "\033[38;5;175m╰────────────────╯\033[0m",
+        "unicode",
+        24,
+        4,
+    )
+    frame = cli_render(
+        sample,
+        "a moonlit mushroom",
+        "unicode",
+        "A lovely fungus, if you don't mind the moss.  ✦",
+        ["~/pixie_art/demo.txt"],
+        art.term_width(),
+        8,
+    )
+    _print_frame(frame)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = argparse.ArgumentParser(
+        prog="imp",
+        description="faeOS terminal art generator — Imp conjures, the dragon comments.",
+        epilog="No prompt → opens the TUI.",
+    )
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("--style", choices=STYLES)
+    p.add_argument("--save", metavar="FILE", help="also write ANSI art to FILE")
+    p.add_argument("--pdf", action="store_true", dest="force_pdf", help="(pdfs are always saved)")
+    p.add_argument("--batch", action="store_true", help="print raw art only, no frame")
+    p.add_argument("--animate", action="store_true", help="animate: N frames after the first")
+    p.add_argument("--frames", type=int, default=ANIM_FRAMES)
+    p.add_argument("--anim-prompt", default="")
+    p.add_argument("--width", type=int)
+    p.add_argument("--height", type=int)
+    p.add_argument("--gallery", action="store_true", help="list the gallery")
+    p.add_argument("--demo", action="store_true", help="render a sample frame (no server)")
+    args = p.parse_args(argv)
+
+    if args.demo:
+        return cmd_demo()
+    if args.gallery:
+        return cmd_gallery_list()
+    if args.prompt:
+        return cmd_generate(args.prompt, args)
+
+    # TUI
+    fd = art.tui_open_tty()
+    if fd is None:
+        print(art.paint("imp needs a real TTY (or give it a wish as an argument).", P.ERR), file=sys.stderr)
+        return 2
+    art.tui_begin(fd, "imp")
+    try:
+        ImpApp(fd).run()
+    finally:
+        art.tui_cleanup()
+        _stop_imp()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        art.tui_cleanup()
+        print()
+        raise SystemExit(130)

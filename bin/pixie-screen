@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""pixie-screen — single policy for terminal clear / tick.
+
+Instead of every feature (scry, grace, pixie-busy, art preview…) patching
+zsh hooks, they register a *hold*. Clear only runs when no holds are active.
+
+  pixie-screen hold NAME [seconds]   # block clears (default 3600s if omitted for sticky)
+  pixie-screen release NAME          # drop one hold
+  pixie-screen release-all           # drop all holds
+  pixie-screen allowed               # exit 0 if clear/tick OK
+  pixie-screen clear                 # clear screen only if allowed
+  pixie-screen status                # human-readable holds
+  pixie-screen purge                 # remove expired holds
+
+Hold names (convention, not enforced):
+  grace          read-grace after pixie reply / up / scry exit
+  scry           scry UI open
+  busy.<pid>     pixie/ask thinking (or use busy with pid file)
+  art            temporary art preview
+  manual         user: pixie-screen hold manual
+
+State dir: ~/.cache/pixie/screen-holds/
+  each file: NAME → expiry unix timestamp (0 = until release)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+HOLD_DIR = Path.home() / ".cache" / "pixie" / "screen-holds"
+LEGACY_SCRY_LOCK = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "pixie-scry.lock"
+LEGACY_GRACE = Path.home() / ".cache" / "pixie" / "grace_until"
+BUSY_GLOB_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+
+def ensure() -> None:
+    HOLD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def purge_expired() -> list[str]:
+    """Remove expired holds; return removed names."""
+    ensure()
+    removed = []
+    now = _now()
+    for p in list(HOLD_DIR.glob("*")):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        # busy.<pid> holds die with the process
+        if p.name.startswith("busy."):
+            try:
+                pid = int(p.name.split(".", 1)[1])
+            except ValueError:
+                p.unlink(missing_ok=True)
+                removed.append(p.name)
+                continue
+            if not _pid_alive(pid):
+                p.unlink(missing_ok=True)
+                removed.append(p.name)
+                continue
+        try:
+            exp = float(p.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            p.unlink(missing_ok=True)
+            removed.append(p.name)
+            continue
+        # 0 = sticky until release
+        if exp > 0 and now >= exp:
+            p.unlink(missing_ok=True)
+            removed.append(p.name)
+    # legacy scry lock without holder
+    if LEGACY_SCRY_LOCK.is_file():
+        try:
+            pid = int(LEGACY_SCRY_LOCK.read_text().strip() or "0")
+            if pid and not _pid_alive(pid):
+                LEGACY_SCRY_LOCK.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            LEGACY_SCRY_LOCK.unlink(missing_ok=True)
+    # stale pixie-busy.*
+    try:
+        for p in BUSY_GLOB_DIR.glob("pixie-busy.*"):
+            try:
+                pid = int(p.name.rsplit(".", 1)[-1])
+            except ValueError:
+                p.unlink(missing_ok=True)
+                continue
+            if not _pid_alive(pid):
+                p.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return removed
+
+
+def list_holds() -> list[tuple[str, float]]:
+    """Return (name, expiry) active holds. expiry 0 = sticky."""
+    purge_expired()
+    out: list[tuple[str, float]] = []
+    for p in sorted(HOLD_DIR.glob("*")):
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        try:
+            exp = float(p.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            continue
+        out.append((p.name, exp))
+    # virtual holds from legacy mechanisms
+    if LEGACY_SCRY_LOCK.is_file():
+        out.append(("scry(legacy-lock)", 0.0))
+    try:
+        until = float(LEGACY_GRACE.read_text(encoding="utf-8").strip())
+        if until > _now():
+            out.append(("grace(legacy)", until))
+    except (OSError, ValueError):
+        pass
+    for p in BUSY_GLOB_DIR.glob("pixie-busy.*"):
+        try:
+            pid = int(p.name.rsplit(".", 1)[-1])
+            if _pid_alive(pid):
+                out.append((f"busy.{pid}", 0.0))
+        except ValueError:
+            continue
+    return out
+
+
+def is_allowed() -> bool:
+    """True if the screen may be cleared / tick may fire."""
+    return len(list_holds()) == 0
+
+
+def hold(name: str, seconds: float | None) -> None:
+    ensure()
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:80]
+    if not safe:
+        raise SystemExit("hold name empty")
+    if seconds is None:
+        exp = 0.0  # sticky
+    else:
+        exp = _now() + max(0.0, float(seconds))
+    (HOLD_DIR / safe).write_text(str(exp), encoding="utf-8")
+    # keep legacy grace file in sync when name is grace
+    if safe == "grace" and seconds is not None:
+        try:
+            LEGACY_GRACE.parent.mkdir(parents=True, exist_ok=True)
+            LEGACY_GRACE.write_text(str(exp), encoding="utf-8")
+        except OSError:
+            pass
+    if safe == "scry":
+        try:
+            LEGACY_SCRY_LOCK.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def release(name: str) -> None:
+    ensure()
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:80]
+    (HOLD_DIR / safe).unlink(missing_ok=True)
+    if safe == "grace":
+        try:
+            LEGACY_GRACE.write_text("0", encoding="utf-8")
+        except OSError:
+            pass
+    if safe == "scry":
+        LEGACY_SCRY_LOCK.unlink(missing_ok=True)
+
+
+def release_all() -> None:
+    ensure()
+    for p in HOLD_DIR.glob("*"):
+        if p.is_file():
+            p.unlink(missing_ok=True)
+    try:
+        LEGACY_GRACE.write_text("0", encoding="utf-8")
+    except OSError:
+        pass
+    LEGACY_SCRY_LOCK.unlink(missing_ok=True)
+
+
+def do_clear() -> int:
+    """Clear if allowed. Exit 0 if cleared, 1 if held, 2 if not a tty."""
+    purge_expired()
+    if not is_allowed():
+        return 1
+    # only clear a real terminal
+    if not sys.stdout.isatty() and not os.environ.get("FORCE_CLEAR"):
+        # still emit clear sequence — caller may be fine
+        pass
+    sys.stdout.write("\033[H\033[2J")
+    sys.stdout.flush()
+    return 0
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    holds = list_holds()
+    if not holds:
+        print("pixie-screen: CLEAR ALLOWED (no holds)")
+        return 0
+    print("pixie-screen: CLEAR BLOCKED")
+    now = _now()
+    for name, exp in holds:
+        if exp <= 0:
+            print(f"  • {name}  (until release)")
+        else:
+            left = max(0, int(exp - now))
+            print(f"  • {name}  ({left}s left)")
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="pixie-screen",
+        description="Central clear/tick policy — hold/release instead of patching hooks",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("hold", help="block clears")
+    p.add_argument("name")
+    p.add_argument(
+        "seconds",
+        nargs="?",
+        type=float,
+        default=None,
+        help="TTL seconds (omit = until release)",
+    )
+    p.set_defaults(
+        func=lambda a: (hold(a.name, a.seconds), 0)[1]
+    )
+
+    p = sub.add_parser("release", help="drop a hold")
+    p.add_argument("name")
+    p.set_defaults(func=lambda a: (release(a.name), 0)[1])
+
+    sub.add_parser("release-all", help="drop every hold").set_defaults(
+        func=lambda a: (release_all(), 0)[1]
+    )
+    sub.add_parser("purge", help="drop expired holds only").set_defaults(
+        func=lambda a: (purge_expired(), 0)[1]
+    )
+    sub.add_parser("allowed", help="exit 0 if clear OK").set_defaults(
+        func=lambda a: 0 if is_allowed() else 1
+    )
+    sub.add_parser("clear", help="clear only if allowed").set_defaults(
+        func=lambda a: do_clear()
+    )
+    sub.add_parser("status", help="show holds").set_defaults(func=cmd_status)
+
+    args = ap.parse_args()
+    ensure()
+    purge_expired()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,15 @@
+*.gguf
+*.so*
+*.so.*
+llama-server
+target/
+__pycache__/
+*.pyc
+sessions/*.jsonl
+memory.md
+menagerie.json
+gallery.json
+*credentials*
+*password*
+auth.json
+.DS_Store

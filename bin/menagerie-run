@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Foreground launcher for systemd (does not daemonize) — offline llama.cpp only
+set -euo pipefail
+export PATH="$HOME/bin:$PATH"
+MODEL="${PIXIE_LLM_MODEL:-}"
+if [[ -z "$MODEL" ]]; then
+  # default profile: qwen3-4b if present, else qwen base, else coder
+  if [[ -f "$HOME/.local/share/pixie/models/qwen3-4b-instruct-q4_k_m.gguf" ]]; then
+    MODEL="$HOME/.local/share/pixie/models/qwen3-4b-instruct-q4_k_m.gguf"
+  elif [[ -f "$HOME/.local/share/pixie/models/qwen2.5-3b-instruct-q4_k_m.gguf" ]]; then
+    MODEL="$HOME/.local/share/pixie/models/qwen2.5-3b-instruct-q4_k_m.gguf"
+  else
+    MODEL="$(compgen -G "$HOME/.local/share/pixie/models/qwen*coder*.gguf" | head -1)"
+  fi
+fi
+HOST="${PIXIE_LLM_HOST:-127.0.0.1}"
+PORT="${PIXIE_LLM_PORT:-8080}"
+# 2048 was too small — long agent chats return HTTP 400 (context exceeded)
+CTX="${PIXIE_LLM_CTX:-8192}"
+# 8 gen threads / 16 prompt threads measured optimal on this box (see menagerie)
+THREADS="${PIXIE_LLM_THREADS:-8}"
+THREADS_BATCH="${PIXIE_LLM_THREADS_BATCH:-16}"
+NGL="${PIXIE_LLM_NGL:-0}"
+# unload the model from RAM after this many idle seconds (0 = keep resident);
+# the server stays up and reloads it on the next request
+SLEEP_IDLE="${PIXIE_LLM_SLEEP_IDLE:-300}"
+if [[ "$SLEEP_IDLE" -le 0 ]]; then SLEEP_IDLE=-1; fi
+ALIAS="${PIXIE_LLM_ALIAS:-qwen}"
+case "$MODEL" in
+  *qwen*) ALIAS="${PIXIE_LLM_ALIAS:-qwen}" ;;
+esac
+LIB="$HOME/.local/lib/pixie"
+export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [[ -n "${PIXIE_LLAMA_SERVER:-}" && -x "${PIXIE_LLAMA_SERVER}" ]]; then
+  SRV="$PIXIE_LLAMA_SERVER"
+elif [[ -x "$HOME/bin/llama-server" ]]; then
+  SRV="$HOME/bin/llama-server"
+elif [[ -x "$LIB/llama-server" ]]; then
+  SRV="$LIB/llama-server"
+elif command -v llama-server >/dev/null 2>&1; then
+  SRV=$(command -v llama-server)
+else
+  echo "llama-server not found" >&2
+  exit 1
+fi
+[[ -e "$MODEL" ]] || { echo "model missing: $MODEL" >&2; exit 1; }
+exec "$SRV" -m "$MODEL" --host "$HOST" --port "$PORT" -c "$CTX" -t "$THREADS" -tb "$THREADS_BATCH" -ngl "$NGL" --alias "$ALIAS" --sleep-idle-seconds "$SLEEP_IDLE" --chat-template "{%- if tools -%}{{- '<|im_start|>system\nYou have access to the following tools:\n' -}}{%- for tool in tools -%}{{- tool | tojson -}}{{- '\n\n' -}}{%- endfor -%}{{- 'To call a function, respond with a JSON object containing name and arguments.\n<|im_end|>\n' -}}{%- endif -%}{%- for message in messages -%}{{- '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n' -}}{%- endfor -%}{{- '<|im_start|>assistant\n' -}}" --timeout 300

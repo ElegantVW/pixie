@@ -1,0 +1,77 @@
+/**
+ * Pixie pink Rofi theme
+ * Usage: rofi -show drun -theme pixie
+ */
+* {
+    bg:              #1a0a12;
+    fg:              #ffe3ee;
+    bg-alt:          #2a1520;
+    pink:            #e879a0;
+    dark-pink:       #c44d7a;
+    hot-pink:        #ff2d55;
+    dim-pink:        #9d5c75;
+    silver:          #c0c0c8;
+    font:            "DejaVu Sans Mono 12";
+}
+
+window {
+    background-color: @bg;
+    border:           2px solid @dark-pink;
+    border-radius:    8px;
+    padding:          4px;
+}
+
+mainbox {
+    children: [ inputbar, listview ];
+}
+
+inputbar {
+    background-color: @bg-alt;
+    border-radius:    6px;
+    padding:          8px 12px;
+    margin:           4px;
+}
+
+prompt {
+    text-color: @pink;
+    font:       @font;
+}
+
+entry {
+    text-color: @fg;
+    font:       @font;
+    background-color: transparent;
+}
+
+listview {
+    background-color: transparent;
+    margin:           4px;
+    lines:            12;
+    columns:          1;
+    scrollbar:        false;
+}
+
+element {
+    border-radius:    4px;
+    padding:          6px 12px;
+    text-color:       @fg;
+    font:             @font;
+}
+
+element selected {
+    background-color: @dark-pink;
+    text-color:       @fg;
+}
+
+element-text {
+    margin:           0 8px;
+}
+
+element-icon {
+    size: 24px;
+}
+
+element-icon.urgent,
+element-icon.active {
+    text-color: @hot-pink;
+}

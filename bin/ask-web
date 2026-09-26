@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# ask-web — web-focused wrapper around `ask` (search + local model).
+# Usage:
+#   ask-web "What happened with the AUR malware in 2026?"
+#   ask-web -m qwen "Latest Arch news"
+#   ask-web --search-only "ufw arch linux"
+set -euo pipefail
+
+MODEL="${ASK_WEB_MODEL:-${ASK_MODEL:-qwen}}"
+ARGS=()
+SEARCH_ONLY=0
+QUERY=()
+
+usage() {
+  cat <<'EOF'
+Usage: ask-web [options] "your question"
+
+  -m MODEL       local model alias (default: qwen)
+  --search-only  Only print search snippets (no LLM)
+  -h, --help     Show this help
+
+This calls `ask --web` so the model can use web search (and file tools if needed).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m) MODEL="${2:-}"; shift 2 ;;
+    --search-only) SEARCH_ONLY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; QUERY+=("$@"); break ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *) QUERY+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#QUERY[@]} -eq 0 ]]; then
+  usage >&2
+  exit 1
+fi
+
+export PATH="$HOME/bin:$PATH"
+if [[ "$SEARCH_ONLY" -eq 1 ]]; then
+  exec ask --search-only "${QUERY[@]}"
+fi
+exec ask --web -m "$MODEL" "${QUERY[@]}"

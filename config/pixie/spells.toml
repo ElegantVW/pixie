@@ -1,0 +1,65 @@
+# House spells Pixie may call without inventing bash.
+# bin is looked up on $HOME/bin then PATH. confirm=true asks before run.
+
+[spells.V]
+bin = "V"
+confirm = true
+note = "Vanguarda desk"
+
+[spells.siren]
+bin = "siren"
+confirm = false
+
+[spells.play]
+bin = "siren"
+args = ["play"]
+confirm = false
+
+[spells.magpie]
+bin = "magpie"
+confirm = false
+
+[spells.summon]
+bin = "summon"
+confirm = false
+
+[spells.scroll]
+bin = "scroll"
+confirm = false
+
+[spells.goblin]
+bin = "goblin"
+confirm = false
+
+[spells.menagerie]
+bin = "menagerie"
+args = ["status"]
+confirm = false
+
+[spells.faectl]
+bin = "faectl"
+confirm = false
+
+[spells.eye]
+bin = "eye"
+confirm = false
+
+[spells.vault]
+bin = "vault"
+confirm = false
+
+[spells.alchemy]
+bin = "alchemy"
+confirm = true
+
+[spells.spellbook]
+bin = "spellbook"
+confirm = false
+
+[spells.imp]
+bin = "imp"
+confirm = false
+
+[spells.reflection]
+bin = "reflection"
+confirm = false

@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+"""ask — local offline agent (llama.cpp / menagerie) + tools (home-dir only).
+
+Usage:
+  ask "create ~/notes/todo.txt with a shopping list"
+  ask -m qwen "what is in my Downloads folder?"
+  ask --web "latest Arch security news"
+  ask --search-only "query"          # snippets only, no model
+
+Requires: menagerie ensure ask   (ask's own llama.cpp on 127.0.0.1:8090)
+Env: PIXIE_LLM_URL=http://127.0.0.1:8090
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+from xml.etree import ElementTree as ET
+
+# Import fae_termart for shared color palette
+import sys as _sys
+_sys.path.insert(0, str(Path.home() / "bin"))
+import fae_termart as art  # noqa: E402
+
+from fae_termart import Palette as P, PIXIE_WAIT, PIXIE_SCREEN
+
+# Force Unicode box drawing for smooth round corners
+os.environ["PIXIE_UNICODE"] = "1"
+
+HOME = Path.home().resolve()
+# Offline llama.cpp only (menagerie — ask owns its instance on 8090)
+LLAMA = os.environ.get("PIXIE_LLM_URL", "http://127.0.0.1:8090").rstrip("/")
+DEFAULT_MODEL = os.environ.get(
+    "ASK_MODEL",
+    os.environ.get("ASK_WEB_MODEL", os.environ.get("PIXIE_LLM_ALIAS", "qwen")),
+)
+MAX_ROUNDS = 12
+MAX_READ = 200_000
+MAX_WRITE = 500_000
+UA = "ask/1.0 (local offline agent)"
+# How often to rotate wait copy while model runs (does not clear the screen)
+WAIT_ROTATE_SEC = float(os.environ.get("PIXIE_WAIT_SEC", "10"))
+
+# Verbose agent debug (round/cwd): ~/.config/pixie/verbose = on|off
+PIXIE_CONFIG = Path.home() / ".config" / "pixie"
+VERBOSE_FILE = PIXIE_CONFIG / "verbose"
+
+# Paths we refuse to touch even under $HOME
+BLOCKED_PREFIXES = (
+    HOME / ".ssh",
+    HOME / ".gnupg",
+    HOME / ".grok" / "credentials",
+)
+
+
+def eprint(*a: Any, **k: Any) -> None:
+    print(*a, file=sys.stderr, **k)
+
+
+def clear_line() -> None:
+    eprint("\r\033[K", end="", flush=True)
+
+
+def verbose_enabled(cli_verbose: bool | None = None) -> bool:
+    """cli_verbose True/False overrides file; None → read config (default off)."""
+    if cli_verbose is True:
+        return True
+    if cli_verbose is False:
+        return False
+    env = os.environ.get("PIXIE_VERBOSE", "").strip().lower()
+    if env in ("1", "on", "true", "yes"):
+        return True
+    if env in ("0", "off", "false", "no"):
+        return False
+    try:
+        return VERBOSE_FILE.read_text(encoding="utf-8").strip().lower() in (
+            "1",
+            "on",
+            "true",
+            "yes",
+        )
+    except OSError:
+        return False
+
+
+def set_verbose(on: bool) -> None:
+    PIXIE_CONFIG.mkdir(parents=True, exist_ok=True)
+    VERBOSE_FILE.write_text("on\n" if on else "off\n", encoding="utf-8")
+    VERBOSE_FILE.chmod(0o600)
+
+
+def _busy_base() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+
+def _busy_path() -> Path:
+    """Lock file so zsh idle tick will not clear while Pixie is thinking."""
+    return _busy_base() / f"pixie-busy.{os.getpid()}"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _busy_purge_stale() -> None:
+    """Remove pixie-busy.* locks whose PID is gone (timeouts / kill -9)."""
+    try:
+        for p in _busy_base().glob("pixie-busy.*"):
+            if not p.is_file():
+                continue
+            try:
+                pid = int(p.name.rsplit(".", 1)[-1])
+            except ValueError:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                continue
+            if not _pid_alive(pid):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _screen_hold(name: str, seconds: float | None = None) -> None:
+    try:
+        import subprocess as _sp
+
+        argv = [str(PIXIE_SCREEN), "hold", name]
+        if seconds is not None:
+            argv.append(str(seconds))
+        _sp.run(argv, check=False, timeout=1, capture_output=True)
+    except Exception:
+        pass
+
+
+def _screen_release(name: str) -> None:
+    try:
+        import subprocess as _sp
+
+        _sp.run(
+            [str(PIXIE_SCREEN), "release", name],
+            check=False,
+            timeout=1,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+
+
+def _busy_acquire() -> Path:
+    _busy_purge_stale()
+    p = _busy_path()
+    try:
+        p.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+    # Central policy — new features use the same hold API
+    _screen_hold(f"busy.{os.getpid()}")
+    return p
+
+
+def _busy_release(p: Path | None = None) -> None:
+    path = p or _busy_path()
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+    _screen_release(f"busy.{os.getpid()}")
+    _busy_purge_stale()
+
+
+class PixieWaitDisplay:
+    """In-place wait spinner (stderr only). Never full-screen clears.
+
+    Full-screen clear was fighting zsh's info box / cursor and painting the
+    prompt on top of the final reply. We only redraw the wait box in place,
+    then erase it cleanly before the reply is printed on stdout.
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, extra: str = "", rotate_sec: float = WAIT_ROTATE_SEC) -> None:
+        self.extra = extra
+        self.rotate_sec = max(3.0, rotate_sec)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._label = random.choice(PIXIE_WAIT)
+        self._i = 0
+        self._last_label_at = 0.0
+        self._drawn = False
+        self._box_h = 0
+        self._lock = threading.Lock()
+        self._busy: Path | None = None
+
+    def set_extra(self, extra: str) -> None:
+        with self._lock:
+            self.extra = extra or ""
+
+    def _box_lines(self) -> list[str]:
+        f = self.FRAMES[self._i % len(self.FRAMES)]
+        label = self._label
+        extra = self.extra or ""
+        try:
+            sys.path.insert(0, str(Path.home() / "bin"))
+            import fae_termart as art  # type: ignore
+
+            body = f"{f}  {label}{extra}"
+            framed = art.box(
+                body,
+                title="Pixie",
+                width=min(64, art.term_width()),
+                body_style=(art.P.PINK, art.P.BOLD),
+            )
+            return framed.splitlines()
+        except Exception:
+            inner = max(28, min(56, len(f"{f}  {label}{extra}") + 2))
+            top = art.paint("╭─ ✦ Pixie ", P.PINK_DIM) + art.paint(
+                "─" * max(0, inner - 10) + "╮", P.PINK_DIM
+            )
+            mid_plain = f"{f}  {label}{extra}"
+            space = max(0, inner - len(mid_plain))
+            mid = (
+                art.paint("│", P.PINK_DIM)
+                + " "
+                + art.paint(f, P.PINK)
+                + "  "
+                + art.paint(label, P.BOLD, P.PINK)
+                + art.paint(extra, P.MUTED)
+                + (" " * space)
+                + " "
+                + art.paint("│", P.PINK_DIM)
+            )
+            bot = art.paint("╰" + "─" * (inner + 2) + "╯", P.PINK_DIM)
+            return [top, mid, bot]
+
+    def _draw(self) -> None:
+        with self._lock:
+            lines = self._box_lines()
+            h = len(lines)
+            if self._drawn and self._box_h:
+                # move to top of previous box, then rewrite
+                eprint(f"\033[{self._box_h}A", end="")
+            for line in lines:
+                eprint(f"\r\033[K{line}")
+            # if new box shorter, clear leftover lines
+            if self._drawn and h < self._box_h:
+                for _ in range(self._box_h - h):
+                    eprint("\r\033[K")
+                eprint(f"\033[{self._box_h - h}A", end="")
+            self._box_h = h
+            self._drawn = True
+
+    def _erase(self) -> None:
+        with self._lock:
+            if not self._drawn or not self._box_h:
+                self._drawn = False
+                return
+            # cursor is just under the box; go up and blank each row
+            eprint(f"\033[{self._box_h}A", end="")
+            for _ in range(self._box_h):
+                eprint("\r\033[K")
+            # leave cursor at the first blanked row (clean for stdout reply)
+            self._drawn = False
+            self._box_h = 0
+            eprint("", flush=True)
+
+    def _run(self) -> None:
+        self._last_label_at = time.monotonic()
+        self._draw()
+        while not self._stop.wait(0.12):
+            self._i += 1
+            now = time.monotonic()
+            if now - self._last_label_at >= self.rotate_sec:
+                choices = [m for m in PIXIE_WAIT if m != self._label] or list(PIXIE_WAIT)
+                self._label = random.choice(choices)
+                self._last_label_at = now
+            self._draw()
+
+    def __enter__(self) -> "PixieWaitDisplay":
+        self._busy = _busy_acquire()  # file lock + pixie-screen hold busy.<pid>
+        self._thread = threading.Thread(target=self._run, name="pixie-wait", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._erase()
+        _busy_release(self._busy)
+        self._busy = None
+
+
+def _http_json(url: str, body: dict | None = None, timeout: float = 600) -> dict:
+    if body is None:
+        req = urllib.request.Request(url, headers={"User-Agent": UA}, method="GET")
+    else:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": UA},
+            method="POST",
+        )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(f"HTTP {e.code} from {url}: {detail}") from e
+
+
+def llm_up() -> bool:
+    """True if llama-server (menagerie) answers on localhost.
+
+    200 = loaded; 503 = server up, model asleep (sleep-idle) — either is
+    usable, the first request wakes the model.
+    """
+    for path in ("/health", "/v1/models"):
+        try:
+            with urllib.request.urlopen(f"{LLAMA}{path}", timeout=2) as r:
+                if r.status in (200, 503):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def ensure_llm_up() -> bool:
+    """Summon ask's own critter (menagerie ensure ask, port 8090) and wait."""
+    import subprocess
+    import time
+    try:
+        subprocess.run(
+            [str(Path.home() / "bin" / "menagerie"), "ensure", "ask"],
+            capture_output=True, timeout=240)
+    except Exception:
+        pass
+    for _ in range(90):
+        if llm_up():
+            return True
+        time.sleep(1)
+    return llm_up()
+
+
+def normalize_chat_messages(messages: list[dict]) -> list[dict]:
+    """Strict chat templates (Mistral) require alternating user/assistant.
+
+    Agent often appends several user turns (hints, tool results). Merge
+    consecutive same-role messages and keep a single leading system block.
+    """
+    if not messages:
+        return []
+    systems: list[str] = []
+    turns: list[dict] = []
+    for m in messages:
+        role = str(m.get("role") or "user").strip().lower()
+        content = str(m.get("content") or "")
+        if role == "system":
+            if content.strip():
+                systems.append(content)
+            continue
+        if role not in ("user", "assistant"):
+            role = "user"
+        if turns and turns[-1]["role"] == role:
+            turns[-1]["content"] = (turns[-1]["content"] + "\n\n" + content).strip()
+        else:
+            turns.append({"role": role, "content": content})
+    # Template wants user/assistant/user… — never start with assistant
+    if turns and turns[0]["role"] == "assistant":
+        turns.insert(0, {"role": "user", "content": "(continue)"})
+    out: list[dict] = []
+    if systems:
+        out.append({"role": "system", "content": "\n\n".join(systems)})
+    out.extend(turns)
+    # Must end with user so the model generates the next assistant turn
+    if out and out[-1]["role"] == "assistant":
+        out.append({"role": "user", "content": "Continue."})
+    if not any(m["role"] == "user" for m in out):
+        out.append({"role": "user", "content": "Hello"})
+    return out
+
+
+def _pixie_max_tokens(default: int = 512) -> int:
+    """Generation budget for Pixie finals/tools.
+
+    Potato-friendly default (512): 8GB RAM + CPU Mistral-7B times out / swaps
+    with 1.5k–2k. Override: PIXIE_MAX_TOKENS=768 (still light) or 256 (snappy).
+    """
+    raw = os.environ.get("PIXIE_MAX_TOKENS", "").strip()
+    if raw.isdigit():
+        return max(128, min(4096, int(raw)))
+    return default
+
+
+def llm_chat(model: str, messages: list[dict], temperature: float = 0.2) -> str:
+    """Chat via offline llama.cpp (OpenAI-compatible, localhost only)."""
+    if not llm_up():
+        raise RuntimeError(
+            f"no local LLM: summon it with `menagerie ensure ask` ({LLAMA})"
+        )
+    normalized = normalize_chat_messages(messages)
+    body = {
+        "model": model or "qwen",
+        "messages": normalized,
+        "temperature": temperature,
+        "max_tokens": _pixie_max_tokens(),
+        "stream": False,
+    }
+    data = _http_json(f"{LLAMA}/v1/chat/completions", body, timeout=600)
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    text = str(msg.get("content") or "")
+    fr = choices[0].get("finish_reason")
+    # Only annotate obvious hard cuts on final-looking text (not tool JSON)
+    if fr in ("length", "max_tokens") and text and '"tool"' not in text[:40]:
+        if not text.rstrip().endswith(("…", "...", "}")):
+            text = text.rstrip() + "\n\n(Pixie ran out of breath — token ceiling. On this box stay near PIXIE_MAX_TOKENS=512–768.)"
+    return text
+
+
+# ── path safety + session cwd ────────────────────────────────────────────────
+
+def _assert_allowed(p: Path) -> Path:
+    try:
+        p.relative_to(HOME)
+    except ValueError as e:
+        raise PermissionError(f"refusing path outside home ({HOME}): {p}") from e
+    for b in BLOCKED_PREFIXES:
+        try:
+            p.relative_to(b)
+            raise PermissionError(f"refusing sensitive path: {p}")
+        except ValueError:
+            pass
+    return p
+
+
+def resolve_user_path(raw: str, cwd: Path | None = None) -> Path:
+    """Resolve path under $HOME. Relative paths use agent cwd (not process cwd)."""
+    raw = (raw or "").strip()
+    base = cwd if cwd is not None else HOME
+    if not raw or raw == ".":
+        return _assert_allowed(base.resolve())
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    else:
+        p = p.resolve()
+    return _assert_allowed(p)
+
+
+def _initial_cwd() -> Path:
+    """Start Pixie where the shell is (user's cd), not always $HOME.
+
+    Order: $PWD (shell) → process cwd → $HOME. Outside-home paths fall back
+    to home (agent stays sandboxed under $HOME).
+    """
+    candidates: list[Path] = []
+    for raw in (os.environ.get("PWD"), os.environ.get("PIXIE_CWD")):
+        if raw:
+            candidates.append(Path(raw).expanduser())
+    try:
+        candidates.append(Path.cwd())
+    except OSError:
+        pass
+    candidates.append(HOME)
+    for c in candidates:
+        try:
+            p = c.resolve()
+            if not p.is_dir():
+                continue
+            return _assert_allowed(p)
+        except (PermissionError, OSError, ValueError):
+            continue
+    return HOME
+
+
+def _remember_cwd(p: Path) -> None:
+    """Share agent cwd with the prompt / next tools (best-effort)."""
+    try:
+        cache = Path.home() / ".cache" / "pixie"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "cwd").write_text(str(p) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+class FSSession:
+    """Shell-like working directory for the agent (always under $HOME).
+
+    Initial cwd matches the user's shell directory when pixie/ask is launched.
+    """
+
+    def __init__(self) -> None:
+        self.cwd: Path = _initial_cwd()
+        _remember_cwd(self.cwd)
+
+    def resolve(self, raw: str | None = None) -> Path:
+        if raw is None or str(raw).strip() == "":
+            return self.cwd
+        return resolve_user_path(str(raw), self.cwd)
+
+    def pwd(self) -> str:
+        return str(self.cwd)
+
+    def cd(self, path: str = "~") -> str:
+        target = self.resolve(path or "~")
+        if path in ("~", ""):
+            target = HOME
+        if not target.exists():
+            return f"error: no such directory: {target}"
+        if not target.is_dir():
+            return f"error: not a directory: {target}"
+        self.cwd = target
+        _remember_cwd(self.cwd)
+        return f"cwd: {self.cwd}"
+
+
+# ── web search ───────────────────────────────────────────────────────────────
+
+def fetch(url: str, timeout: int = 8, quiet: bool = True) -> bytes | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except Exception as e:
+        if not quiet:
+            eprint(f"[search] skip {url.split('/')[2] if '//' in url else url}: {e}")
+        return None
+
+
+def strip_tags(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def web_search(query: str, quiet: bool = True) -> str:
+    q = (query or "").strip()
+    if not q:
+        return "error: empty query"
+    blocks: list[str] = []
+
+    # Wikipedia
+    try:
+        oq = urllib.parse.quote(q)
+        raw = fetch(
+            f"https://en.wikipedia.org/w/api.php?action=opensearch&search={oq}&limit=3&format=json",
+            quiet=quiet,
+        )
+        if raw:
+            data = json.loads(raw.decode("utf-8", "replace"))
+            titles = data[1] if len(data) > 1 else []
+            descs = data[2] if len(data) > 2 else []
+            for i, title in enumerate(titles[:3]):
+                tq = urllib.parse.quote(title.replace(" ", "_"))
+                sraw = fetch(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{tq}",
+                    quiet=quiet,
+                )
+                if not sraw:
+                    continue
+                s = json.loads(sraw.decode("utf-8", "replace"))
+                extract = (s.get("extract") or (descs[i] if i < len(descs) else "")) or ""
+                if extract:
+                    blocks.append(f"[Wikipedia] {title}\n{extract[:900]}")
+    except Exception as e:
+        if not quiet:
+            eprint(f"[search] wikipedia error: {e}")
+
+    # News headlines only
+    try:
+        nq = urllib.parse.quote_plus(q)
+        raw = fetch(
+            f"https://news.google.com/rss/search?q={nq}&hl=en-US&gl=US&ceid=US:en",
+            quiet=quiet,
+        )
+        if raw:
+            root = ET.fromstring(raw)
+            lines = []
+            for it in root.findall(".//item")[:5]:
+                title = (it.findtext("title") or "").strip()
+                if title:
+                    lines.append(f"- {title}")
+            if lines:
+                blocks.append("[News headlines]\n" + "\n".join(lines))
+    except Exception as e:
+        if not quiet:
+            eprint(f"[search] news error: {e}")
+
+    # DuckDuckGo (optional)
+    try:
+        dq = urllib.parse.quote_plus(q)
+        raw = fetch(f"https://html.duckduckgo.com/html/?q={dq}", timeout=5, quiet=quiet)
+        if raw:
+            text = raw.decode("utf-8", "replace")
+            results = re.findall(
+                r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</(?:a|td|div)',
+                text,
+                flags=re.I | re.S,
+            )
+            lines = []
+            for _href, title, snip in results[:5]:
+                title = strip_tags(title)
+                snip = strip_tags(snip)[:280]
+                if title:
+                    lines.append(f"- {title}: {snip}" if snip else f"- {title}")
+            if lines:
+                blocks.append("[Web results]\n" + "\n".join(lines))
+    except Exception as e:
+        if not quiet:
+            eprint(f"[search] ddg error: {e}")
+
+    if not blocks:
+        return "(No web results fetched.)"
+    return "\n\n".join(blocks)[:12000]
+
+
+# ── file tools (session-aware) ───────────────────────────────────────────────
+
+def _as_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return str(v).lower() in ("1", "true", "yes", "on")
+
+
+def _human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            if unit == "B":
+                return f"{int(size)}B"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{int(size)}B"
+
+
+def tool_ls(fs: FSSession, path: str | None = None, all: bool = False, long: bool = True) -> str:
+    p = fs.resolve(path) if path not in (None, "") else fs.cwd
+    if not p.exists():
+        return f"error: not found: {p}"
+    if p.is_file():
+        st = p.stat()
+        return f"file  {p.name}  {_human_size(st.st_size)}  {p}"
+    if not p.is_dir():
+        return f"error: not a directory: {p}"
+    entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+    total = len(entries)
+    if not all:
+        entries = [e for e in entries if not e.name.startswith(".")]
+    lines = [f"{p}  (cwd={fs.cwd})"]
+    shown = entries[:300]
+    for e in shown:
+        try:
+            st = e.stat()
+            size = _human_size(st.st_size) if e.is_file() else "-"
+        except OSError:
+            size = "?"
+        kind = "dir " if e.is_dir() else "file"
+        if long:
+            lines.append(f"{kind}  {size:>8}  {e.name}")
+        else:
+            lines.append(f"{kind}  {e.name}")
+    if total > 300:
+        lines.append(f"... (truncated, {total} total entries)")
+    if len(lines) == 1:
+        lines.append("(empty)")
+    return "\n".join(lines)
+
+
+def tool_read_file(fs: FSSession, path: str) -> str:
+    p = fs.resolve(path)
+    if not p.is_file():
+        return f"error: not a file: {p}"
+    data = p.read_bytes()
+    truncated = False
+    if len(data) > MAX_READ:
+        data = data[:MAX_READ]
+        truncated = True
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"error: binary file ({len(data)} bytes): {p}"
+    if truncated:
+        text += f"\n\n… truncated at {MAX_READ} bytes"
+    return text
+
+
+def tool_write_file(fs: FSSession, path: str, content: str, mode: str = "overwrite") -> str:
+    p = fs.resolve(path)
+    content = content if content is not None else ""
+    if len(content.encode("utf-8")) > MAX_WRITE:
+        return f"error: content too large (max {MAX_WRITE} bytes)"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if mode == "append" and p.exists():
+        with p.open("a", encoding="utf-8") as f:
+            f.write(content)
+        return f"appended to {p} ({len(content)} chars)"
+    p.write_text(content, encoding="utf-8")
+    return f"wrote {p} ({len(content)} chars)"
+
+
+def tool_mkdir(fs: FSSession, path: str) -> str:
+    p = fs.resolve(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return f"directory ready: {p}"
+
+
+def tool_rm(fs: FSSession, path: str, recursive: bool = False) -> str:
+    """Remove file or directory. recursive=true is like rm -r."""
+    p = fs.resolve(path)
+    if not p.exists():
+        return f"error: not found: {p}"
+    if p == HOME:
+        return "error: refusing to remove home directory"
+    # if deleting cwd or ancestor, move cwd up first
+    try:
+        fs.cwd.relative_to(p)
+        fs.cwd = p.parent if p.parent != p else HOME
+        _assert_allowed(fs.cwd)
+    except ValueError:
+        pass
+    if p.is_dir():
+        if recursive:
+            shutil.rmtree(p)
+            return f"removed directory tree: {p}"
+        try:
+            p.rmdir()
+        except OSError as e:
+            return f"error: dir not empty (use recursive=true / rm -r): {e}"
+        return f"removed empty directory: {p}"
+    p.unlink()
+    return f"removed file: {p}"
+
+
+def tool_mv(fs: FSSession, src: str, dest: str) -> str:
+    s = fs.resolve(src)
+    d = fs.resolve(dest)
+    if not s.exists():
+        return f"error: not found: {s}"
+    if d.exists() and d.is_dir():
+        d = d / s.name
+    d.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(s), str(d))
+    if fs.cwd == s or str(fs.cwd).startswith(str(s) + os.sep):
+        fs.cwd = d if d.is_dir() else d.parent
+    return f"moved {s} → {d}"
+
+
+def tool_cp(fs: FSSession, src: str, dest: str, recursive: bool = False) -> str:
+    s = fs.resolve(src)
+    d = fs.resolve(dest)
+    if not s.exists():
+        return f"error: not found: {s}"
+    if d.exists() and d.is_dir():
+        d = d / s.name
+    d.parent.mkdir(parents=True, exist_ok=True)
+    if s.is_dir():
+        if not recursive:
+            return "error: src is directory (use recursive=true)"
+        if d.exists():
+            return f"error: dest exists: {d}"
+        shutil.copytree(s, d)
+    else:
+        shutil.copy2(s, d)
+    return f"copied {s} → {d}"
+
+
+def tool_find(fs: FSSession, pattern: str, path: str | None = None, max_results: int = 50) -> str:
+    """Glob search under path (default cwd). pattern like '*.txt' or '**/*.py'."""
+    root = fs.resolve(path) if path not in (None, "") else fs.cwd
+    if not root.exists():
+        return f"error: not found: {root}"
+    pat = (pattern or "*").strip()
+    if not pat:
+        pat = "*"
+    # default to recursive if no slash/globstar
+    if "**" not in pat and "/" not in pat and not pat.startswith("*."):
+        # bare name → match anywhere
+        search_pat = f"**/*{pat}*" if "*" not in pat else f"**/{pat}"
+    elif "**" not in pat and "/" not in pat:
+        search_pat = f"**/{pat}"
+    else:
+        search_pat = pat
+    hits: list[str] = []
+    try:
+        for match in root.glob(search_pat):
+            try:
+                _assert_allowed(match.resolve())
+            except PermissionError:
+                continue
+            rel = match.relative_to(root) if match.is_relative_to(root) else match
+            kind = "dir" if match.is_dir() else "file"
+            hits.append(f"{kind}  {rel}")
+            if len(hits) >= max_results:
+                hits.append(f"... truncated at {max_results}")
+                break
+    except Exception as e:
+        return f"error: {e}"
+    if not hits:
+        return f"no matches for {pat!r} under {root}"
+    return f"search in {root} pattern={pat!r}\n" + "\n".join(hits)
+
+
+def tool_grep(fs: FSSession, pattern: str, path: str | None = None, max_hits: int = 40) -> str:
+    """Search text files for regex pattern under path (file or directory)."""
+    root = fs.resolve(path) if path not in (None, "") else fs.cwd
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"error: bad regex: {e}"
+    files: list[Path] = []
+    if root.is_file():
+        files = [root]
+    elif root.is_dir():
+        for f in root.rglob("*"):
+            if f.is_file() and not any(part.startswith(".") for part in f.parts[-3:]):
+                files.append(f)
+            if len(files) > 500:
+                break
+    else:
+        return f"error: not found: {root}"
+
+    lines_out: list[str] = []
+    for f in files:
+        try:
+            _assert_allowed(f.resolve())
+        except PermissionError:
+            continue
+        try:
+            if f.stat().st_size > MAX_READ:
+                continue
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                try:
+                    rel = f.relative_to(HOME)
+                except ValueError:
+                    rel = f
+                lines_out.append(f"{rel}:{i}: {line[:200]}")
+                if len(lines_out) >= max_hits:
+                    lines_out.append(f"... truncated at {max_hits} hits")
+                    return "\n".join(lines_out)
+    return "\n".join(lines_out) if lines_out else f"no matches for /{pattern}/ under {root}"
+
+
+# --- Mail (aerc IMAP → ~/.cache/goblin/mail/{unread,read,trash}/*.txt) ---
+
+GOBLIN = Path.home() / "bin" / "goblin"
+MAIL_ROOT = Path.home() / ".cache" / "goblin" / "mail"
+
+
+def _run_goblin(argv: list[str], timeout: int = 120) -> str:
+    """Run goblin CLI; return stdout+stderr text for the agent."""
+    if not GOBLIN.is_file():
+        return f"error: goblin not found at {GOBLIN}"
+    try:
+        proc = subprocess.run(
+            [str(GOBLIN), *argv],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{os.environ.get('PATH', '')}"},
+        )
+    except subprocess.TimeoutExpired:
+        return f"error: goblin timed out after {timeout}s (IMAP slow or unreachable?)"
+    except OSError as e:
+        return f"error: could not run goblin: {e}"
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    parts = []
+    if out:
+        parts.append(out)
+    if err:
+        parts.append(f"[log]\n{err}")
+    if proc.returncode != 0 and not parts:
+        parts.append(f"error: goblin exit {proc.returncode}")
+    elif proc.returncode != 0:
+        parts.append(f"(exit {proc.returncode})")
+    return "\n".join(parts) if parts else "(no output)"
+
+
+def tool_mail_sync(folder: str | None = None, all_recent: bool = False) -> str:
+    """Download mail from aerc IMAP into ~/.cache/goblin/mail/unread/*.txt.
+
+    Default: UNSEEN only. all_recent=True pulls newest messages even if Seen
+    (used when local unread is empty after a prior fetch).
+    """
+    argv = ["sync"]
+    if folder:
+        argv.extend(["--folder", folder])
+    if all_recent:
+        argv.append("--all")
+    return _run_goblin(argv, timeout=180)
+
+
+def tool_mail_list(box: str = "unread") -> str:
+    """List local mail files in unread|read|trash."""
+    box = (box or "unread").strip().lower()
+    if box not in ("unread", "read", "trash"):
+        return "error: box must be unread, read, or trash"
+    return _run_goblin(["list", box, "--plain"])
+
+
+def tool_mail_bundle() -> str:
+    """All unread messages as one text blob for summarization."""
+    return _run_goblin(["bundle"])
+
+
+def tool_mail_show(file: str) -> str:
+    """Print one local mail .txt (filename or path under unread/)."""
+    if not file or not str(file).strip():
+        return "error: file name required"
+    return _run_goblin(["show", str(file).strip(), "--plain"])
+
+
+def tool_mail_move(
+    dest: str,
+    files: list[str] | None = None,
+    all_unread: bool = False,
+    local_only: bool = False,
+) -> str:
+    """Move local unread mail to read or trash (and update IMAP unless local_only)."""
+    dest = (dest or "").strip().lower()
+    if dest not in ("read", "trash"):
+        return "error: dest must be 'read' or 'trash'"
+    argv = ["move", dest]
+    if all_unread:
+        argv.append("--all")
+    if local_only:
+        argv.append("--local-only")
+    for f in files or []:
+        if f:
+            argv.append(str(f))
+    if not all_unread and not files:
+        return "error: pass files=[...] or all=true"
+    return _run_goblin(argv, timeout=180)
+
+
+def run_tool(fs: FSSession, name: str, args: dict, quiet: bool = True) -> str:
+    args = args or {}
+    name = str(name).strip().lower()
+    # aliases
+    aliases = {
+        "list_dir": "ls",
+        "listdir": "ls",
+        "dir": "ls",
+        "remove": "rm",
+        "delete": "rm",
+        "unlink": "rm",
+        "cat": "read_file",
+        "read": "read_file",
+        "write": "write_file",
+        "touch_write": "write_file",
+        "move": "mv",
+        "rename": "mv",
+        "copy": "cp",
+        "search_files": "find",
+        "glob": "find",
+        "cwd": "pwd",
+        "chdir": "cd",
+        # mail
+        "check_mail": "mail_sync",
+        "sync_mail": "mail_sync",
+        "email_sync": "mail_sync",
+        "list_mail": "mail_list",
+        "mail_list_unread": "mail_list",
+        "unread_mail": "mail_bundle",
+        "mail_unread": "mail_bundle",
+        "read_mail": "mail_show",
+        "mail_read": "mail_show",
+        "show_mail": "mail_show",
+        "move_mail": "mail_move",
+        "email_move": "mail_move",
+    }
+    name = aliases.get(name, name)
+
+    try:
+        if name == "web_search":
+            return web_search(str(args.get("query", "")), quiet=quiet)
+        if name == "pwd":
+            return fs.pwd()
+        if name == "cd":
+            return fs.cd(str(args.get("path", args.get("dir", "~"))))
+        if name == "ls":
+            return tool_ls(
+                fs,
+                args.get("path"),
+                all=_as_bool(args.get("all"), False),
+                long=_as_bool(args.get("long"), True),
+            )
+        if name == "read_file":
+            return tool_read_file(fs, str(args.get("path", "")))
+        if name == "write_file":
+            return tool_write_file(
+                fs,
+                str(args.get("path", "")),
+                str(args.get("content", "")),
+                str(args.get("mode", "overwrite") or "overwrite"),
+            )
+        if name == "mkdir":
+            return tool_mkdir(fs, str(args.get("path", "")))
+        if name == "rm":
+            return tool_rm(
+                fs,
+                str(args.get("path", "")),
+                recursive=_as_bool(args.get("recursive"), False),
+            )
+        if name == "mv":
+            return tool_mv(fs, str(args.get("src", args.get("from", ""))), str(args.get("dest", args.get("to", ""))))
+        if name == "cp":
+            return tool_cp(
+                fs,
+                str(args.get("src", args.get("from", ""))),
+                str(args.get("dest", args.get("to", ""))),
+                recursive=_as_bool(args.get("recursive"), False),
+            )
+        if name == "find":
+            return tool_find(
+                fs,
+                str(args.get("pattern", args.get("query", "*"))),
+                args.get("path"),
+                max_results=int(args.get("max_results", 50) or 50),
+            )
+        if name == "grep":
+            return tool_grep(
+                fs,
+                str(args.get("pattern", args.get("query", ""))),
+                args.get("path"),
+                max_hits=int(args.get("max_hits", 40) or 40),
+            )
+        # --- email ---
+        if name == "mail_sync":
+            folder = args.get("folder")
+            return tool_mail_sync(
+                str(folder) if folder else None,
+                all_recent=_as_bool(args.get("all", args.get("all_recent")), False),
+            )
+        if name == "mail_list":
+            return tool_mail_list(str(args.get("box", args.get("folder", "unread")) or "unread"))
+        if name == "mail_bundle":
+            return tool_mail_bundle()
+        if name == "mail_show":
+            return tool_mail_show(str(args.get("file", args.get("path", args.get("name", "")))))
+        if name == "mail_move":
+            files_arg = args.get("files") or args.get("file") or []
+            if isinstance(files_arg, str):
+                files_arg = [files_arg] if files_arg.strip() else []
+            return tool_mail_move(
+                dest=str(args.get("dest", args.get("to", ""))),
+                files=list(files_arg) if files_arg else None,
+                all_unread=_as_bool(args.get("all", args.get("all_unread")), False),
+                local_only=_as_bool(args.get("local_only"), False),
+            )
+        return f"error: unknown tool {name!r}"
+    except (PermissionError, ValueError, OSError) as e:
+        return f"error: {e}"
+
+
+SYSTEM = """You are Pixie — a clever, playful terminal pixie (she/her) who lives in this Linux shell.
+You love pink moonlight, tidy files, and helping your human without fuss.
+Speak like a witty companion, not a corporate bot. Never be mean or creepy.
+
+PERSONALITY (for {"final":"..."} only — tool calls stay pure JSON):
+- Always start the final answer in character, e.g.:
+  "Pixie thinks that…", "Pixie reckons…", "Hmm, Pixie would try…",
+  "Pixie peeked and…", "Hold my sparkles — …"
+- Vary the opener. Then give the useful answer clearly and briefly.
+- A little whimsy is good; still be accurate and practical.
+
+HOW YOU WORK:
+You have a shell-like working directory that starts at the user's *current*
+shell directory (same place they `cd`'d before calling pixie) — not always ~.
+Each turn output exactly ONE JSON object (no markdown fences, no extra chatter):
+
+Navigation:
+{"tool":"pwd","args":{}}
+{"tool":"cd","args":{"path":"Downloads"}}
+{"tool":"ls","args":{"path":".","all":false}}
+
+Files:
+{"tool":"read_file","args":{"path":"notes.txt"}}
+{"tool":"write_file","args":{"path":"notes.txt","content":"...","mode":"overwrite"}}
+{"tool":"mkdir","args":{"path":"projects/demo"}}
+{"tool":"rm","args":{"path":"old.txt","recursive":false}}
+{"tool":"mv","args":{"src":"a.txt","dest":"b.txt"}}
+{"tool":"cp","args":{"src":"a.txt","dest":"copy.txt","recursive":false}}
+{"tool":"find","args":{"pattern":"*.txt","path":"."}}
+{"tool":"grep","args":{"pattern":"TODO","path":"."}}
+
+Web:
+{"tool":"web_search","args":{"query":"..."}}
+
+Email tools (ONLY if the user is talking about email / inbox / mail):
+{"tool":"mail_sync","args":{}}
+{"tool":"mail_list","args":{"box":"unread"}}
+{"tool":"mail_bundle","args":{}}
+{"tool":"mail_show","args":{"file":"uid123_Subject.txt"}}
+{"tool":"mail_move","args":{"dest":"trash","all":true}}
+{"tool":"mail_move","args":{"dest":"read","files":["uid123_Subject.txt"]}}
+
+Done:
+{"final":"Pixie thinks that … useful answer here"}
+
+EMAIL — use ONLY when the user asks about mail/emails/inbox/unread:
+1. mail_sync, then mail_bundle; summarize real From/Subject only.
+2. Then ask whether to move items to trash or read; wait for confirmation.
+3. mail_move only after they confirm. Never invent emails.
+4. If the request is NOT about mail, do not call mail tools and do not
+   mention email, inbox, trash-folder, or "check your messages".
+
+RULES:
+- Answer the user's actual question. Stay on topic.
+- NEVER drag email into unrelated requests (jokes, advice, haiku, files, etc.).
+- Paths are relative to cwd unless they start with / or ~.
+- Stay under the user's home. Never touch .ssh or .gnupg.
+- Prefer cd + ls for exploration.
+- rm recursive=true only when the user clearly wants a whole tree gone.
+- write_file mode: "overwrite" (default) or "append".
+- For news/current events, use web_search first.
+- Never trash mail without the user saying so.
+- Never invent tool results.
+- Tool turns = JSON only. Final turns = JSON with in-character final text.
+"""
+
+
+def extract_json(text: str) -> dict | None:
+    """Return the first JSON object in text (one tool/final per model turn)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    if fence:
+        text = fence.group(1).strip()
+
+    # Prefer a single-line JSON object (common when model dumps several lines)
+    for line in text.splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and ("tool" in obj or "final" in obj):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    # First complete object via raw_decode
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        obj, _end = json.JSONDecoder().raw_decode(text[start:])
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        return None
+    return None
+
+
+def _last_pixie_reply(max_chars: int = 2000) -> str:
+    """Recent final reply (for multi-command follow-ups like mail trash/read)."""
+    path = Path.home() / ".cache" / "pixie" / "last-reply.txt"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[:max_chars] + "…"
+    return text
+
+
+def _last_reply_was_email() -> bool:
+    prev = _last_pixie_reply(800)
+    if not prev:
+        return False
+    return bool(
+        re.search(
+            r"\b(email|emails|e-?mail|inbox|unread|mail_move|subject:|from:|"
+            r"trash folder|mark as read|mail bundle|disroot)\b",
+            prev,
+            re.I,
+        )
+    )
+
+
+_EMAIL_CHECK_RE = re.compile(
+    r"\b("
+    r"emails?|e-mails?|inbox"
+    r"|check\s+(my\s+)?(e-?mails?|mail|inbox)"
+    r"|my\s+(e-?mails?|mail)"
+    r"|unread\s+(e-?mails?|mail|messages?)"
+    r"|summarize\s+(my\s+)?(e-?mails?|mail|inbox)"
+    r")\b",
+    re.I,
+)
+# bare "mail" alone is too broad ("blackmail", "chainmail") — require e-mail-ish phrasing
+_EMAIL_CHECK_RE_LOOSE_MAIL = re.compile(
+    r"\b(mail|mails)\b",
+    re.I,
+)
+_EMAIL_MOVE_RE = re.compile(
+    r"("
+    r"\b(trash|discard|junk)\b"
+    r"|\bmark\b[\w\s]{0,40}\bread\b"
+    r"|\b(archive|keep them|leave them)\b"
+    r"|\bmove\b[\w\s]{0,30}\b(trash|read|them|all|mail|emails?|everything)\b"
+    r"|\b(to|into)\s+(the\s+)?(trash|read)\b"
+    r"|\ball of them\b"
+    r")",
+    re.I,
+)
+
+
+def _looks_like_email_check(q: str) -> bool:
+    """User wants a fresh check/summary of mail (not a move follow-up)."""
+    q = (q or "").strip()
+    if not q:
+        return False
+    if _EMAIL_CHECK_RE.search(q):
+        return not _looks_like_email_move(q)
+    # plain "mail" / "mails" only if clearly about checking messages
+    if _EMAIL_CHECK_RE_LOOSE_MAIL.search(q) and re.search(
+        r"\b(check|read|show|list|open|sync|fetch|any|new|unread)\b", q, re.I
+    ):
+        return not _looks_like_email_move(q)
+    return False
+
+
+def _looks_like_email_move(q: str) -> bool:
+    """User wants to trash/archive/mark-read mail — not generic 'delete a file'."""
+    q = (q or "").strip()
+    if not q or not _EMAIL_MOVE_RE.search(q):
+        return False
+    # Need mail language in this turn, or a prior *email* reply + short follow-up
+    if _EMAIL_CHECK_RE.search(q) or _EMAIL_CHECK_RE_LOOSE_MAIL.search(q):
+        return True
+    if _last_reply_was_email() and (
+        re.search(r"\b(them|all|that|those|everything|yes|yep|ok|sure|do it)\b", q, re.I)
+        or len(q) < 48
+    ):
+        return True
+    return False
+
+
+def _looks_like_followup(q: str) -> bool:
+    """Only inject previous Pixie reply when this turn is a short continuation."""
+    q = (q or "").strip()
+    if not q:
+        return False
+    if _looks_like_email_check(q) or _looks_like_email_move(q):
+        return True
+    # short affirmations / references — not long new topics (bear haiku, etc.)
+    if len(q) <= 64 and re.search(
+        r"^(yes|no|yep|nope|yeah|nah|ok|okay|sure|please|thanks|thank you|"
+        r"do it|go ahead|that one|the first|the rest|same|again)\b",
+        q,
+        re.I,
+    ):
+        return True
+    if len(q) <= 80 and re.search(
+        r"\b(them|those|that one|all of them|the newsletter)\b", q, re.I
+    ):
+        return True
+    return False
+
+
+def agent(
+    question: str,
+    model: str,
+    force_web: bool = False,
+    verbose: bool | None = None,
+) -> str:
+    fs = FSSession()
+    show_debug = verbose_enabled(verbose)
+    user_block = f"Current working directory: {fs.cwd}\n\nUser request:\n{question}"
+    # Do NOT inject prior email chats into unrelated prompts (small models latch on).
+    if _looks_like_followup(question):
+        prev = _last_pixie_reply()
+        if prev:
+            user_block += (
+                "\n\n(Previous Pixie reply — only for this follow-up; "
+                "do not change the topic to email unless the user did):\n"
+                f"{prev}"
+            )
+    # Hard topic guard for the small local model
+    if not _looks_like_email_check(question) and not _looks_like_email_move(question):
+        user_block += (
+            "\n\n(Reminder: this request is NOT about email. "
+            "Do not mention email, inbox, or mail tools.)"
+        )
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM},
+        {
+            "role": "user",
+            "content": user_block,
+        },
+    ]
+    if force_web:
+        messages.append(
+            {
+                "role": "user",
+                "content": "(Hint: start with web_search for this request.)",
+            }
+        )
+    if _looks_like_email_check(question):
+        # Prefetch outside the model loop — small models are slow/unreliable
+        # at multi-step tool use, and we must never invent email content.
+        if show_debug:
+            eprint(
+                art.paint("✦ ", P.PINK)
+                + art.paint("Pixie uses ", P.PINK_DIM)
+                + art.paint("mail_sync", P.BOLD, P.DARK)
+                + art.paint("  (prefetch)", P.MUTED),
+                flush=True,
+            )
+        sync_out = tool_mail_sync()
+        # If server has no UNSEEN and local unread empty, pull recent Seen mail
+        local_unread = list((MAIL_ROOT / "unread").glob("*.txt")) if MAIL_ROOT.is_dir() else []
+        if not local_unread and (
+            "0 message" in sync_out or "no UNSEEN" in sync_out or "synced 0" in sync_out
+        ):
+            if show_debug:
+                eprint(
+                    art.paint("✦ ", P.PINK)
+                    + art.paint("Pixie uses ", P.PINK_DIM)
+                    + art.paint("mail_sync", P.BOLD, P.DARK)
+                    + art.paint('  {"all":true} (prefetch)', P.MUTED),
+                    flush=True,
+                )
+            sync_out = tool_mail_sync(all_recent=True)
+        if show_debug:
+            eprint(
+                art.paint("✦ ", P.PINK)
+                + art.paint("Pixie uses ", P.PINK_DIM)
+                + art.paint("mail_bundle", P.BOLD, P.DARK)
+                + art.paint("  (prefetch)", P.MUTED),
+                flush=True,
+            )
+        digest = tool_mail_bundle()
+        if show_debug:
+            preview = digest if len(digest) < 280 else digest[:280] + "…"
+            preview = preview.replace("\n", " ↵ ")
+            eprint(
+                art.paint("✧ ", P.OK)
+                + art.paint("result  ", P.PINK_DIM)
+                + art.paint(preview, P.SILVER),
+                flush=True,
+            )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Mail tools already ran. Do NOT call mail_sync or mail_bundle again.\n"
+                    "Reply with a single JSON final answer only — no other tools.\n\n"
+                    f"SYNC:\n{sync_out}\n\n"
+                    f"UNREAD DIGEST (only source of truth — do not invent emails):\n{digest}\n\n"
+                    "Write {\"final\":\"...\"} that:\n"
+                    "1) Starts in Pixie character\n"
+                    "2) Briefly summarizes each real message (From + Subject + gist)\n"
+                    "3) If digest is empty, say so honestly\n"
+                    "4) ALWAYS ends by asking whether to move all/any to trash or read "
+                    "(user will answer in a later command)\n"
+                    "Keep it readable; no fake subjects."
+                ),
+            }
+        )
+    elif _looks_like_email_move(question):
+        # Unambiguous "all → trash/read" — execute without another slow model round-trip
+        qlow = question.lower()
+        dest = None
+        if re.search(r"\b(trash|delete|discard|junk)\b", qlow) and re.search(
+            r"\b(all|everything|them all|all of them)\b", qlow
+        ):
+            dest = "trash"
+        elif re.search(r"\b(mark|move|as)\b", qlow) and re.search(
+            r"\bread\b", qlow
+        ) and re.search(r"\b(all|everything|them all|all of them)\b", qlow):
+            dest = "read"
+        if dest:
+            if show_debug:
+                eprint(
+                    art.paint("✦ ", P.PINK)
+                    + art.paint("Pixie uses ", P.PINK_DIM)
+                    + art.paint("mail_move", P.BOLD, P.DARK)
+                    + art.paint(f'  {{"dest":"{dest}","all":true}}', P.MUTED),
+                    flush=True,
+                )
+            result = tool_mail_move(dest=dest, all_unread=True)
+            if show_debug:
+                preview = result if len(result) < 280 else result[:280] + "…"
+                eprint(
+                    art.paint("✧ ", P.OK)
+                    + art.paint("result  ", P.PINK_DIM)
+                    + art.paint(preview.replace("\n", " ↵ "), P.SILVER),
+                    flush=True,
+                )
+            if dest == "trash":
+                return (
+                    f"Pixie swept them into the trash — done.\n{result}\n"
+                    "Say if you need anything fished back out (local copies live in "
+                    "~/.cache/goblin/mail/trash/)."
+                )
+            return (
+                f"Pixie marked them read and filed them away.\n{result}\n"
+                "Local copies are in ~/.cache/goblin/mail/read/."
+            )
+        # Selective move: give the model the file list + prior reply
+        listing = tool_mail_list("unread")
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Email move follow-up. Current local unread files:\n"
+                    f"{listing}\n\n"
+                    "Use mail_move with dest 'trash' or 'read' and either all=true "
+                    "or files=[exact filenames]. Then return {\"final\":\"...\"}.\n"
+                    "Do not invent filenames."
+                ),
+            }
+        )
+
+    # One wait spinner for the whole agent run (no per-round full clears)
+    with PixieWaitDisplay() as wait:
+        for round_i in range(1, MAX_ROUNDS + 1):
+            t0 = time.time()
+            if show_debug:
+                wait.set_extra(f"  (round {round_i}/{MAX_ROUNDS}, cwd={fs.cwd})")
+            try:
+                content = llm_chat(model, messages)
+            except Exception as e:
+                return f"Local LLM request failed: {e}"
+            elapsed = time.time() - t0
+            if show_debug:
+                eprint(
+                    art.paint("· ", P.PINK_DIM)
+                    + art.paint(f"Pixie landed in {elapsed:.0f}s", P.MUTED),
+                    flush=True,
+                )
+
+            obj = extract_json(content)
+            if obj is None:
+                return content.strip()
+
+            if "final" in obj and "tool" not in obj:
+                return str(obj["final"]).strip()
+
+            tool = obj.get("tool")
+            args = obj.get("args") or {}
+            if not tool:
+                if "final" in obj:
+                    return str(obj["final"]).strip()
+                return content.strip()
+
+            if show_debug:
+                args_s = json.dumps(args, ensure_ascii=False)[:200]
+                eprint(
+                    art.paint("✦ ", P.PINK)
+                    + art.paint("Pixie uses ", P.PINK_DIM)
+                    + art.paint(str(tool), P.BOLD, P.DARK)
+                    + art.paint(f"  {args_s}", P.MUTED),
+                    flush=True,
+                )
+            result = run_tool(
+                fs,
+                str(tool),
+                args if isinstance(args, dict) else {},
+                quiet=not show_debug,
+            )
+            if show_debug:
+                preview = result if len(result) < 280 else result[:280] + "…"
+                preview = preview.replace("\n", " ↵ ")
+                eprint(
+                    art.paint("✧ ", P.OK)
+                    + art.paint("result  ", P.PINK_DIM)
+                    + art.paint(preview, P.SILVER),
+                    flush=True,
+                )
+
+            messages.append(
+                {"role": "assistant", "content": json.dumps(obj, ensure_ascii=False)}
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"TOOL_RESULT ({tool}):\n{result}\n\n"
+                        f"cwd is now: {fs.cwd}\n"
+                        'Continue. Call another tool or return {"final":"..."}.'
+                    ),
+                }
+            )
+
+    return "Stopped: too many tool rounds. Try a simpler request."
+
+
+def _term_width(default: int = 72) -> int:
+    try:
+        sys.path.insert(0, str(Path.home() / "bin"))
+        import fae_termart as art  # type: ignore
+
+        return art.term_width(default)
+    except Exception:
+        try:
+            import shutil as _sh
+
+            return max(40, min(_sh.get_terminal_size((default, 24)).columns, 100))
+        except Exception:
+            return default
+
+
+def _box(title: str, body: str, *, accent: str = P.PINK) -> str:
+    """Unicode masterpiece box (shared fae_termart)."""
+    try:
+        # Map ask accents → termart still uses pink family for chrome
+        return art.box(
+            body,
+            title=title,
+            width=art.term_width(),
+            body_style=(P.SILVER,),
+        )
+    except Exception:
+        # Fallback minimal frame
+        w = _term_width()
+        inner = max(20, w - 4)
+        lines = [f"+- {title} " + "-" * max(0, inner - len(title) - 4) + "+"]
+        for raw in (body.splitlines() or [""]):
+            lines.append("| " + raw[:inner] + " |")
+        lines.append("+" + "-" * (inner + 2) + "+")
+        return "\n".join(lines)
+
+
+def format_final(text: str) -> str:
+    """Boxed, color-coded Pixie final reply."""
+    text = (text or "").strip()
+    if not text:
+        boxed = _box("Pixie", "(said nothing — only starlight.)")
+    else:
+        boxed = _box("Pixie", text)
+    # Persist for grace + scry log (Shift-Tab history of replies)
+    try:
+        import subprocess as _sp
+
+        payload = text if text else "(said nothing.)"
+        _sp.run(
+            [str(Path.home() / "bin" / "pixie-session"), "save-reply"],
+            input=payload,
+            text=True,
+            check=False,
+            timeout=2,
+            capture_output=True,  # never leak ids/noise into the reply box
+        )
+        # Dedicated scry entry (kind=pixie) so SCRY lists replies even if
+        # shell capture missed the boxed output.
+        _sp.run(
+            [str(Path.home() / "bin" / "scry-log"), "pixie"],
+            input=payload,
+            text=True,
+            check=False,
+            timeout=2,
+            capture_output=True,
+        )
+    except Exception:
+        pass
+    return boxed
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Local offline agent (llama.cpp + tools in $HOME)"
+    )
+    ap.add_argument("question", nargs="*", help="What you want done / asked")
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"model (default {DEFAULT_MODEL})")
+    ap.add_argument("--web", action="store_true", help="prefer starting with web_search")
+    ap.add_argument(
+        "--search-only",
+        action="store_true",
+        help="only run web_search and print snippets (no LLM)",
+    )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="show rounds, tools, and results this run",
+    )
+    ap.add_argument(
+        "-q",
+        "--quiet-debug",
+        action="store_true",
+        help="hide rounds/tools this run (override saved on)",
+    )
+    args = ap.parse_args()
+    question = " ".join(args.question).strip()
+    if not question:
+        ap.error("empty question")
+
+    if args.search_only:
+        print(web_search(question, quiet=False))
+        return 0
+
+    if not llm_up():
+        eprint("No local LLM is running — summoning ask's critter …")
+        ensure_llm_up()
+    if not llm_up():
+        eprint("Could not start the local LLM.")
+        eprint("  Summon it:  menagerie ensure ask")
+        eprint(f"  Expected URL:          {LLAMA}")
+        return 1
+
+    verb: bool | None = None
+    if args.verbose:
+        verb = True
+    elif args.quiet_debug:
+        verb = False
+
+    answer = agent(question, args.model, force_web=args.web, verbose=verb)
+    # Wait spinner already erased itself on stderr. Print reply on stdout with
+    # breathing room so zsh's info-box + cursor land *below*, never over, it.
+    sys.stdout.write("\n")
+    sys.stdout.write(format_final(answer))
+    sys.stdout.write("\n\n")
+    sys.stdout.flush()
+    # Hold tick clear so the idle info-box redraw cannot wipe the reply
+    try:
+        _screen_hold("grace", float(os.environ.get("PIXIE_READ_SEC", "45")))
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
