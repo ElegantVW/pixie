@@ -4,6 +4,22 @@ Offline-first local agent: **pixie** (files + tools), **ask** (one-shot agent), 
 
 Source-only kit — scripts + configs. Models (`*.gguf`) and libs (`llama-server` + `.so`) live on the machine, never in git.
 
+## Look
+
+![Pixie answering live](assets/screenshots/pixie-hello.png)
+![Menagerie den](assets/screenshots/menagerie-tui.png)
+![Menagerie status](assets/screenshots/menagerie-status.png)
+
+```
+   *   
+  \|/  
+   |   
+---*---
+   |   
+  /|\  
+   *   
+```
+
 ## Apps + ports
 
 | App | Port | Default model |
