@@ -1,6 +1,6 @@
 ![Pixie hero](assets/hero/pixie.svg)
 
-# Pixie — local AI agent stack
+# Pixie — local AI agent stack ✨
 
 Offline-first local agent: **pixie** (files + tools), **ask** (one-shot agent), **imp** (code helper), **menagerie** (model/app control plane + `llama-server` spawner). No cloud, no telemetry. Each app owns its own `llama-server` on its own port.
 
