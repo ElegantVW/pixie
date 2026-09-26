@@ -8,3 +8,8 @@ for f in pixie pixie_mind.py pixie-session pixie-screen pixie-art menagerie mena
 done
 cp -n "$ROOT/config/pixie/spells.toml" "$HOME/.config/pixie/spells.toml" 2>/dev/null || true
 echo "pixie installed → ~/bin. models → ~/.local/share/pixie/models/*.gguf"
+# DEPS: models live on-machine, never in git.
+if ! ls "$HOME/.local/share/pixie/models/"*.gguf >/dev/null 2>&1; then
+  echo "pixie: WARNING — no GGUF models; every app will refuse." >&2
+  echo "pixie:   next:  place a model at ~/.local/share/pixie/models/ then menagerie models add" >&2
+fi
