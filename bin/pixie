@@ -581,12 +581,13 @@ def ask_pixie(user_prompt: str, verbose: bool = False) -> str:
                 
                 tool_box_content = f"{routing_line}\n{telemetry_line}"
                 
+                fit = max(40, min(76, art.term_width() - 1))
                 print(art.box(
                     tool_box_content,
                     title=f"Calling tools ─────── ✦ Thought for {elapsed_time:.2f}s",
                     accent=P.BLUSH,
-                    body_style=(), 
-                    width=76
+                    body_style=(),
+                    width=fit
                 ), file=sys.stderr)
                 
                 if verbose:
@@ -1614,12 +1615,13 @@ def main() -> int:
 
         clean_response = response.strip()
 
+        fit = max(40, min(76, art.term_width() - 1))
         print(art.box(
             clean_response,
             title=f"Pixie ─────── ✦ Thought for {total_elapsed_time:.2f}s",
             accent=P.BLUSH,
             body_style=(P.SILVER,),
-            width=76
+            width=fit
         ))
     except Exception as e:
         if verbose:

@@ -182,8 +182,8 @@ cmd_start() {
   fi
 
   echo "summoning llama.cpp [$APP] on ${URL} …"
-  echo "  model: $MODEL_PATH"
-  echo "  ctx=$CTX threads=$THREADS (gen) / $THREADS_BATCH (prompt) alias=$ALIAS"
+  echo "  model: ${MODEL_PATH/#$HOME/\~}"
+  echo "  ctx=$CTX threads=$THREADS/$THREADS_BATCH alias=$ALIAS"
   nohup env \
     PIXIE_LLM_MODEL="$MODEL_PATH" \
     PIXIE_LLM_HOST="$HOST" \
