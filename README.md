@@ -6,6 +6,8 @@ Offline-first local agent: **pixie** (files + tools), **ask** (one-shot agent), 
 
 Source-only kit — scripts + configs. Models (`*.gguf`) and libs (`llama-server` + `.so`) live on the machine, never in git.
 
+For: private file+tool agent on your own model. Not for: cloud models, big models with no GPU/RAM budget.
+
 ## Look
 
 ![Pixie answering live](assets/screenshots/pixie-hello.png)
