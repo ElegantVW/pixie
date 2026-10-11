@@ -208,6 +208,7 @@ def status_all(data: dict | None = None) -> dict:
             "port": cfg.get("port", 0),
             "ctx": cfg.get("ctx", 0),
             "alias": cfg.get("alias", ""),
+            "backend": cfg.get("backend", "cpu"),
             "status": status,
             "pid": pid,
         }

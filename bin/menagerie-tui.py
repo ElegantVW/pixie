@@ -5,8 +5,8 @@ Bare `menagerie` launches this. Shows every AI app with its model + status,
 lets you start/stop critters, switch models per app, add/remove models,
 and set the RAM budget.
 
-Keys:  ↑↓ j/k move · s start/stop · m switch model · a add model
-       d remove model · b budget · r restart · q quit
+Keys:  ↑↓ j/k move · s start/stop · m switch model · g gpu/cpu backend
+       a add model · d remove model · b budget · r restart · q quit
 """
 from __future__ import annotations
 
@@ -121,14 +121,21 @@ def draw(fd: int, data: dict, models: list, sel: int, msg: str, budget_line: str
         status = info.get("status", "stopped")
         model = info.get("model", "")
         port = info.get("port", "?")
+        backend = info.get("backend", "cpu")
         dot, color = STATUS_DOT.get(status, ("○", P.MUTED))
         if not model:
             model_txt = "no model associated"
         else:
             model_txt = model[:32]
         sel_mark = "✦" if i == sel else " "
-        line = f" {sel_mark} {dot} {app:<7} ✦ {model_txt:<34} ✦ {port:<5} {status}"
-        body.append(art.paint(line, *((P.SILVER,) if i != sel else (P.PINK,))))
+        # backend chip: gpu burns amber, cpu sits muted
+        bk = art.paint(f"[{backend:<3}]", P.WARN) if backend == "gpu" else art.paint(f"[{backend:<3}]", P.MUTED)
+        head = f" {sel_mark} {dot} {app:<7} "
+        rest = f" ✦ {model_txt:<32} ✦ {port:<5} {status}"
+        if i != sel:
+            body.append(art.paint(head, P.SILVER) + bk + art.paint(rest, P.SILVER))
+        else:
+            body.append(art.paint(head, P.PINK) + bk + art.paint(rest, P.PINK))
     body.append("")
     if models:
         body.append(art.paint(" models — add / switch / remove", P.MUTED))
@@ -144,7 +151,7 @@ def draw(fd: int, data: dict, models: list, sel: int, msg: str, budget_line: str
 
     frame = art.box(body, title="The Menagerie", width=tw)
     runes = art.footer_keys(
-        [("^s", "start/stop"), ("m", "model"), ("a", "add"), ("d", "rm"),
+        [("^s", "start/stop"), ("m", "model"), ("g", "gpu/cpu"), ("a", "add"), ("d", "rm"),
          ("b", "budget"), ("r", "restart"), ("q", "quit")], width=tw)
     art.paint_frame(fd, frame + "\n" + runes)
 
@@ -222,6 +229,27 @@ def main() -> int:
                 if chosen and chosen != current:
                     rc, out = run_menagerie(["set", app, chosen], timeout=300)
                     msg = f"{app} → {chosen}: " + (out.splitlines()[-1][:60] if out else ("ok" if rc == 0 else "failed"))
+        elif key == "g":
+            app = APPS_ORDER[sel]
+            cur = data.get(app, {}).get("backend", "cpu")
+            other = "cpu" if cur == "gpu" else "gpu"
+            go = True
+            if other == "gpu":
+                # one 8GB card: a second gpu mouth is asked, not assumed
+                holders = [a for a in APPS_ORDER
+                           if a != app and data.get(a, {}).get("backend") == "gpu"
+                           and data.get(a, {}).get("status") in ("loaded", "loading", "asleep")]
+                if holders:
+                    go = confirm(fd, f"{', '.join(holders)} already hold(s) the GPU. Share the 8GB card?")
+            if go:
+                rc, out = run_menagerie(["backend", app, other], timeout=30)
+                last = out.splitlines()[-1][:80] if out else ("ok" if rc == 0 else f"exit {rc}")
+                if other == "gpu" and data.get(app, {}).get("status") in ("loaded", "asleep", "loading"):
+                    msg = f"{app} → gpu (restart to apply): {last}"
+                else:
+                    msg = f"{app} → {other}: {last}"
+            else:
+                msg = f"{app} stays {cur}"
         elif key == "a":
             ans = dialog(fd, "Add model",
                          ["GGUF path, or download from HF:", "", "  /path/to/model.gguf", "  hf: <repo> <file>   (e.g. hf: unsloth/Qwen3-4B-Instruct-GGUF qwen3-4b-instruct-q4_k_m.gguf)"])
