@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # menagerie — the AI control center: where the wizard keeps the critters.
 #
-# Every AI app (pixie, ask, magpie, imp, kur) gets its own dedicated
+# Every AI app (pixie, magpie, imp, kur) gets its own dedicated
 # llama-server instance on its own port, bound to its own model from
 # ~/.config/pixie/menagerie.json. Models are added/removed/switched here.
 #
@@ -40,11 +40,15 @@ PORT=""
 CTX=""
 ALIAS=""
 BACKEND="cpu"
+VRAM="?"
 MODEL=""
 MODEL_PATH=""
 URL=""
 PID_FILE=""
 LOG_FILE=""
+# GPU priority order: interactive first, batch yields. (Only gpu-backend
+# apps play; cpu creatures never enter arbitration.)
+GPU_PRIORITY="pixie magpie"
 
 reg() {
   python3 "$REG_HELPER" "$@"
@@ -66,11 +70,13 @@ resolve_app() {
       CTX) CTX="$val" ;;
       ALIAS) ALIAS="$val" ;;
       BACKEND) BACKEND="$val" ;;
+      VRAM) VRAM="$val" ;;
       MODEL) MODEL="$val" ;;
       MODEL_PATH) MODEL_PATH="$val" ;;
     esac
   done < <(reg get-app "$APP")
   [[ "$BACKEND" == "gpu" || "$BACKEND" == "cpu" ]] || BACKEND="cpu"
+  [[ "$VRAM" =~ ^[0-9]+(\.[0-9]+)?$ ]] || VRAM="?"
   if [[ -z "$PORT" ]]; then
     echo "menagerie: unknown app '$APP' (known: $(reg list-apps | cut -f1 | tr '\n' ' '))" >&2
     return 1
@@ -132,6 +138,118 @@ is_asleep() {
   [[ "$code" == "503" ]]
 }
 
+# backend value of an app (never the "app: value" display line — that
+# string once compared unequal to "gpu" and neutered all preemption)
+app_backend() {
+  local out
+  out=$(reg backend "$1" 2>/dev/null) || { echo cpu; return 0; }
+  out="${out##*: }"
+  if [[ "$out" == "gpu" || "$out" == "cpu" ]]; then echo "$out"; else echo cpu; fi
+}
+
+# ── VRAM arbitration (one 8GB card, many mouths) ──────────────────────
+# Sensor: AMD exposes VRAM straight off sysfs (no daemon, no ROCm — the
+# card predates ROCm support). First card with counters wins; the house
+# has one card, and honesty about that is a comment, not a loop.
+vram_free_gb() {
+  local f
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [[ -f "$f" ]] || continue
+    local d="${f%/mem_info_vram_total}"
+    [[ -f "$d/mem_info_vram_used" ]] || continue
+    local total used
+    total=$(cat "$f" 2>/dev/null || echo 0)
+    used=$(cat "$d/mem_info_vram_used" 2>/dev/null || echo 0)
+    if [[ "$total" -gt 0 ]]; then
+      awk "BEGIN{printf \"%.1f\", ($total - $used)/1024/1024/1024}"
+      return 0
+    fi
+  done
+  echo "?"
+}
+
+# rank in GPU_PRIORITY (lower = hungrier priority); unlisted = last
+prio_rank() {
+  local i=0 a
+  for a in $GPU_PRIORITY; do
+    [[ "$a" == "$1" ]] && { echo "$i"; return 0; }
+    i=$((i + 1))
+  done
+  echo 99
+}
+
+# A gpu slot may load iff the card fits it. Lower-priority loaded holders
+# are parked (graceful stop; their next request reloads them). Higher
+# holders make us wait, bounded and announced — batch yields, never kills.
+# Returns 0 to proceed, 1 to refuse with the reason already printed.
+gpu_arbitrate() {
+  local need="$VRAM" target="$APP" free holder
+  if [[ "$need" == "?" ]]; then
+    echo "warning: no VRAM cost for $MODEL — proceeding blind" >&2
+    return 0
+  fi
+  free=$(vram_free_gb)
+  if [[ "$free" == "?" ]]; then
+    echo "warning: no VRAM sensor — proceeding blind" >&2
+    return 0
+  fi
+  if awk "BEGIN{exit !( $free >= $need )}"; then return 0; fi
+  # 1. park lower-priority loaded gpu holders (asleep ones keep nothing)
+  local parked=""
+  for holder in $GPU_PRIORITY; do
+    [[ "$holder" == "$target" ]] && continue
+    [[ "$(prio_rank "$target")" -lt "$(prio_rank "$holder")" ]] || continue
+    local h_backend h_port h_code
+    h_backend=$(app_backend "$holder")
+    [[ "$h_backend" == "gpu" ]] || continue
+    h_port=$(reg get-app "$holder" 2>/dev/null | awk -F= '$1=="PORT"{print $2}')
+    [[ -n "$h_port" ]] || continue
+    h_code=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$h_port/health" 2>/dev/null || true)
+    [[ "$h_code" == "200" ]] || continue
+    echo "menagerie: $target needs the card ($need GB, $free free) — parking $holder…"
+    resolve_app "$holder"
+    cmd_stop >/dev/null 2>&1 || true
+    resolve_app "$target"
+    parked="$parked $holder"
+    free=$(vram_free_gb)
+    if [[ "$free" != "?" ]] && awk "BEGIN{exit !( $free >= $need )}"; then
+      echo "menagerie: card free ($free GB) — proceeding"
+      return 0
+    fi
+  done
+  # 2. higher-priority holders remain: bounded wait, announced
+  local higher=""
+  for holder in $GPU_PRIORITY; do
+    [[ "$holder" == "$target" ]] && continue
+    [[ "$(prio_rank "$target")" -gt "$(prio_rank "$holder")" ]] || continue
+    local h_backend h_port h_code
+    h_backend=$(app_backend "$holder")
+    [[ "$h_backend" == "gpu" ]] || continue
+    h_port=$(reg get-app "$holder" 2>/dev/null | awk -F= '$1=="PORT"{print $2}')
+    [[ -n "$h_port" ]] || continue
+    h_code=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$h_port/health" 2>/dev/null || true)
+    [[ "$h_code" == "200" ]] || continue
+    higher="$higher $holder"
+  done
+  if [[ -z "${higher// }" ]]; then
+    echo "error: VRAM short ($free GB free, need $need)${parked:+ even after parking$parked} — stop something and retry" >&2
+    return 1
+  fi
+  echo "menagerie:$higher holds the GPU for $target — waiting (batch yields to interactive)…"
+  local waited=0
+  while [[ $waited -lt 600 ]]; do
+    sleep 15; waited=$((waited + 15))
+    free=$(vram_free_gb)
+    if [[ "$free" != "?" ]] && awk "BEGIN{exit !( $free >= $need )}"; then
+      echo "menagerie: card free — proceeding"
+      return 0
+    fi
+    echo "menagerie: still waiting on$higher (${waited}s)…"
+  done
+  echo "error:$higher still holds the GPU after 600s — stop it or retry later" >&2
+  return 1
+}
+
 # ── RAM budget ────────────────────────────────────────────────────────
 budget_gb() { reg budget | awk '{print $1}'; }
 
@@ -151,8 +269,16 @@ cmd_ensure() {
     return 0
   fi
   if is_running && is_asleep; then
+    # asleep keeps the server but no model: waking RELOADS (VRAM need),
+    # so arbitration applies here exactly as on a cold start
+    if [[ "$BACKEND" == "gpu" ]]; then
+      gpu_arbitrate || return 1
+    fi
     echo "menagerie [$APP] asleep at $URL — next request wakes it"
     return 0
+  fi
+  if [[ "$BACKEND" == "gpu" ]]; then
+    gpu_arbitrate || return 1
   fi
   if ! ram_ok; then
     local ev target_app="$APP"
@@ -265,6 +391,7 @@ cmd_status() {
   echo "app:      $APP"
   echo "model:    $MODEL"
   echo "backend:  $BACKEND"
+  echo "vram:     $VRAM GB (model cost)"
   echo "listen:   ${HOST}:${PORT}  (localhost only)"
   echo "url:      $URL"
   echo "ctx/thr:  $CTX / $THREADS"
@@ -297,12 +424,17 @@ cmd_status_all() {
     elif is_running && is_asleep; then status=asleep
     elif is_running; then status=loading
     else status=stopped; fi
-    pid=$([[ -f "$PID_FILE" ]] && cat "$PID_FILE" || echo "-")
+    # live PID only: a stale file prints "-" (a dead number is not a process)
+    pid="-"
+    if [[ -f "$PID_FILE" ]]; then
+      p=$(cat "$PID_FILE" 2>/dev/null || true)
+      if [[ -n "${p:-}" ]] && kill -0 "$p" 2>/dev/null; then pid="$p"; fi
+    fi
     model="${MODEL_PATH:-$MODEL}"
     printf '%-8s %-34s %-5s %-9s %s\n' "$app" "${MODEL:0:33}" "$PORT" "$status" "$pid"
   done
   echo
-  echo "RAM budget: $(budget_gb) GB  ·  loaded now: $(reg est-loaded) GB"
+  echo "RAM budget: $(budget_gb) GB  ·  loaded now: $(reg est-loaded)"
 }
 
 cmd_set() {
@@ -377,7 +509,7 @@ case "$cmd" in
     ;;
   ensure|start|stop|restart|status|chat|logs|path)
     prof=pixie
-    if [[ "${1:-}" =~ ^(pixie|ask|magpie|imp|kur|qwen|default|all)$ ]]; then
+    if [[ "${1:-}" =~ ^(pixie|magpie|imp|kur|qwen|default|all)$ ]]; then
       prof="$1"
       shift || true
     fi
@@ -453,6 +585,7 @@ menagerie — the AI control center (per-app llama.cpp critters)
   menagerie status all            table: app | model | port | status
   menagerie set <app> <model>     switch the model an app uses (restarts it)
   menagerie backend <app> [cpu|gpu]  per-creature backend (Vulkan+offload vs CPU)
+  gpu slots share one card: pixie preempts, batch waits (bounded, announced)
   menagerie models                list registered models
   menagerie models add <path>     register a local .gguf
   menagerie models add --hf <repo> <file>   download a model from HF
@@ -460,7 +593,7 @@ menagerie — the AI control center (per-app llama.cpp critters)
   menagerie budget [GB]           RAM budget for loaded models
 
 Apps (each owns its own llama-server instance):
-  pixie→8080  ask→8090  magpie→8091  imp→8082  kur→8081
+  pixie→8080  magpie→8091  imp→8082  kur→8081
 Legacy aliases: qwen|default = pixie, all = every app.
 H
     ;;

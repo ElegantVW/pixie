@@ -24,6 +24,7 @@ CLI (used by bin/menagerie and the TUI):
   menagerie-registry seed                      create defaults if missing
   menagerie-registry get-app <app>             KEY=VALUE lines for bash
   menagerie-registry set-app <app> <model>     rebind an app to a model
+  menagerie-registry remove-app <app>          drop an app (ask is gone)
   menagerie-registry backend <app> [cpu|gpu]   view/set per-app backend
   menagerie-registry list-apps                 app model port alias (tsv)
   menagerie-registry models                    human table of registry models
@@ -60,7 +61,6 @@ DEFAULT_BUDGET = None  # decided by suggest_budget_gb()
 # (app, port, ctx, alias, model-preference-chain)
 APP_DEFAULTS = [
     ("pixie", 8080, 8192, "qwen", ["qwen3-4b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m", "qwen*coder*", "smollm2-360m-instruct-q4_k_m"]),
-    ("ask", 8090, 8192, "ask", ["qwen3-4b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m", "qwen*coder*", "smollm2-360m-instruct-q4_k_m"]),
     ("magpie", 8091, 8192, "magpie", ["qwen3-4b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m", "qwen*coder*", "smollm2-360m-instruct-q4_k_m"]),
     ("imp", 8082, 4096, "imp", ["qwen*coder*", "qwen3-4b-instruct-q4_k_m", "smollm2-360m-instruct-q4_k_m"]),
     ("kur", 8081, 1024, "kur", ["smollm2-360m-instruct-q4_k_m", "qwen3-4b-instruct-q4_k_m", "qwen*coder*"]),
@@ -153,6 +153,12 @@ def ensure_registry() -> dict:
     for cfg in data.get("apps", {}).values():
         if cfg.get("backend") not in ("cpu", "gpu"):
             cfg["backend"] = "cpu"
+    # vram cost per model (GB): weights + KV at configured ctx. Seeded by
+    # file_size x 1.6 — grounded live (4B Q4: predicted 3.7, measured 4.0
+    # resident on wake). Overridable by editing; the arbiter reads it.
+    for m in data.get("models", {}).values():
+        if not isinstance(m.get("vram_gb"), (int, float)):
+            m["vram_gb"] = round(_gb(m.get("size", 0)) * 1.6, 1)
     if "ram_budget_gb" not in data:
         data["ram_budget_gb"] = suggest_budget_gb()
     if "budget_seen" not in data:
@@ -326,6 +332,14 @@ def set_app_backend(app: str, backend: str) -> None:
     save(data)
 
 
+def remove_app(name: str) -> None:
+    data = ensure_registry()
+    if name not in data.get("apps", {}):
+        raise SystemExit(f"error: unknown app '{name}'")
+    del data["apps"][name]
+    save(data)
+
+
 def set_app_model(app: str, model: str) -> None:
     data = ensure_registry()
     if app not in data.get("apps", {}):
@@ -445,12 +459,18 @@ def main() -> int:
         print(f"CTX={cfg['ctx']}")
         print(f"ALIAS={cfg['alias']}")
         print(f"BACKEND={cfg.get('backend', 'cpu')}")
+        print(f"VRAM={data.get('models', {}).get(cfg.get('model', ''), {}).get('vram_gb', '?')}")
         print(f"MODEL_PATH={model_path(data, cfg['model']) or ''}")
         return 0
 
     if cmd == "set-app":
         set_app_model(argv[0], argv[1])
         print(f"{argv[0]} → {argv[1]}")
+        return 0
+
+    if cmd == "remove-app":
+        remove_app(argv[0])
+        print(f"removed app: {argv[0]}")
         return 0
 
     if cmd == "backend":

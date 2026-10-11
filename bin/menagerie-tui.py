@@ -35,7 +35,7 @@ MENAGERIE = Path.home() / "bin" / "menagerie"
 if not MENAGERIE.is_file():
     MENAGERIE = Path(__file__).parent / "menagerie"
 
-APPS_ORDER = ["pixie", "ask", "magpie", "imp", "kur"]
+APPS_ORDER = ["pixie", "magpie", "imp", "kur"]
 
 STATUS_DOT = {"loaded": ("●", P.PINK), "asleep": ("◐", P.WARN), "loading": ("◑", P.WARN), "stopped": ("○", P.MUTED)}
 
