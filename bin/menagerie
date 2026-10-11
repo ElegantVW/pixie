@@ -39,6 +39,7 @@ APP=""
 PORT=""
 CTX=""
 ALIAS=""
+BACKEND="cpu"
 MODEL=""
 MODEL_PATH=""
 URL=""
@@ -64,10 +65,12 @@ resolve_app() {
       PORT) PORT="$val" ;;
       CTX) CTX="$val" ;;
       ALIAS) ALIAS="$val" ;;
+      BACKEND) BACKEND="$val" ;;
       MODEL) MODEL="$val" ;;
       MODEL_PATH) MODEL_PATH="$val" ;;
     esac
   done < <(reg get-app "$APP")
+  [[ "$BACKEND" == "gpu" || "$BACKEND" == "cpu" ]] || BACKEND="cpu"
   if [[ -z "$PORT" ]]; then
     echo "menagerie: unknown app '$APP' (known: $(reg list-apps | cut -f1 | tr '\n' ' '))" >&2
     return 1
@@ -85,6 +88,15 @@ all_apps() {
 find_server() {
   if [[ -n "${PIXIE_LLAMA_SERVER:-}" && -x "${PIXIE_LLAMA_SERVER}" ]]; then
     echo "$PIXIE_LLAMA_SERVER"; return
+  fi
+  # gpu backend: the house Vulkan wrapper first (self-contained .so set).
+  # Requested gpu with no Vulkan server is an ERROR, never a silent CPU box.
+  if [[ "$BACKEND" == "gpu" ]]; then
+    if [[ -x "$HOME/.local/lib/llama-vulkan/llama-server-vk" ]]; then
+      echo "$HOME/.local/lib/llama-vulkan/llama-server-vk"; return
+    fi
+    echo "error: backend=gpu for [$APP] but no Vulkan server at ~/.local/lib/llama-vulkan/llama-server-vk" >&2
+    return 1
   fi
   if [[ -x "$HOME/bin/llama-server" ]]; then echo "$HOME/bin/llama-server"; return; fi
   if command -v llama-server >/dev/null 2>&1; then command -v llama-server; return; fi
@@ -183,15 +195,20 @@ cmd_start() {
 
   echo "summoning llama.cpp [$APP] on ${URL} …"
   echo "  model: ${MODEL_PATH/#$HOME/\~}"
-  echo "  ctx=$CTX threads=$THREADS/$THREADS_BATCH alias=$ALIAS"
+  echo "  ctx=$CTX threads=$THREADS/$THREADS_BATCH alias=$ALIAS backend=$BACKEND"
+  # gpu backend offloads fully unless the caller said otherwise explicitly
+  local eff_ngl="$NGL"
+  if [[ "$BACKEND" == "gpu" && -z "${PIXIE_LLM_NGL:-}" ]]; then eff_ngl=99; fi
+  echo "  ngl=$eff_ngl backend=$BACKEND"
   nohup env \
+    PIXIE_LLM_BACKEND="$BACKEND" \
     PIXIE_LLM_MODEL="$MODEL_PATH" \
     PIXIE_LLM_HOST="$HOST" \
     PIXIE_LLM_PORT="$PORT" \
     PIXIE_LLM_CTX="$CTX" \
     PIXIE_LLM_THREADS="$THREADS" \
     PIXIE_LLM_THREADS_BATCH="$THREADS_BATCH" \
-    PIXIE_LLM_NGL="$NGL" \
+    PIXIE_LLM_NGL="$eff_ngl" \
     PIXIE_LLM_ALIAS="$ALIAS" \
     "$RUNNER" >"$LOG_FILE" 2>&1 &
   echo $! >"$PID_FILE"
@@ -247,11 +264,12 @@ cmd_status() {
   srv=$(find_server 2>/dev/null || echo "(llama-server not found)")
   echo "app:      $APP"
   echo "model:    $MODEL"
+  echo "backend:  $BACKEND"
   echo "listen:   ${HOST}:${PORT}  (localhost only)"
   echo "url:      $URL"
   echo "ctx/thr:  $CTX / $THREADS"
   echo "budget:   $(budget_gb) GB (loaded now: $(reg est-loaded))"
-  echo "backend:  $srv"
+  echo "engine:   $srv"
   if is_running && health; then
     echo "status:   loaded"
     [[ -f "$PID_FILE" ]] && echo "pid:      $(cat "$PID_FILE")"
@@ -341,6 +359,7 @@ print((d.get('choices') or [{}])[0].get('message',{}).get('content','') or d)
 cmd_path() {
   echo "APP=$APP"
   echo "MODEL=$MODEL"
+  echo "BACKEND=$BACKEND"
   echo "MODEL_PATH=$MODEL_PATH"
   echo "URL=$URL"
   echo "LOG=$LOG_FILE"
@@ -390,6 +409,14 @@ case "$cmd" in
     [[ $# -ge 2 ]] || { echo "usage: menagerie set <app> <model>" >&2; exit 1; }
     cmd_set "$1" "$2"
     ;;
+  backend)
+    [[ $# -ge 1 ]] || { echo "usage: menagerie backend <app> [cpu|gpu]" >&2; exit 1; }
+    if [[ $# -ge 2 ]]; then
+      reg backend "$1" "$2" || exit 1
+    else
+      reg backend "$1" || exit 1
+    fi
+    ;;
   models|model|ls)
     case "${1:-}" in
       add)
@@ -425,6 +452,7 @@ menagerie — the AI control center (per-app llama.cpp critters)
   menagerie start|stop|restart|status|chat|logs|path <app>
   menagerie status all            table: app | model | port | status
   menagerie set <app> <model>     switch the model an app uses (restarts it)
+  menagerie backend <app> [cpu|gpu]  per-creature backend (Vulkan+offload vs CPU)
   menagerie models                list registered models
   menagerie models add <path>     register a local .gguf
   menagerie models add --hf <repo> <file>   download a model from HF
@@ -437,7 +465,7 @@ Legacy aliases: qwen|default = pixie, all = every app.
 H
     ;;
   *)
-    echo "Usage: menagerie {tui|ensure|start|stop|restart|status|set|models|budget|chat|logs|path}" >&2
+    echo "Usage: menagerie {tui|ensure|start|stop|restart|status|set|backend|models|budget|chat|logs|path}" >&2
     exit 1
     ;;
 esac

@@ -34,6 +34,17 @@ export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [[ -n "${PIXIE_LLAMA_SERVER:-}" && -x "${PIXIE_LLAMA_SERVER}" ]]; then
   SRV="$PIXIE_LLAMA_SERVER"
+elif [[ "${PIXIE_LLM_BACKEND:-cpu}" == "gpu" ]]; then
+  # gpu backend (per-creature `menagerie backend <app> gpu`): the house
+  # Vulkan wrapper, self-contained .so set. Missing wrapper is an ERROR —
+  # a gpu creature must never silently run CPU.
+  VK="$HOME/.local/lib/llama-vulkan/llama-server-vk"
+  if [[ -x "$VK" ]]; then
+    SRV="$VK"
+  else
+    echo "error: backend=gpu but no Vulkan server at $VK" >&2
+    exit 1
+  fi
 elif [[ -x "$HOME/bin/llama-server" ]]; then
   SRV="$HOME/bin/llama-server"
 elif [[ -x "$LIB/llama-server" ]]; then

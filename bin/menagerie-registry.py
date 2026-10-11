@@ -24,6 +24,7 @@ CLI (used by bin/menagerie and the TUI):
   menagerie-registry seed                      create defaults if missing
   menagerie-registry get-app <app>             KEY=VALUE lines for bash
   menagerie-registry set-app <app> <model>     rebind an app to a model
+  menagerie-registry backend <app> [cpu|gpu]   view/set per-app backend
   menagerie-registry list-apps                 app model port alias (tsv)
   menagerie-registry models                    human table of registry models
   menagerie-registry add-model <path>          register a local .gguf
@@ -147,6 +148,11 @@ def ensure_registry() -> dict:
                 chosen = models[0]
             if chosen:
                 data["apps"][app] = {"model": chosen, "port": port, "ctx": ctx, "alias": alias}
+    # backend per app (cpu|gpu): backfilled cpu = historical behavior.
+    # gpu means the Vulkan server + full offload; the runner picks both.
+    for cfg in data.get("apps", {}).values():
+        if cfg.get("backend") not in ("cpu", "gpu"):
+            cfg["backend"] = "cpu"
     if "ram_budget_gb" not in data:
         data["ram_budget_gb"] = suggest_budget_gb()
     if "budget_seen" not in data:
@@ -309,6 +315,16 @@ def remove_model(name: str) -> None:
     save(data)
 
 
+def set_app_backend(app: str, backend: str) -> None:
+    if backend not in ("cpu", "gpu"):
+        raise SystemExit(f"error: backend must be cpu|gpu, not '{backend}'")
+    data = ensure_registry()
+    if app not in data.get("apps", {}):
+        raise SystemExit(f"error: unknown app '{app}' (known: {', '.join(data['apps'])})")
+    data["apps"][app]["backend"] = backend
+    save(data)
+
+
 def set_app_model(app: str, model: str) -> None:
     data = ensure_registry()
     if app not in data.get("apps", {}):
@@ -427,6 +443,7 @@ def main() -> int:
         print(f"PORT={cfg['port']}")
         print(f"CTX={cfg['ctx']}")
         print(f"ALIAS={cfg['alias']}")
+        print(f"BACKEND={cfg.get('backend', 'cpu')}")
         print(f"MODEL_PATH={model_path(data, cfg['model']) or ''}")
         return 0
 
@@ -434,6 +451,24 @@ def main() -> int:
         set_app_model(argv[0], argv[1])
         print(f"{argv[0]} → {argv[1]}")
         return 0
+
+    if cmd == "backend":
+        data = ensure_registry()
+        if len(argv) == 1:
+            app = argv[0]
+            if app not in data.get("apps", {}):
+                print(f"error: unknown app '{app}'", file=sys.stderr)
+                return 1
+            print(f"{app}: {data['apps'][app].get('backend', 'cpu')}")
+            return 0
+        if len(argv) >= 2:
+            set_app_backend(argv[0], argv[1])
+            print(f"{argv[0]} backend → {argv[1]}")
+            if argv[1] == "gpu":
+                print("takes effect on next start (menagerie restart <app>)")
+            return 0
+        print("usage: backend <app> [cpu|gpu]", file=sys.stderr)
+        return 1
 
     if cmd == "list-apps":
         for app, cfg in data["apps"].items():
