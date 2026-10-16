@@ -2,11 +2,12 @@
 
 ## v0.2.1 TUI feel (2026-10-16)
 
+- Splash holds 1.5s (star poses ~350 ms). Wait lines rotate every 2.5s.
 - Content-sized chat bubbles (you right / Pixie left).
 - Tab / Shift-Tab cycle Runes; digits `1`–`4` type into the prompt.
 - Launch splash and wait spinner are frames of the house star (`assets/sigils/pixie.txt`).
 - File cards: green `+` / red `−`, `l` look, `o` open in `$EDITOR`.
-- Evidence: `cargo test` 34 pass (no llama).
+- Evidence: `cargo test` 35 pass (no llama).
 
 ## v0.2.0 rust familiar (2026-10-16)
 

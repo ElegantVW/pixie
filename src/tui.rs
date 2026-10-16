@@ -32,7 +32,7 @@ const FG: Color = Color::Rgb(0xff, 0xeb, 0xf2);
 const SILVER: Color = Color::Rgb(0xc0, 0xc0, 0xc8);
 const GREEN: Color = Color::Rgb(0x7d, 0xc9, 0x8a);
 const RED: Color = Color::Rgb(0xe8, 0x7a, 0x7a);
-const SPLASH_MIN: Duration = Duration::from_millis(500);
+const SPLASH_MIN: Duration = Duration::from_millis(1500);
 const CARD_LINES: usize = 24;
 
 struct ConfirmGate {

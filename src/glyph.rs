@@ -66,10 +66,11 @@ pub const WAIT: [&str; 8] = [
 ];
 
 const FRAME_MS: u128 = 140;
-const WAIT_MS: u128 = 400;
+const SPLASH_FRAME_MS: u128 = 350;
+const WAIT_MS: u128 = 2500;
 
 pub fn splash_frame(born: Instant) -> &'static [&'static str] {
-    &SPLASH[idx(born, FRAME_MS, SPLASH.len())]
+    &SPLASH[idx(born, SPLASH_FRAME_MS, SPLASH.len())]
 }
 
 pub fn spin_line(born: Instant) -> &'static str {
@@ -111,5 +112,11 @@ mod tests {
     #[test]
     fn first_splash_is_the_sigil() {
         assert_eq!(SPLASH[0], SIGIL);
+    }
+
+    #[test]
+    fn wait_holds_long_enough_to_read() {
+        assert!(WAIT_MS >= 2000, "wait lines were flashing at {WAIT_MS} ms");
+        assert!(SPLASH_FRAME_MS >= 300, "splash poses were {SPLASH_FRAME_MS} ms");
     }
 }
