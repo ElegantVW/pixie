@@ -1,6 +1,7 @@
 //! Pink boxes for one-shot replies and TUI bubbles.
 
 use ratatui::symbols::border::{Set, PLAIN, ROUNDED};
+use unicode_width::UnicodeWidthChar;
 
 pub fn unicode() -> bool {
     match std::env::var("PIXIE_UNICODE") {
@@ -29,7 +30,7 @@ pub fn box_text(title: &str, body: &str, width: usize) -> String {
     if title_s.chars().count() > inner {
         title_s = title_s.chars().take(inner).collect();
     }
-    let tlen = title_s.chars().count();
+    let tlen = str_cols(&title_s);
     let fill = inner.saturating_sub(tlen);
     let left = fill / 2;
     let right = fill - left;
@@ -41,7 +42,7 @@ pub fn box_text(title: &str, body: &str, width: usize) -> String {
     let body_w = inner.saturating_sub(2);
     for raw in body.lines() {
         for chunk in wrap(raw, body_w) {
-            let pad = body_w.saturating_sub(chunk.chars().count());
+            let pad = body_w.saturating_sub(str_cols(&chunk));
             lines.push(format!("{vt} {chunk}{} {vt}", " ".repeat(pad)));
         }
     }
@@ -52,21 +53,39 @@ pub fn box_text(title: &str, body: &str, width: usize) -> String {
     lines.join("\n")
 }
 
+pub fn ch_cols(c: char) -> usize {
+    if c == '\n' {
+        0
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+pub fn str_cols(s: &str) -> usize {
+    s.chars().map(ch_cols).sum()
+}
+
+/// Hard wrap by terminal columns (display width), not by char count.
 pub fn wrap(s: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![s.to_string()];
     }
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut cur_w = 0usize;
     for ch in s.chars() {
         if ch == '\n' {
             out.push(std::mem::take(&mut cur));
+            cur_w = 0;
             continue;
         }
-        if cur.chars().count() >= width {
+        let w = ch_cols(ch);
+        if w > 0 && cur_w + w > width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
+            cur_w = 0;
         }
         cur.push(ch);
+        cur_w = cur_w.saturating_add(w);
     }
     if !cur.is_empty() || out.is_empty() {
         out.push(cur);
@@ -87,21 +106,26 @@ pub fn prompt_height(text: &str, term_width: u16, frame_height: u16) -> u16 {
     (lines.min(cap) + 2).max(3)
 }
 
-/// Row/col of `char_idx` inside `chrome::wrap` output.
+/// Row and **display column** of `char_idx` after the same wrap as `wrap`.
 pub fn wrap_cursor(text: &str, width: usize, char_idx: usize) -> (u16, u16) {
     let width = width.max(1);
     let lines = wrap(text, width);
-    let mut n = 0usize;
+    let mut seen = 0usize;
     let last = lines.len().saturating_sub(1);
     for (i, line) in lines.iter().enumerate() {
-        let len = line.chars().count();
-        let end = n + len;
+        let n = line.chars().count();
+        let end = seen + n;
         if char_idx < end || (char_idx == end && i == last) {
-            return (i as u16, (char_idx - n) as u16);
+            let take = char_idx.saturating_sub(seen);
+            let col = str_cols(&line.chars().take(take).collect::<String>());
+            return (i as u16, col as u16);
         }
-        n = end;
+        seen = end;
+        if text.chars().nth(seen) == Some('\n') {
+            seen += 1;
+        }
     }
-    let col = lines.last().map(|l| l.chars().count() as u16).unwrap_or(0);
+    let col = lines.last().map(|l| str_cols(l) as u16).unwrap_or(0);
     (last as u16, col)
 }
 
@@ -122,7 +146,7 @@ pub fn bubble_width(text: &str, max: u16, min: u16) -> u16 {
     }
     for raw in text.lines() {
         for chunk in wrap(raw, inner_max.max(1)) {
-            longest = longest.max(chunk.chars().count());
+            longest = longest.max(str_cols(&chunk));
         }
     }
     ((longest + 2) as u16).clamp(min, max)
@@ -165,5 +189,18 @@ mod tests {
     fn wrap_cursor_tracks_char_index() {
         let (r, c) = wrap_cursor("abcdefghij", 4, 5);
         assert_eq!((r, c), (1, 1));
+        let end = wrap_cursor("abcdefghij", 4, 10);
+        assert_eq!(end.0, 2);
+    }
+
+    #[test]
+    fn wrap_uses_columns_not_chars() {
+        let star = "✦";
+        let w = ch_cols('✦').max(1);
+        let s = star.repeat(8);
+        let lines = wrap(&s, w * 4);
+        assert!(lines.len() >= 2, "expected wrap, got {lines:?} (✦ is {w} cols)");
+        let (row, col) = wrap_cursor(&format!("✦ {}", "x".repeat(20)), 10, 22);
+        assert!(row >= 1, "cursor should leave row 0, got row={row} col={col}");
     }
 }

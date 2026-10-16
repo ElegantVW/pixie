@@ -937,28 +937,38 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
+    let inner_w = chrome::prompt_inner_width(chunks[2].width);
+    let rows = chrome::wrap(&prompt_inner, inner_w);
+    let inner_h = chunks[2].height.saturating_sub(2).max(1) as usize;
+    let (crow, ccol) = if editing {
+        let prefix = "✦ ".chars().count();
+        let vis = prefix + app.cursor.min(app.buf.chars().count());
+        chrome::wrap_cursor(&prompt_inner, inner_w, vis)
+    } else {
+        (0, 0)
+    };
+    let start = (crow as usize + 1).saturating_sub(inner_h);
+    let shown: Vec<Line> = rows
+        .iter()
+        .skip(start)
+        .take(inner_h)
+        .map(|s| Line::from(s.clone()))
+        .collect();
     f.render_widget(
-        Paragraph::new(prompt_inner.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(BLUSH))
-                    .border_set(chrome::border_set()),
-            ),
+        Paragraph::new(shown).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BLUSH))
+                .border_set(chrome::border_set()),
+        ),
         chunks[2],
     );
     if editing {
-        let inner_w = chrome::prompt_inner_width(chunks[2].width);
-        let prefix = "✦ ".chars().count();
-        let vis = prefix + app.cursor.min(app.buf.chars().count());
-        let (row, col) = chrome::wrap_cursor(&prompt_inner, inner_w, vis);
-        let max_row = chunks[2].height.saturating_sub(2);
-        let row = row.min(max_row.saturating_sub(1));
-        let x = chunks[2].x.saturating_add(1).saturating_add(col);
+        let row = (crow as usize).saturating_sub(start) as u16;
+        let x = chunks[2].x.saturating_add(1).saturating_add(ccol);
         let y = chunks[2].y.saturating_add(1).saturating_add(row);
-        if x < chunks[2].x.saturating_add(chunks[2].width)
-            && y < chunks[2].y.saturating_add(chunks[2].height)
+        if x < chunks[2].x.saturating_add(chunks[2].width.saturating_sub(1))
+            && y < chunks[2].y.saturating_add(chunks[2].height.saturating_sub(1))
         {
             f.set_cursor_position(Position { x, y });
         }

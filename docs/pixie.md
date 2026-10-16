@@ -13,7 +13,7 @@
   - **Deep** — light DDG HTML `web_research`, `fetch_web_page` (`magpie browse --dump`), wiki, search_house. Never `menagerie ensure magpie`.
   - **Build** — inspect / write / run / verify.
   - **Plan** — read-only bash allowlist + `write_plan`. Wiki, no Magpie.
-- You/Pixie sit in content-sized bubbles (right blush / left pink). House star splash on launch; wait spinner is the star’s own rows (`*` `\|/` `---*---` `/|\`), not a generic ticker.
+- You/Pixie sit in content-sized bubbles (right blush / left pink). House star splash on launch; wait spinner is the star’s own rows (`*` `\|/` `---*---` `/|\`), not a generic ticker. Prompt box grows with wrapped text (same wrap for height, paint, and cursor).
 - File cards: green `+` / red `−` on writes; `l` look (in-TUI pager) · `o` open (`$VISUAL`/`$EDITOR`) · `[` `]` cycle files.
 - Host card every turn (`/etc/os-release`, package manager). House pack in `config/pixie/context/`.
 - Barge-in: type + Enter aborts the in-flight reply. `v` verbose (think + tools). Quiet hides `<think>` but jsonl stores it.

@@ -4,11 +4,12 @@
 
 - Splash holds 1.5s (star poses ~350 ms). Wait lines rotate every 5s.
 - Prompt box grows with wrapped text; left/right/home/end move the cursor.
+- Prompt wrap is display-width (one wrap for height, paint, and cursor) so a second line no longer stomps the first.
 - Content-sized chat bubbles (you right / Pixie left).
 - Tab / Shift-Tab cycle Runes; digits `1`–`4` type into the prompt.
 - Launch splash and wait spinner are frames of the house star (`assets/sigils/pixie.txt`).
 - File cards: green `+` / red `−`, `l` look, `o` open in `$EDITOR`.
-- Evidence: `cargo test` 37 pass (no llama).
+- Evidence: `cargo test` 38 pass (no llama).
 
 ## v0.2.0 rust familiar (2026-10-16)
 
