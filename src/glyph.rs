@@ -67,7 +67,7 @@ pub const WAIT: [&str; 8] = [
 
 const FRAME_MS: u128 = 140;
 const SPLASH_FRAME_MS: u128 = 350;
-const WAIT_MS: u128 = 2500;
+const WAIT_MS: u128 = 5000;
 
 pub fn splash_frame(born: Instant) -> &'static [&'static str] {
     &SPLASH[idx(born, SPLASH_FRAME_MS, SPLASH.len())]
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn wait_holds_long_enough_to_read() {
-        assert!(WAIT_MS >= 2000, "wait lines were flashing at {WAIT_MS} ms");
+        assert!(WAIT_MS >= 5000, "wait lines were flashing at {WAIT_MS} ms");
         assert!(SPLASH_FRAME_MS >= 300, "splash poses were {SPLASH_FRAME_MS} ms");
     }
 }

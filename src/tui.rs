@@ -12,7 +12,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -100,6 +100,7 @@ struct LookState {
 struct App {
     chat: Vec<ChatEntry>,
     buf: String,
+    cursor: usize,
     rune_idx: usize,
     session_id: String,
     verbose: bool,
@@ -171,6 +172,7 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
     let mut app = App {
         chat,
         buf: String::new(),
+        cursor: 0,
         rune_idx,
         session_id,
         verbose: verbose || load_verbose(),
@@ -219,6 +221,7 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
         event::EnableBracketedPaste
     )?;
     let mut term = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
+    let _ = term.hide_cursor();
     let mut last_tick = Instant::now();
     loop {
         while let Ok(msg) = app.rx.try_recv() {
@@ -269,7 +272,7 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
                     _ => {}
                 },
                 CEvent::Paste(s) => {
-                    app.buf.push_str(&s);
+                    insert_text(&mut app.buf, &mut app.cursor, &s);
                 }
                 CEvent::Resize(_, _) => {}
                 _ => {}
@@ -521,6 +524,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 }
             } else {
                 app.buf.clear();
+                app.cursor = 0;
             }
         }
         KeyCode::Char('v') if app.buf.is_empty() && !app.busy => {
@@ -545,19 +549,37 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             let text = app.buf.trim().to_string();
             if !text.is_empty() {
                 app.buf.clear();
+                app.cursor = 0;
                 send(app, &text);
             }
         }
         KeyCode::Backspace => {
-            app.buf.pop();
+            delete_before(&mut app.buf, &mut app.cursor);
         }
+        KeyCode::Delete => {
+            delete_at(&mut app.buf, &mut app.cursor);
+        }
+        KeyCode::Left => {
+            if app.cursor > 0 {
+                app.cursor -= 1;
+            }
+        }
+        KeyCode::Right => {
+            let n = app.buf.chars().count();
+            if app.cursor < n {
+                app.cursor += 1;
+            }
+        }
+        KeyCode::Home => app.cursor = 0,
+        KeyCode::End => app.cursor = app.buf.chars().count(),
         KeyCode::Char(c) => {
             if k.modifiers.contains(KeyModifiers::CONTROL) {
                 if c == 'u' {
                     app.buf.clear();
+                    app.cursor = 0;
                 }
             } else {
-                app.buf.push(c);
+                insert_text(&mut app.buf, &mut app.cursor, &c.to_string());
             }
         }
         KeyCode::Up => app.scroll = app.scroll.saturating_add(1),
@@ -572,6 +594,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 fn send(app: &mut App, text: &str) {
     if app.waking {
         app.buf = text.to_string();
+        app.cursor = app.buf.chars().count();
         app.status = "waking the menagerie brain…".into();
         return;
     }
@@ -775,6 +798,74 @@ fn pretty_path(p: &str) -> String {
     }
 }
 
+fn prompt_text(app: &App, rune_desc: &str) -> (String, bool) {
+    let spin = if app.busy || app.splash || app.waking {
+        glyph::spin_line(app.born)
+    } else {
+        glyph::SPIN[0]
+    };
+    let wait = glyph::wait_line(app.born);
+    if let Some((name, args)) = app.confirm.peek() {
+        return (format!("{spin}  approve {name}? {args}  [y/N]"), false);
+    }
+    if !app.buf.is_empty() {
+        return (format!("✦ {}", app.buf), true);
+    }
+    if app.splash || app.waking {
+        return (format!("{spin}  {wait}"), false);
+    }
+    if app.busy {
+        let phase = if app.phase.is_empty() {
+            wait.to_string()
+        } else {
+            format!("{} · {wait}", app.phase)
+        };
+        return (
+            format!("{spin}  {phase}  (type + enter barge-in)"),
+            false,
+        );
+    }
+    let hint = if app.status.is_empty() {
+        format!("{rune_desc} · tab rune · ?")
+    } else {
+        app.status.clone()
+    };
+    (format!("{spin}  {hint}"), false)
+}
+
+fn byte_at(s: &str, char_i: usize) -> usize {
+    s.char_indices()
+        .nth(char_i)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+fn insert_text(buf: &mut String, cursor: &mut usize, text: &str) {
+    let i = byte_at(buf, *cursor);
+    buf.insert_str(i, text);
+    *cursor = cursor.saturating_add(text.chars().count());
+}
+
+fn delete_before(buf: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let end = byte_at(buf, *cursor);
+    let start = byte_at(buf, *cursor - 1);
+    buf.replace_range(start..end, "");
+    *cursor -= 1;
+}
+
+fn delete_at(buf: &mut String, cursor: &mut usize) {
+    let n = buf.chars().count();
+    if *cursor >= n {
+        return;
+    }
+    let start = byte_at(buf, *cursor);
+    let end = byte_at(buf, *cursor + 1);
+    buf.replace_range(start..end, "");
+}
+
 struct Bubble {
     right: bool,
     title: String,
@@ -786,19 +877,21 @@ struct Bubble {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
+    let runes = runes::all();
+    let rune = &runes[app.rune_idx];
+    let (prompt_inner, editing) = prompt_text(app, rune.desc);
     let extra = if app.help || app.plan_menu { 6 } else { 0 };
+    let prompt_h = chrome::prompt_height(&prompt_inner, size.width, size.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
             Constraint::Length(extra),
-            Constraint::Length(3),
+            Constraint::Length(prompt_h),
             Constraint::Length(1),
         ])
         .split(size);
 
-    let runes = runes::all();
-    let rune = &runes[app.rune_idx];
     app.file_hits.clear();
 
     if app.splash {
@@ -844,42 +937,32 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
 
-    let spin = if app.busy || app.splash || app.waking {
-        glyph::spin_line(app.born)
-    } else {
-        glyph::SPIN[0]
-    };
-    let wait = glyph::wait_line(app.born);
-    let prompt_inner = if let Some((name, args)) = app.confirm.peek() {
-        format!("{spin}  approve {name}? {args}  [y/N]")
-    } else if app.splash || app.waking {
-        format!("{spin}  {wait}")
-    } else if app.busy {
-        let phase = if app.phase.is_empty() {
-            wait.to_string()
-        } else {
-            format!("{} · {wait}", app.phase)
-        };
-        format!("{spin}  {phase}  (type + enter barge-in)")
-    } else if app.buf.is_empty() {
-        let hint = if app.status.is_empty() {
-            format!("{} · tab rune · ?", rune.desc)
-        } else {
-            app.status.clone()
-        };
-        format!("{spin}  {hint}")
-    } else {
-        format!("✦ {}", app.buf)
-    };
     f.render_widget(
-        Paragraph::new(prompt_inner).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BLUSH))
-                .border_set(chrome::border_set()),
-        ),
+        Paragraph::new(prompt_inner.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(BLUSH))
+                    .border_set(chrome::border_set()),
+            ),
         chunks[2],
     );
+    if editing {
+        let inner_w = chrome::prompt_inner_width(chunks[2].width);
+        let prefix = "✦ ".chars().count();
+        let vis = prefix + app.cursor.min(app.buf.chars().count());
+        let (row, col) = chrome::wrap_cursor(&prompt_inner, inner_w, vis);
+        let max_row = chunks[2].height.saturating_sub(2);
+        let row = row.min(max_row.saturating_sub(1));
+        let x = chunks[2].x.saturating_add(1).saturating_add(col);
+        let y = chunks[2].y.saturating_add(1).saturating_add(row);
+        if x < chunks[2].x.saturating_add(chunks[2].width)
+            && y < chunks[2].y.saturating_add(chunks[2].height)
+        {
+            f.set_cursor_position(Position { x, y });
+        }
+    }
 
     let pills: Vec<Span> = runes
         .iter()

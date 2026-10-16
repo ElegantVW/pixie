@@ -74,6 +74,37 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+pub fn prompt_inner_width(term_width: u16) -> usize {
+    term_width.saturating_sub(2).max(8) as usize
+}
+
+/// Outer prompt height (borders included). Floor 3, inner cap 10, never more than half the frame.
+pub fn prompt_height(text: &str, term_width: u16, frame_height: u16) -> u16 {
+    let inner_w = prompt_inner_width(term_width);
+    let lines = wrap(text, inner_w).len().max(1) as u16;
+    let half = frame_height.saturating_sub(6) / 2;
+    let cap = 10u16.min(half.max(1));
+    (lines.min(cap) + 2).max(3)
+}
+
+/// Row/col of `char_idx` inside `chrome::wrap` output.
+pub fn wrap_cursor(text: &str, width: usize, char_idx: usize) -> (u16, u16) {
+    let width = width.max(1);
+    let lines = wrap(text, width);
+    let mut n = 0usize;
+    let last = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        let end = n + len;
+        if char_idx < end || (char_idx == end && i == last) {
+            return (i as u16, (char_idx - n) as u16);
+        }
+        n = end;
+    }
+    let col = lines.last().map(|l| l.chars().count() as u16).unwrap_or(0);
+    (last as u16, col)
+}
+
 pub fn term_width() -> usize {
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
@@ -120,5 +151,19 @@ mod tests {
         let s = box_text("Pixie", "hello", 40);
         assert!(s.contains("Pixie"), "{s}");
         assert!(s.contains("hello"), "{s}");
+    }
+
+    #[test]
+    fn prompt_height_grows_and_caps() {
+        let h = prompt_height(&"x".repeat(200), 40, 40);
+        assert!(h > 3, "{h}");
+        assert!(h <= 12, "{h}");
+        assert_eq!(prompt_height("hi", 40, 40), 3);
+    }
+
+    #[test]
+    fn wrap_cursor_tracks_char_index() {
+        let (r, c) = wrap_cursor("abcdefghij", 4, 5);
+        assert_eq!((r, c), (1, 1));
     }
 }
