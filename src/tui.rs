@@ -1,10 +1,13 @@
 use crate::agent::{self, ChatEntry, Event};
+use crate::chrome;
+use crate::diff::{self, FileTouch, Op};
+use crate::glyph;
 use crate::llm::{self, Abort};
 use crate::mind::{self, SessionRec};
 use crate::paths;
 use crate::runes::{self, RuneKey};
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseEventKind},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -12,11 +15,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use serde_json::{json, Value};
 use std::io::{self, stdout};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +30,10 @@ const BLUSH: Color = Color::Rgb(0xf0, 0xb4, 0xc8);
 const DIM: Color = Color::Rgb(0x9d, 0x5c, 0x75);
 const FG: Color = Color::Rgb(0xff, 0xeb, 0xf2);
 const SILVER: Color = Color::Rgb(0xc0, 0xc0, 0xc8);
+const GREEN: Color = Color::Rgb(0x7d, 0xc9, 0x8a);
+const RED: Color = Color::Rgb(0xe8, 0x7a, 0x7a);
+const SPLASH_MIN: Duration = Duration::from_millis(500);
+const CARD_LINES: usize = 24;
 
 struct ConfirmGate {
     pending: Mutex<Option<(String, Value)>>,
@@ -67,7 +75,11 @@ impl ConfirmGate {
 enum UiMsg {
     Chunk(String),
     Round { n: usize, cap: usize },
-    Tool { title: String, body: String },
+    Tool {
+        title: String,
+        body: String,
+        file: Option<FileTouch>,
+    },
     Wake { err: Option<String> },
     Done {
         gen: u64,
@@ -79,6 +91,12 @@ enum UiMsg {
     },
 }
 
+struct LookState {
+    path: String,
+    lines: Vec<(Op, String)>,
+    scroll: u16,
+}
+
 struct App {
     chat: Vec<ChatEntry>,
     buf: String,
@@ -88,6 +106,7 @@ struct App {
     help: bool,
     busy: bool,
     waking: bool,
+    splash: bool,
     live: String,
     live_think: String,
     phase: String,
@@ -100,6 +119,11 @@ struct App {
     plan_idx: usize,
     status: String,
     gen: u64,
+    born: Instant,
+    look: Option<LookState>,
+    file_sel: usize,
+    file_hits: Vec<(Rect, usize)>,
+    pending_editor: Option<PathBuf>,
 }
 
 impl App {
@@ -108,9 +132,13 @@ impl App {
     }
 }
 
+enum KeyOut {
+    Continue,
+    Quit,
+}
+
 fn load_verbose() -> bool {
-    let p = paths::ui_path();
-    fs_bool(&p)
+    fs_bool(&paths::ui_path())
 }
 
 fn fs_bool(p: &std::path::Path) -> bool {
@@ -137,12 +165,9 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
         let idx = runes::all().iter().position(|r| r.key == k).unwrap_or(0);
         (c, idx, id)
     } else {
-        (
-            Vec::new(),
-            0,
-            chrono_id(),
-        )
+        (Vec::new(), 0, chrono_id())
     };
+    let waking = !llm::llm_up();
     let mut app = App {
         chat,
         buf: String::new(),
@@ -151,7 +176,8 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
         verbose: verbose || load_verbose(),
         help: false,
         busy: false,
-        waking: !llm::llm_up(),
+        waking,
+        splash: true,
         live: String::new(),
         live_think: String::new(),
         phase: String::new(),
@@ -164,6 +190,11 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
         plan_idx: 0,
         status: String::new(),
         gen: 0,
+        born: Instant::now(),
+        look: None,
+        file_sel: 0,
+        file_hits: Vec::new(),
+        pending_editor: None,
     };
     if app.waking {
         let tx = app.tx.clone();
@@ -193,18 +224,48 @@ pub fn run(verbose: bool, resume: Option<String>) -> anyhow::Result<()> {
         while let Ok(msg) = app.rx.try_recv() {
             handle_msg(&mut app, msg);
         }
-        term.draw(|f| draw(f, &app))?;
+        if app.splash && !app.waking && app.born.elapsed() >= SPLASH_MIN {
+            app.splash = false;
+        }
+        term.draw(|f| draw(f, &mut app))?;
+        if let Some(path) = app.pending_editor.take() {
+            suspend_editor(&mut term, &path)?;
+        }
         let timeout = Duration::from_millis(50).saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             match event::read()? {
-                CEvent::Key(k) => {
-                    if handle_key(&mut app, k)? {
-                        break;
-                    }
-                }
+                CEvent::Key(k) => match handle_key(&mut app, k)? {
+                    KeyOut::Quit => break,
+                    KeyOut::Continue => {}
+                },
                 CEvent::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(1),
-                    MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(1),
+                    MouseEventKind::ScrollUp => {
+                        if let Some(look) = app.look.as_mut() {
+                            look.scroll = look.scroll.saturating_add(1);
+                        } else {
+                            app.scroll = app.scroll.saturating_add(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if let Some(look) = app.look.as_mut() {
+                            look.scroll = look.scroll.saturating_sub(1);
+                        } else {
+                            app.scroll = app.scroll.saturating_sub(1);
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let col = m.column;
+                        let row = m.row;
+                        for (rect, fi) in &app.file_hits {
+                            if col >= rect.x
+                                && col < rect.x.saturating_add(rect.width)
+                                && row >= rect.y
+                                && row < rect.y.saturating_add(rect.height)
+                            {
+                                app.file_sel = *fi;
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 CEvent::Paste(s) => {
@@ -248,10 +309,15 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
             app.live_think = sp.think;
         }
         UiMsg::Round { n, cap } => {
-            app.phase = format!("round {n}/{cap} · thinking…");
+            app.phase = format!("round {n}/{cap}");
         }
-        UiMsg::Tool { title, body } => {
-            app.chat.push(ChatEntry::Tool { title, body });
+        UiMsg::Tool { title, body, file } => {
+            if file.is_some() {
+                let n = file_card_count(app) + 1;
+                app.file_sel = n.saturating_sub(1);
+                app.scroll = 0;
+            }
+            app.chat.push(ChatEntry::Tool { title, body, file });
             app.live.clear();
         }
         UiMsg::Wake { err } => {
@@ -335,6 +401,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
             }
             app.live.clear();
             app.phase.clear();
+            app.scroll = 0;
             if wrote_plan {
                 app.plan_menu = true;
                 app.plan_idx = 0;
@@ -343,14 +410,56 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
     }
 }
 
-fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
+fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
     if app.confirm.peek().is_some() {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => app.confirm.respond(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.confirm.respond(false),
             _ => {}
         }
-        return Ok(false);
+        return Ok(KeyOut::Continue);
+    }
+    if app.look.is_some() {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') if app.buf.is_empty() => app.look = None,
+            KeyCode::Char('o') if app.buf.is_empty() => request_open(app),
+            KeyCode::Char('[') if app.buf.is_empty() => {
+                cycle_file(app, -1);
+                open_look(app);
+            }
+            KeyCode::Char(']') if app.buf.is_empty() => {
+                cycle_file(app, 1);
+                open_look(app);
+            }
+            KeyCode::Up => {
+                if let Some(l) = app.look.as_mut() {
+                    l.scroll = l.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(l) = app.look.as_mut() {
+                    l.scroll = l.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(l) = app.look.as_mut() {
+                    l.scroll = l.scroll.saturating_add(8);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(l) = app.look.as_mut() {
+                    l.scroll = l.scroll.saturating_sub(8);
+                }
+            }
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.busy {
+                    app.abort.cancel();
+                }
+                return Ok(KeyOut::Quit);
+            }
+            _ => {}
+        }
+        return Ok(KeyOut::Continue);
     }
     if app.plan_menu && app.buf.is_empty() {
         match k.code {
@@ -385,7 +494,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
             }
             _ => {}
         }
-        return Ok(false);
+        return Ok(KeyOut::Continue);
     }
 
     match k.code {
@@ -393,13 +502,13 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
             if app.busy {
                 app.abort.cancel();
             }
-            return Ok(true);
+            return Ok(KeyOut::Quit);
         }
         KeyCode::Char('q') if app.buf.is_empty() => {
             if app.busy {
                 app.abort.cancel();
             }
-            return Ok(true);
+            return Ok(KeyOut::Quit);
         }
         KeyCode::Esc => {
             if app.help {
@@ -408,7 +517,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
                 if app.busy {
                     app.abort.cancel();
                 } else {
-                    return Ok(true);
+                    return Ok(KeyOut::Quit);
                 }
             } else {
                 app.buf.clear();
@@ -419,12 +528,19 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
             save_verbose(app.verbose);
         }
         KeyCode::Char('?') if app.buf.is_empty() => app.help = !app.help,
-        KeyCode::Tab | KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.rune_idx = (app.rune_idx + 1) % 4;
+        KeyCode::Tab => {
+            app.rune_idx = runes::next_idx(app.rune_idx);
         }
-        KeyCode::Char(c) if app.buf.is_empty() && c.is_ascii_digit() && ('1'..='4').contains(&c) => {
-            app.rune_idx = (c as u8 - b'1') as usize;
+        KeyCode::BackTab => {
+            app.rune_idx = runes::prev_idx(app.rune_idx);
         }
+        KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.rune_idx = runes::next_idx(app.rune_idx);
+        }
+        KeyCode::Char('[') if app.buf.is_empty() => cycle_file(app, -1),
+        KeyCode::Char(']') if app.buf.is_empty() => cycle_file(app, 1),
+        KeyCode::Char('l') if app.buf.is_empty() => open_look(app),
+        KeyCode::Char('o') if app.buf.is_empty() => request_open(app),
         KeyCode::Enter => {
             let text = app.buf.trim().to_string();
             if !text.is_empty() {
@@ -450,7 +566,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<bool> {
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(5),
         _ => {}
     }
-    Ok(false)
+    Ok(KeyOut::Continue)
 }
 
 fn send(app: &mut App, text: &str) {
@@ -486,6 +602,7 @@ fn send(app: &mut App, text: &str) {
     app.busy = true;
     app.live.clear();
     app.live_think.clear();
+    app.scroll = 0;
     let rune = runes::all()[app.rune_idx].clone();
     let session = app.session_id.clone();
     let verbose = app.verbose;
@@ -514,8 +631,10 @@ fn send(app: &mut App, text: &str) {
                 Event::Round { n, cap } => {
                     let _ = tx.send(UiMsg::Round { n, cap });
                 }
-                Event::ToolEnd { title, body, .. } => {
-                    let _ = tx.send(UiMsg::Tool { title, body });
+                Event::ToolEnd {
+                    title, body, file, ..
+                } => {
+                    let _ = tx.send(UiMsg::Tool { title, body, file });
                 }
                 Event::ToolStart { name, .. } => {
                     let _ = tx.send(UiMsg::Round { n: 0, cap: rounds });
@@ -534,13 +653,145 @@ fn send(app: &mut App, text: &str) {
     });
 }
 
-fn draw(f: &mut Frame, app: &App) {
+fn file_card_count(app: &App) -> usize {
+    app.chat
+        .iter()
+        .filter(|e| matches!(e, ChatEntry::Tool { file: Some(_), .. }))
+        .count()
+}
+
+fn file_cards(app: &App) -> Vec<&FileTouch> {
+    app.chat
+        .iter()
+        .filter_map(|e| match e {
+            ChatEntry::Tool { file: Some(f), .. } => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+fn current_touch(app: &App) -> Option<&FileTouch> {
+    let n = file_card_count(app);
+    if n == 0 {
+        return None;
+    }
+    let want = app.file_sel.min(n - 1);
+    file_cards(app).into_iter().nth(want)
+}
+
+fn cycle_file(app: &mut App, delta: i32) {
+    let n = file_card_count(app);
+    if n == 0 {
+        app.status = "pixie: no file to look at yet".into();
+        return;
+    }
+    let cur = app.file_sel.min(n - 1) as i32;
+    app.file_sel = ((cur + delta).rem_euclid(n as i32)) as usize;
+}
+
+fn open_look(app: &mut App) {
+    let Some(touch) = current_touch(app) else {
+        app.status = "pixie: no file to look at yet".into();
+        return;
+    };
+    let path = touch.path.clone();
+    let lines = look_lines(touch);
+    app.look = Some(LookState {
+        path,
+        lines,
+        scroll: 0,
+    });
+}
+
+fn look_lines(touch: &FileTouch) -> Vec<(Op, String)> {
+    if touch.binary {
+        return vec![(Op::Eq, "not a text file".into())];
+    }
+    if !touch.lines.is_empty() {
+        return touch
+            .lines
+            .iter()
+            .map(|l| (l.op, l.text.clone()))
+            .collect();
+    }
+    match std::fs::read_to_string(&touch.path) {
+        Ok(t) => t.lines().map(|x| (Op::Eq, x.to_string())).collect(),
+        Err(e) => vec![(Op::Eq, format!("pixie: could not read ({e})"))],
+    }
+}
+
+fn request_open(app: &mut App) {
+    let Some(touch) = current_touch(app) else {
+        app.status = "pixie: no file to open yet".into();
+        return;
+    };
+    match paths::assert_allowed(&touch.path) {
+        Err(e) => app.status = format!("pixie: {e}"),
+        Ok(p) => app.pending_editor = Some(p),
+    }
+}
+
+fn suspend_editor<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        event::DisableMouseCapture,
+        event::DisableBracketedPaste
+    )?;
+    let _ = term.show_cursor();
+    let argv = editor_argv();
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).arg(path);
+    let _ = cmd.status();
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
+    )?;
+    term.clear()?;
+    Ok(())
+}
+
+fn editor_argv() -> Vec<String> {
+    let raw = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "nano".into());
+    mind::split_argv(&raw).unwrap_or_else(|_| vec![raw])
+}
+
+fn pretty_path(p: &str) -> String {
+    let h = paths::home();
+    let hs = h.to_string_lossy();
+    if let Some(rest) = p.strip_prefix(hs.as_ref()) {
+        format!("~{rest}")
+    } else {
+        p.to_string()
+    }
+}
+
+struct Bubble {
+    right: bool,
+    title: String,
+    lines: Vec<Line<'static>>,
+    max_frac: u16,
+    border: Color,
+    file_i: Option<usize>,
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
+    let extra = if app.help || app.plan_menu { 6 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(5),
-            Constraint::Length(if app.help || app.plan_menu { 6 } else { 0 }),
+            Constraint::Length(extra),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
@@ -548,88 +799,28 @@ fn draw(f: &mut Frame, app: &App) {
 
     let runes = runes::all();
     let rune = &runes[app.rune_idx];
-    let title = format!(" ✦ Pixie ✦ {} · {} ✦ ", rune.name, app.session_id);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(PINK))
-        .style(Style::default().fg(FG));
+    app.file_hits.clear();
 
-    let mut lines: Vec<Line> = Vec::new();
-    for e in &app.chat {
-        match e {
-            ChatEntry::User(t) => {
-                lines.push(Line::from(Span::styled(
-                    format!("you · {t}"),
-                    Style::default().fg(BLUSH),
-                )));
-            }
-            ChatEntry::Assistant {
-                text,
-                clock,
-                think,
-                cancelled,
-            } => {
-                if app.verbose && !think.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("think · {think}"),
-                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-                    )));
-                }
-                let mark = if *cancelled { " (cancelled)" } else { "" };
-                lines.push(Line::from(Span::styled(
-                    format!("Pixie ✦ {clock}{mark} · {text}"),
-                    Style::default().fg(PINK),
-                )));
-            }
-            ChatEntry::Tool { title, body } => {
-                let shown = if app.verbose {
-                    format!("{title}\n{body}")
-                } else {
-                    title.clone()
-                };
-                lines.push(Line::from(Span::styled(shown, Style::default().fg(DIM))));
-            }
-        }
-        lines.push(Line::from(""));
+    if app.splash {
+        draw_splash(f, chunks[0], app);
+    } else if let Some(look) = app.look.as_ref() {
+        draw_look(f, chunks[0], look);
+    } else {
+        draw_chat(f, chunks[0], app, rune.name);
     }
-    if app.busy {
-        if app.verbose && !app.live_think.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("think · {}", app.live_think),
-                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-            )));
-        }
-        let vis = crate::think::strip(&app.live);
-        if !vis.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("Pixie · {vis}"),
-                Style::default().fg(PINK),
-            )));
-        } else if !app.phase.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("✦ {}", app.phase),
-                Style::default().fg(SILVER),
-            )));
-        }
-    }
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
-    f.render_widget(para, chunks[0]);
 
     if app.help {
         let help = Paragraph::new(
-            "enter send · esc clear/cancel · q quit · 1–4 runes · tab cycle · v verbose\n\
-             Plan: after write_plan, y approve → Build · e stay · n drop",
+            "enter send · esc clear/cancel · q quit · tab / shift-tab runes · v verbose\n\
+             l look file · o open in editor · [ ] files · Plan: y approve · e stay · n drop",
         )
         .style(Style::default().fg(SILVER))
         .block(
             Block::default()
                 .title(" keys ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(DIM)),
+                .border_style(Style::default().fg(DIM))
+                .border_set(chrome::border_set()),
         );
         f.render_widget(help, chunks[1]);
     } else if app.plan_menu {
@@ -646,20 +837,37 @@ fn draw(f: &mut Frame, app: &App) {
                 Block::default()
                     .title(" plan ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(PINK)),
+                    .border_style(Style::default().fg(PINK))
+                    .border_set(chrome::border_set()),
             ),
             chunks[1],
         );
     }
 
+    let spin = if app.busy || app.splash || app.waking {
+        glyph::spin_line(app.born)
+    } else {
+        glyph::SPIN[0]
+    };
+    let wait = glyph::wait_line(app.born);
     let prompt_inner = if let Some((name, args)) = app.confirm.peek() {
-        format!("approve {name}? {args}  [y/N]")
-    } else if app.waking {
-        "✦ waking the menagerie brain…".into()
+        format!("{spin}  approve {name}? {args}  [y/N]")
+    } else if app.splash || app.waking {
+        format!("{spin}  {wait}")
     } else if app.busy {
-        format!("✦ {}  (type + enter barge-in)", if app.phase.is_empty() { "thinking…".into() } else { app.phase.clone() })
+        let phase = if app.phase.is_empty() {
+            wait.to_string()
+        } else {
+            format!("{} · {wait}", app.phase)
+        };
+        format!("{spin}  {phase}  (type + enter barge-in)")
     } else if app.buf.is_empty() {
-        format!("✦ {} · ↑↓ · ?", rune.desc)
+        let hint = if app.status.is_empty() {
+            format!("{} · tab rune · ?", rune.desc)
+        } else {
+            app.status.clone()
+        };
+        format!("{spin}  {hint}")
     } else {
         format!("✦ {}", app.buf)
     };
@@ -667,29 +875,404 @@ fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(prompt_inner).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(BLUSH)),
+                .border_style(Style::default().fg(BLUSH))
+                .border_set(chrome::border_set()),
         ),
         chunks[2],
     );
 
-    let pills: String = runes
+    let pills: Vec<Span> = runes
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            if i == app.rune_idx {
-                format!("[{} {}]", i + 1, r.name)
+        .flat_map(|(i, r)| {
+            let gap = if i == 0 {
+                None
             } else {
-                format!(" {} {} ", i + 1, r.name)
+                Some(Span::raw("  "))
+            };
+            let style = if i == app.rune_idx {
+                Style::default().fg(PINK).add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(SILVER)
+            };
+            let pill = Span::styled(format!(" {} ", r.name), style);
+            match gap {
+                Some(g) => vec![g, pill],
+                None => vec![pill],
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let verb = if app.verbose { " verbose" } else { "" };
-    f.render_widget(
-        Paragraph::new(format!("{pills}  · ?{verb}")).style(Style::default().fg(SILVER)),
-        chunks[3],
-    );
-    let _ = chunks;
-    let _unused: Option<Rect> = None;
-    let _ = _unused;
+        .collect();
+    let mut footer = pills;
+    footer.push(Span::styled(
+        if app.verbose { "  · ?  verbose" } else { "  · ?" },
+        Style::default().fg(SILVER),
+    ));
+    f.render_widget(Paragraph::new(Line::from(footer)), chunks[3]);
+}
+
+fn draw_splash(f: &mut Frame, area: Rect, app: &App) {
+    f.render_widget(Clear, area);
+    let frame = glyph::splash_frame(app.born);
+    let gh = frame.len() as u16;
+    let gw = 7u16;
+    let x = area.x + area.width.saturating_sub(gw) / 2;
+    let y = area.y + area.height.saturating_sub(gh + 2) / 2;
+    for (i, line) in frame.iter().enumerate() {
+        let row = Rect {
+            x,
+            y: y.saturating_add(i as u16),
+            width: gw,
+            height: 1,
+        };
+        if row.y >= area.y + area.height {
+            break;
+        }
+        f.render_widget(
+            Paragraph::new(*line).style(Style::default().fg(PINK)),
+            row,
+        );
+    }
+    let wait = glyph::wait_line(app.born);
+    let wy = y.saturating_add(gh).saturating_add(1);
+    if wy < area.y + area.height {
+        let w = (wait.chars().count() as u16).min(area.width);
+        let wx = area.x + area.width.saturating_sub(w) / 2;
+        f.render_widget(
+            Paragraph::new(wait).style(Style::default().fg(BLUSH)),
+            Rect {
+                x: wx,
+                y: wy,
+                width: w.max(1),
+                height: 1,
+            },
+        );
+    }
+}
+
+fn draw_look(f: &mut Frame, area: Rect, look: &LookState) {
+    let title = format!(" look · {} ", pretty_path(&look.path));
+    let inner_w = area.width.saturating_sub(2).max(8) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (op, text) in &look.lines {
+        for chunk in chrome::wrap(text, inner_w.saturating_sub(2)) {
+            lines.push(diff_line(*op, &chunk));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("(empty)", Style::default().fg(DIM))));
+    }
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(PINK))
+                .border_set(chrome::border_set()),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((look.scroll, 0));
+    f.render_widget(para, area);
+}
+
+fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, rune_name: &str) {
+    let title = format!(" ✦ Pixie ✦ {rune_name} · {} ✦ ", app.session_id);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(PINK))
+        .border_set(chrome::border_set())
+        .style(Style::default().fg(FG));
+    f.render_widget(block, area);
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    let bubbles = collect_bubbles(app, inner.width);
+    let mut heights = Vec::new();
+    for b in &bubbles {
+        let max_w = ((inner.width as u32 * b.max_frac as u32) / 100).clamp(12, inner.width as u32) as u16;
+        let body = bubble_body_text(b);
+        let w = chrome::bubble_width(&body, max_w, 12).min(inner.width);
+        let inner_w = w.saturating_sub(2).max(1) as usize;
+        let h = 2u16 + wrapped_height(&b.lines, inner_w);
+        heights.push((w, h.max(3)));
+    }
+
+    let gaps = bubbles.len().saturating_sub(1) as u16;
+    let total: u16 = heights.iter().map(|(_, h)| *h).sum::<u16>().saturating_add(gaps);
+    let view = inner.height;
+    let max_scroll = total.saturating_sub(view);
+    if app.scroll > max_scroll {
+        app.scroll = max_scroll;
+    }
+    let mut cursor = if total <= view {
+        inner.y as i32 + (view - total) as i32
+    } else {
+        inner.y as i32 - max_scroll.saturating_sub(app.scroll) as i32
+    };
+    let bottom = (inner.y + inner.height) as i32;
+    for (i, b) in bubbles.iter().enumerate() {
+        let (w, h) = heights[i];
+        let x = if b.right {
+            inner.x + inner.width.saturating_sub(w)
+        } else {
+            inner.x
+        };
+        let y = cursor;
+        cursor += h as i32 + 1;
+        if y + h as i32 <= inner.y as i32 {
+            continue;
+        }
+        if y >= bottom {
+            break;
+        }
+        if y < inner.y as i32 {
+            continue;
+        }
+        let h_vis = (bottom - y).min(h as i32) as u16;
+        if h_vis < 3 {
+            continue;
+        }
+        let r = Rect {
+            x,
+            y: y as u16,
+            width: w,
+            height: h_vis,
+        };
+        render_bubble(f, r, b, app.file_sel);
+        if let Some(fi) = b.file_i {
+            app.file_hits.push((r, fi));
+        }
+    }
+}
+
+fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
+    let mut out = Vec::new();
+    let mut file_i = 0usize;
+    for e in &app.chat {
+        match e {
+            ChatEntry::User(t) => {
+                out.push(Bubble {
+                    right: true,
+                    title: " you ".into(),
+                    lines: wrap_plain(t),
+                    max_frac: 70,
+                    border: BLUSH,
+                    file_i: None,
+                });
+            }
+            ChatEntry::Assistant {
+                text,
+                clock,
+                think,
+                cancelled,
+            } => {
+                if app.verbose && !think.is_empty() {
+                    out.push(Bubble {
+                        right: false,
+                        title: " think ".into(),
+                        lines: wrap_plain(think),
+                        max_frac: 80,
+                        border: DIM,
+                        file_i: None,
+                    });
+                }
+                let mark = if *cancelled { " (cancelled)" } else { "" };
+                out.push(Bubble {
+                    right: false,
+                    title: format!(" ✦ Pixie · {clock}{mark} "),
+                    lines: wrap_plain(text),
+                    max_frac: 80,
+                    border: PINK,
+                    file_i: None,
+                });
+            }
+            ChatEntry::Tool { title, body, file } => {
+                if let Some(ft) = file {
+                    let sel = file_i == app.file_sel;
+                    out.push(file_bubble(ft, sel, app.verbose, body, file_i));
+                    file_i += 1;
+                } else if app.verbose {
+                    out.push(Bubble {
+                        right: false,
+                        title: format!(" {title} "),
+                        lines: wrap_plain(body),
+                        max_frac: 90,
+                        border: DIM,
+                        file_i: None,
+                    });
+                } else {
+                    out.push(Bubble {
+                        right: false,
+                        title: " tool ".into(),
+                        lines: wrap_plain(title),
+                        max_frac: 90,
+                        border: DIM,
+                        file_i: None,
+                    });
+                }
+            }
+        }
+    }
+    if app.busy {
+        if app.verbose && !app.live_think.is_empty() {
+            out.push(Bubble {
+                right: false,
+                title: " think ".into(),
+                lines: wrap_plain(&app.live_think),
+                max_frac: 80,
+                border: DIM,
+                file_i: None,
+            });
+        }
+        let vis = crate::think::strip(&app.live);
+        let spin = glyph::spin_line(app.born);
+        if !vis.is_empty() {
+            out.push(Bubble {
+                right: false,
+                title: format!(" ✦ Pixie · {spin} "),
+                lines: wrap_plain(&vis),
+                max_frac: 80,
+                border: PINK,
+                file_i: None,
+            });
+        } else {
+            out.push(Bubble {
+                right: false,
+                title: format!(" ✦ Pixie · {spin} "),
+                lines: wrap_plain(glyph::wait_line(app.born)),
+                max_frac: 50,
+                border: SILVER,
+                file_i: None,
+            });
+        }
+    }
+    out
+}
+
+fn file_bubble(ft: &FileTouch, sel: bool, verbose: bool, body: &str, file_i: usize) -> Bubble {
+    let sum = ft.summary();
+    let mark = if sel { "▸ " } else { "" };
+    let title = if sum.is_empty() {
+        format!(" {mark}{} · {} ", ft.kind.as_str(), pretty_path(&ft.path))
+    } else {
+        format!(
+            " {mark}{} · {} · {sum} ",
+            ft.kind.as_str(),
+            pretty_path(&ft.path)
+        )
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if ft.kind == diff::FileKind::Search && !ft.extra_paths.is_empty() {
+        for p in ft.extra_paths.iter().take(12) {
+            lines.push(Line::from(Span::styled(
+                pretty_path(p),
+                Style::default().fg(SILVER),
+            )));
+        }
+    } else if ft.binary {
+        lines.push(Line::from(Span::styled(
+            "not a text file",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        for l in diff::for_card(&ft.lines, CARD_LINES) {
+            lines.push(diff_line(l.op, &l.text));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(empty)",
+            Style::default().fg(DIM),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "o open  ·  l look  ·  [ ] files",
+        Style::default().fg(DIM),
+    )));
+    if verbose && !body.is_empty() {
+        for chunk in chrome::wrap(body, 80) {
+            lines.push(Line::from(Span::styled(
+                chunk,
+                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    Bubble {
+        right: false,
+        title,
+        lines,
+        max_frac: 90,
+        border: if sel { PINK } else { DIM },
+        file_i: Some(file_i),
+    }
+}
+
+fn diff_line(op: Op, text: &str) -> Line<'static> {
+    match op {
+        Op::Add => Line::from(Span::styled(
+            format!("+ {text}"),
+            Style::default().fg(GREEN),
+        )),
+        Op::Del => Line::from(Span::styled(
+            format!("- {text}"),
+            Style::default().fg(RED),
+        )),
+        Op::Eq => Line::from(Span::styled(
+            format!("  {text}"),
+            Style::default().fg(SILVER),
+        )),
+    }
+}
+
+fn wrap_plain(text: &str) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
+    text.lines()
+        .map(|l| Line::from(l.to_string()))
+        .collect()
+}
+
+fn bubble_body_text(b: &Bubble) -> String {
+    let mut s = b.title.clone();
+    for line in &b.lines {
+        s.push('\n');
+        s.push_str(&line.to_string());
+    }
+    s
+}
+
+fn wrapped_height(lines: &[Line<'static>], inner_w: usize) -> u16 {
+    let mut n = 0u16;
+    for line in lines {
+        let t = line.to_string();
+        let chunks = chrome::wrap(&t, inner_w.max(1));
+        n = n.saturating_add(chunks.len().max(1) as u16);
+    }
+    n.max(1)
+}
+
+fn render_bubble(f: &mut Frame, rect: Rect, b: &Bubble, file_sel: usize) {
+    let border = if b.file_i == Some(file_sel) && b.file_i.is_some() {
+        PINK
+    } else {
+        b.border
+    };
+    let para = Paragraph::new(b.lines.clone())
+        .block(
+            Block::default()
+                .title(b.title.clone())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .border_set(chrome::border_set()),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, rect);
 }

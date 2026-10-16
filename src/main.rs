@@ -1,5 +1,7 @@
 mod agent;
 mod chrome;
+mod diff;
+mod glyph;
 mod host;
 mod llm;
 mod mind;

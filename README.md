@@ -10,7 +10,7 @@ cd ~/pixie && ./build.sh install --house
 # models → ~/.local/share/pixie/models/*.gguf
 ```
 
-Then: `menagerie status all` and `pixie "hello"`.
+Then: `menagerie status all` and `pixie "hello"`. Bare `pixie` is the TUI: Tab cycles Runes, house-star wait glyph, file cards with `l` look / `o` open.
 
 ## Look
 

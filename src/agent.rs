@@ -1,3 +1,4 @@
+use crate::diff::FileTouch;
 use crate::host;
 use crate::llm::{self, Abort};
 use crate::mind::{self, SessionRec};
@@ -12,7 +13,11 @@ use std::time::Instant;
 pub enum ChatEntry {
     User(String),
     Assistant { text: String, clock: String, think: String, cancelled: bool },
-    Tool { title: String, body: String },
+    Tool {
+        title: String,
+        body: String,
+        file: Option<FileTouch>,
+    },
 }
 
 pub struct TurnOut {
@@ -69,7 +74,7 @@ pub fn chat_messages(chat: &[ChatEntry], rune: &Rune, session_id: &str) -> Vec<V
     let n = history.len();
     for (i, entry) in history.iter().enumerate() {
         match entry {
-            ChatEntry::Tool { body, .. } => {
+            ChatEntry::Tool { body, file: _, .. } => {
                 if last_tool == Some(i) {
                     let cap = body.chars().take(1200).collect::<String>();
                     msgs.push(json!({"role": "tool", "content": cap}));
@@ -259,15 +264,18 @@ pub fn run_turn(
                 );
                 let body = tools::tool_body(fname, &fargs, &result, verbose);
                 let title = format!("Calling tools ─ ✦ thought for {:.2}s", t1.elapsed().as_secs_f32());
+                let file = tools::take_touch();
                 chat.push(ChatEntry::Tool {
                     title: title.clone(),
                     body: body.clone(),
+                    file: file.clone(),
                 });
                 on_event(Event::ToolEnd {
                     title,
                     body,
                     name: fname.to_string(),
                     result: result.clone(),
+                    file,
                 });
                 if abort.is_cancelled() {
                     return TurnOut {
@@ -310,6 +318,7 @@ pub enum Event {
         name: String,
         #[allow(dead_code)]
         result: Value,
+        file: Option<FileTouch>,
     },
 }
 
@@ -355,6 +364,7 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
                 chat.push(ChatEntry::Tool {
                     title: format!("Calling tools · {name}"),
                     body: tools::tool_body(name, &args, &result, true),
+                    file: tools::touch_from_rec(name, &args, &result),
                 });
             }
             _ => {}

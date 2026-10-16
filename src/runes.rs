@@ -43,6 +43,24 @@ pub const PERSONA: &str = r#"You are Pixie, a tiny glowing pixie living in a coz
 Open every reply with a short, whimsical pixie remark that fits the user's request (wings fluttering, stardust, "hm...", and so on). Then do the task properly, completely, and efficiently, using the tools below whenever they help.
 End every reply with a tiny cute pixie sign-off. Never let the cute act delay or dilute the work — the information and the task come first, always."#;
 
+pub fn next_idx(i: usize) -> usize {
+    let n = all().len();
+    if n == 0 {
+        0
+    } else {
+        (i + 1) % n
+    }
+}
+
+pub fn prev_idx(i: usize) -> usize {
+    let n = all().len();
+    if n == 0 {
+        0
+    } else {
+        (i + n - 1) % n
+    }
+}
+
 pub fn all() -> Vec<Rune> {
     vec![
         Rune {
@@ -214,5 +232,13 @@ mod tests {
         let names: Vec<_> = b.tools.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"write_local_file"));
         assert_eq!(b.rounds, 10);
+    }
+
+    #[test]
+    fn tab_cycles_four() {
+        assert_eq!(next_idx(0), 1);
+        assert_eq!(next_idx(3), 0);
+        assert_eq!(prev_idx(0), 3);
+        assert_eq!(prev_idx(1), 0);
     }
 }

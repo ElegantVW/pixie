@@ -1,12 +1,26 @@
+use crate::diff::{self, DiffLine, FileKind, FileTouch, Op};
 use crate::mind;
 use crate::paths;
 use crate::runes::RuneKey;
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
+
+thread_local! {
+    static TOUCH: RefCell<Option<FileTouch>> = const { RefCell::new(None) };
+}
+
+pub fn take_touch() -> Option<FileTouch> {
+    TOUCH.with(|c| c.borrow_mut().take())
+}
+
+fn set_touch(t: FileTouch) {
+    TOUCH.with(|c| *c.borrow_mut() = Some(t));
+}
 
 const TOOL_RESULT_CAP: usize = 1200;
 const TOOL_ROUND_CAP: usize = 4000;
@@ -205,6 +219,7 @@ pub fn run_tool(
             "error": format!("Unknown tool '{fname}' in {} mode. Valid tools: {}", rune.as_str(), allowed.join(", "))
         });
     }
+    let _ = take_touch();
     let fargs = norm_args(&fname, fargs);
     if needs_confirm(&fname, rune) {
         match confirm {
@@ -249,9 +264,25 @@ pub fn run_tool(
             match paths::assert_allowed(path) {
                 Err(e) => json!({"error": e.to_string()}),
                 Ok(p) => {
-                    match fs::read_to_string(&p) {
+                    match fs::read(&p) {
                         Err(e) => json!({"error": format!("File not found: {path} ({e})")}),
-                        Ok(text) => {
+                        Ok(bytes) => {
+                            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+                                set_touch(FileTouch {
+                                    path: p.display().to_string(),
+                                    kind: FileKind::Read,
+                                    added: 0,
+                                    deleted: 0,
+                                    lines: Vec::new(),
+                                    binary: true,
+                                    extra_paths: Vec::new(),
+                                });
+                                return json!({
+                                    "path": p.display().to_string(),
+                                    "error": "not a text file"
+                                });
+                            }
+                            let text = String::from_utf8_lossy(&bytes);
                             let lines: Vec<&str> = text.lines().collect();
                             let start = fargs
                                 .get("start_line")
@@ -268,8 +299,25 @@ pub fn run_tool(
                             } else {
                                 lines[start..].join("\n")
                             };
+                            let preview: Vec<DiffLine> = slice
+                                .lines()
+                                .take(80)
+                                .map(|t| DiffLine {
+                                    op: Op::Eq,
+                                    text: t.to_string(),
+                                })
+                                .collect();
+                            set_touch(FileTouch {
+                                path: p.display().to_string(),
+                                kind: FileKind::Read,
+                                added: 0,
+                                deleted: 0,
+                                lines: preview,
+                                binary: false,
+                                extra_paths: Vec::new(),
+                            });
                             json!({
-                                "path": path,
+                                "path": p.display().to_string(),
                                 "content": slice,
                                 "bounded_from": start + 1,
                                 "bounded_to": end.max(start)
@@ -288,8 +336,49 @@ pub fn run_tool(
                     if let Some(d) = p.parent() {
                         let _ = fs::create_dir_all(d);
                     }
+                    let existed = p.exists();
+                    let old_bytes = if existed { fs::read(&p).ok() } else { None };
+                    let binary_old = old_bytes
+                        .as_ref()
+                        .map(|b| b.contains(&0) || std::str::from_utf8(b).is_err())
+                        .unwrap_or(false);
                     match fs::write(&p, content) {
-                        Ok(()) => json!({"path": p.display().to_string(), "written": true, "bytes": content.len()}),
+                        Ok(()) => {
+                            let created = !existed;
+                            let (added, deleted, lines, binary) = if binary_old {
+                                (0usize, 0usize, Vec::new(), true)
+                            } else {
+                                let old_text = old_bytes
+                                    .as_ref()
+                                    .and_then(|b| std::str::from_utf8(b).ok())
+                                    .unwrap_or("");
+                                let lines = diff::diff_text(old_text, content);
+                                let (a, d) = diff::counts(&lines);
+                                (a, d, lines, false)
+                            };
+                            set_touch(FileTouch {
+                                path: p.display().to_string(),
+                                kind: if created {
+                                    FileKind::Create
+                                } else {
+                                    FileKind::Write
+                                },
+                                added,
+                                deleted,
+                                lines,
+                                binary,
+                                extra_paths: Vec::new(),
+                            });
+                            json!({
+                                "path": p.display().to_string(),
+                                "written": true,
+                                "bytes": content.len(),
+                                "created": created,
+                                "added": added,
+                                "deleted": deleted,
+                                "binary": binary
+                            })
+                        }
                         Err(e) => json!({"error": e.to_string()}),
                     }
                 }
@@ -324,7 +413,29 @@ pub fn run_tool(
             }
         }
         "remember" => mind::remember(fargs.get("fact").and_then(|x| x.as_str()).unwrap_or(""), None),
-        "search_house" => mind::search_house(fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""), 12),
+        "search_house" => {
+            let r = mind::search_house(fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""), 12);
+            let extra = hit_paths(&r);
+            if let Some(first) = extra.first() {
+                set_touch(FileTouch {
+                    path: first.clone(),
+                    kind: FileKind::Search,
+                    added: 0,
+                    deleted: 0,
+                    lines: extra
+                        .iter()
+                        .take(12)
+                        .map(|p| DiffLine {
+                            op: Op::Eq,
+                            text: p.clone(),
+                        })
+                        .collect(),
+                    binary: false,
+                    extra_paths: extra.clone(),
+                });
+            }
+            r
+        }
         "wiki" => {
             let r = mind::wiki(
                 fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
@@ -375,14 +486,38 @@ pub fn run_tool(
             }
             r
         }
-        "write_plan" => mind::write_plan(
-            fargs.get("goal").and_then(|x| x.as_str()).unwrap_or(""),
-            fargs.get("steps").unwrap_or(&json!([])),
-            fargs.get("files").unwrap_or(&json!([])),
-            fargs.get("risks").unwrap_or(&json!([])),
-            fargs.get("verify").and_then(|x| x.as_str()).unwrap_or(""),
-            session_id,
-        ),
+        "write_plan" => {
+            let r = mind::write_plan(
+                fargs.get("goal").and_then(|x| x.as_str()).unwrap_or(""),
+                fargs.get("steps").unwrap_or(&json!([])),
+                fargs.get("files").unwrap_or(&json!([])),
+                fargs.get("risks").unwrap_or(&json!([])),
+                fargs.get("verify").and_then(|x| x.as_str()).unwrap_or(""),
+                session_id,
+            );
+            if let Some(path) = r.get("path").and_then(|x| x.as_str()) {
+                let preview = fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .take(80)
+                    .map(|t| DiffLine {
+                        op: Op::Add,
+                        text: t.to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                let added = preview.len();
+                set_touch(FileTouch {
+                    path: path.to_string(),
+                    kind: FileKind::Plan,
+                    added,
+                    deleted: 0,
+                    lines: preview,
+                    binary: false,
+                    extra_paths: Vec::new(),
+                });
+            }
+            r
+        }
         "manage_systemd_service" => {
             let mut s_name = fargs.get("service_name").and_then(|x| x.as_str()).unwrap_or("menagerie.service");
             if matches!(s_name, "your_user_name" | "your_user_service" | "default" | "user-environment" | "") {
@@ -509,6 +644,87 @@ fn check_mail(sync: bool, box_: &str, max_messages: i64) -> Value {
     result
 }
 
+fn hit_paths(result: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = result.get("hits").and_then(|x| x.as_array()) {
+        for h in arr {
+            if let Some(p) = h.get("path").and_then(|x| x.as_str()) {
+                if !out.iter().any(|e: &String| e == p) {
+                    out.push(p.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resume a file card from jsonl without storing the hunk (look re-reads the path).
+pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTouch> {
+    if result.get("error").is_some() {
+        return None;
+    }
+    match alias(name) {
+        "read_local_file" => {
+            let path = result
+                .get("path")
+                .or_else(|| args.get("path"))
+                .and_then(|x| x.as_str())?;
+            Some(FileTouch {
+                path: path.into(),
+                kind: FileKind::Read,
+                added: 0,
+                deleted: 0,
+                lines: Vec::new(),
+                binary: false,
+                extra_paths: Vec::new(),
+            })
+        }
+        "write_local_file" => {
+            let path = result.get("path").and_then(|x| x.as_str())?;
+            let created = result.get("created").and_then(|x| x.as_bool()).unwrap_or(false);
+            Some(FileTouch {
+                path: path.into(),
+                kind: if created {
+                    FileKind::Create
+                } else {
+                    FileKind::Write
+                },
+                added: result.get("added").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                deleted: result.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                lines: Vec::new(),
+                binary: result.get("binary").and_then(|x| x.as_bool()).unwrap_or(false),
+                extra_paths: Vec::new(),
+            })
+        }
+        "search_house" => {
+            let extra = hit_paths(result);
+            let path = extra.first()?.clone();
+            Some(FileTouch {
+                path,
+                kind: FileKind::Search,
+                added: 0,
+                deleted: 0,
+                lines: Vec::new(),
+                binary: false,
+                extra_paths: extra,
+            })
+        }
+        "write_plan" => {
+            let path = result.get("path").and_then(|x| x.as_str())?;
+            Some(FileTouch {
+                path: path.into(),
+                kind: FileKind::Plan,
+                added: 0,
+                deleted: 0,
+                lines: Vec::new(),
+                binary: false,
+                extra_paths: Vec::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn tool_payload(results: &[Value]) -> String {
     let mut parts = Vec::new();
     let mut used = 0usize;
@@ -538,7 +754,10 @@ pub fn tool_body(fname: &str, fargs: &Value, result: &Value, verbose: bool) -> S
             return format!("{routing}\n{}", s.chars().take(120).collect::<String>());
         }
         if result.get("written").and_then(|x| x.as_bool()).unwrap_or(false) {
-            return format!("{routing}\nwrote {} bytes", result.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0));
+            let bytes = result.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
+            let a = result.get("added").and_then(|x| x.as_u64()).unwrap_or(0);
+            let d = result.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0);
+            return format!("{routing}\nwrote {bytes} bytes (+{a} -{d})");
         }
         if let Some(c) = result.get("count") {
             return format!("{routing}\n{c} results");
@@ -609,6 +828,45 @@ mod tests {
     fn look_stub() {
         let r = run_tool("look", &json!({"target": "screen"}), RuneKey::Chat, "", None, None);
         assert!(r["error"].as_str().unwrap().contains("sleeping"));
+    }
+
+    #[test]
+    fn write_reports_diff_not_hunks() {
+        let dir = paths::cache_dir().join(format!("tui-feel-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("sample.txt");
+        let path = p.display().to_string();
+        let r = run_tool(
+            "write_local_file",
+            &json!({"path": path, "content": "alpha\nbeta\n"}),
+            RuneKey::Build,
+            "",
+            None,
+            None,
+        );
+        assert_eq!(r.get("written"), Some(&json!(true)), "{r}");
+        assert_eq!(r.get("created"), Some(&json!(true)), "{r}");
+        assert!(r.get("added").and_then(|x| x.as_u64()).unwrap_or(0) >= 2, "{r}");
+        assert!(r.get("hunks").is_none(), "model payload must not dump hunks: {r}");
+        let blob = r.to_string();
+        assert!(!blob.contains("hunks"), "{blob}");
+        let touch = take_touch().expect("file touch");
+        assert!(touch.lines.iter().any(|l| l.op == Op::Add));
+
+        let r2 = run_tool(
+            "write_local_file",
+            &json!({"path": path, "content": "alpha\ngamma\n"}),
+            RuneKey::Build,
+            "",
+            None,
+            None,
+        );
+        assert_eq!(r2.get("created"), Some(&json!(false)), "{r2}");
+        assert!(r2.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) >= 1, "{r2}");
+        let t2 = take_touch().expect("edit touch");
+        assert!(t2.lines.iter().any(|l| l.op == Op::Del && l.text.contains("beta")));
+        assert!(t2.lines.iter().any(|l| l.op == Op::Add && l.text.contains("gamma")));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,5 +1,13 @@
 # Pixie changelog
 
+## v0.2.1 TUI feel (2026-10-16)
+
+- Content-sized chat bubbles (you right / Pixie left).
+- Tab / Shift-Tab cycle Runes; digits `1`–`4` type into the prompt.
+- Launch splash and wait spinner are frames of the house star (`assets/sigils/pixie.txt`).
+- File cards: green `+` / red `−`, `l` look, `o` open in `$EDITOR`.
+- Evidence: `cargo test` 34 pass (no llama).
+
 ## v0.2.0 rust familiar (2026-10-16)
 
 - Pixie engine is Rust (`src/`, `./build.sh install --house`). Python `bin/pixie` retired.
