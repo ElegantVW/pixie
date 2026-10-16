@@ -1,0 +1,157 @@
+mod agent;
+mod chrome;
+mod host;
+mod llm;
+mod mind;
+mod paths;
+mod runes;
+mod think;
+mod tools;
+mod tui;
+
+use crate::agent::ChatEntry;
+use crate::llm::Abort;
+use crate::mind::SessionRec;
+use crate::runes::RuneKey;
+use anyhow::Result;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(name = "pixie", version, about = "local faeOS familiar")]
+struct Cli {
+    /// Show think + full tool mirrors
+    #[arg(short, long)]
+    verbose: bool,
+    /// List chat archives
+    #[arg(long)]
+    chats: bool,
+    /// Print a chat transcript (latest if omitted)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    chat: Option<String>,
+    /// Resume a chat in the TUI (latest if omitted)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    /// One-shot prompt
+    prompt: Vec<String>,
+}
+
+fn main() {
+    let code = match real_main() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pixie: {e}");
+            eprintln!("  next:  check the menagerie is awake (`menagerie ensure pixie`)");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+fn real_main() -> Result<i32> {
+    let cli = Cli::parse();
+    if cli.chats {
+        println!("{}", mind::format_chat_list(None));
+        return Ok(0);
+    }
+    if let Some(id) = cli.chat {
+        let name = if id.is_empty() { None } else { Some(id.as_str()) };
+        let Some(sid) = mind::resolve_session_id(name, None) else {
+            if id.is_empty() {
+                eprintln!("pixie: no chats stored yet");
+            } else {
+                eprintln!("pixie: no chat named {id}");
+            }
+            return Ok(1);
+        };
+        println!("{}", mind::format_chat(&sid, None));
+        return Ok(0);
+    }
+    if let Some(id) = cli.resume {
+        let name = if id.is_empty() { None } else { Some(id.as_str()) };
+        let Some(sid) = mind::resolve_session_id(name, None) else {
+            if id.is_empty() {
+                eprintln!("pixie: no chats stored yet");
+            } else {
+                eprintln!("pixie: no chat named {id}");
+            }
+            return Ok(1);
+        };
+        tui::run(cli.verbose, Some(sid))?;
+        return Ok(0);
+    }
+    if cli.prompt.is_empty() {
+        tui::run(cli.verbose, None)?;
+        return Ok(0);
+    }
+    oneshot(&cli.prompt.join(" "), cli.verbose)
+}
+
+fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
+    let _ = mind::seed_memory(None);
+    if !llm::llm_up() && !llm::ensure_llm_up() {
+        eprintln!("pixie: the menagerie brain is asleep");
+        eprintln!("  next:  menagerie ensure pixie");
+        return Ok(1);
+    }
+    let rune = runes::by_key(RuneKey::Chat);
+    let sid = format!("oneshot-{}", std::process::id());
+    mind::append_session(
+        &sid,
+        &SessionRec {
+            ts: mind::now_ts(),
+            role: "user".into(),
+            rune: "oneshot".into(),
+            text: prompt.into(),
+            tool: String::new(),
+            args: None,
+            result: None,
+            raw: String::new(),
+            think: String::new(),
+            cancelled: false,
+        },
+        None,
+    );
+    let mut chat = vec![ChatEntry::User(prompt.into())];
+    let abort = Abort::new();
+    let t0 = std::time::Instant::now();
+    let out = agent::run_turn(
+        &mut chat,
+        &rune,
+        &sid,
+        &abort,
+        verbose,
+        None,
+        |_| {},
+    );
+    let text = if let Some(e) = out.err {
+        format!("(✦ pixie lost the connection: {e})")
+    } else {
+        out.text
+    };
+    mind::append_session(
+        &sid,
+        &SessionRec {
+            ts: mind::now_ts(),
+            role: "assistant".into(),
+            rune: "oneshot".into(),
+            text: text.clone(),
+            tool: String::new(),
+            args: None,
+            result: None,
+            raw: String::new(),
+            think: out.think.clone(),
+            cancelled: out.cancelled,
+        },
+        None,
+    );
+    let elapsed = t0.elapsed().as_secs_f32();
+    let mut body = text;
+    if verbose && !out.think.is_empty() {
+        body = format!("think: {}\n\n{body}", out.think);
+    }
+    println!(
+        "{}",
+        chrome::box_text(&format!("Pixie ─────── ✦ Thought for {elapsed:.2}s"), &body, chrome::term_width())
+    );
+    Ok(0)
+}

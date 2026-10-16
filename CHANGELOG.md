@@ -1,5 +1,13 @@
 # Pixie changelog
 
+## v0.2.0 rust familiar (2026-10-16)
+
+- Pixie engine is Rust (`src/`, `./build.sh install --house`). Python `bin/pixie` retired.
+- Host card from `/etc/os-release` + package manager so she stops inventing `apt` on Arch.
+- Chat rune has no Magpie search (GPU + time). Deep uses light DDG HTML + `magpie browse --dump`.
+- Barge-in, verbose think (`v` / `-v`), Plan bash allowlist, path gate on read and write.
+- Evidence: `cargo test` 23 pass (no llama).
+
 ## v1.1.2 nap (2026-10-11)
 
 - Numbered nap. Offline-first local AI agent stack, source-only kit.

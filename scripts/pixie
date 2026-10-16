@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# pixie — thin launcher (never a prebuilt ELF in git)
+# Discovery: PIXIE_BIN → ~/.local/lib/faeos/pixie → sibling tree
+set -euo pipefail
+
+USER_HOME="${HOME}"
+if [[ -n "${SUDO_USER:-}" ]]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  USER_HOME="${USER_HOME:-$HOME}"
+fi
+
+CANDIDATES=(
+  "${PIXIE_BIN:-}"
+  "$USER_HOME/.local/lib/faeos/pixie"
+  /usr/local/lib/faeos/pixie
+  "$USER_HOME/pixie/target/release/pixie"
+  "${PIXIE_ROOT:-}/target/release/pixie"
+)
+here="$(cd "$(dirname "$0")" && pwd)"
+if [[ -x "$here/../target/release/pixie" ]]; then
+  CANDIDATES+=("$here/../target/release/pixie")
+fi
+
+for c in "${CANDIDATES[@]}"; do
+  [[ -n "$c" && -x "$c" ]] || continue
+  exec "$c" "$@"
+done
+
+echo "pixie: engine not built yet." >&2
+echo "  next:  cd ~/pixie && ./build.sh install --house" >&2
+exit 127
