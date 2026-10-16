@@ -243,9 +243,9 @@ pub fn stream_chat(
         *g = None;
     }
     if !acc_tools.is_empty() && crate::mind::extract_tool_calls(&full, 1).is_empty() {
-        if let Some((_, (name, args))) = acc_tools.iter().next() {
-            let args_v: Value = serde_json::from_str(args).unwrap_or(json!({"command": args}));
-            let synth = json!({"name": name, "arguments": args_v}).to_string();
+        let pairs: Vec<(String, String)> = acc_tools.into_values().collect();
+        let synth = synth_tool_calls(&pairs);
+        if !synth.is_empty() {
             if full.is_empty() {
                 on_chunk(&synth);
                 full = synth;
@@ -258,6 +258,36 @@ pub fn stream_chat(
     StreamOut {
         text: full,
         err: None,
+    }
+}
+
+/// Join native llama tool_calls into one JSON object per call (cap 4).
+pub fn synth_tool_calls(calls: &[(String, String)]) -> String {
+    let mut parts = Vec::new();
+    for (name, args) in calls.iter().take(4) {
+        if name.is_empty() {
+            continue;
+        }
+        let args_v: Value = serde_json::from_str(args).unwrap_or(json!({}));
+        parts.push(json!({"name": name, "arguments": args_v}).to_string());
+    }
+    parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synth_keeps_every_native_call() {
+        let s = synth_tool_calls(&[
+            ("list_dir".into(), r#"{"path":"~/pixie"}"#.into()),
+            ("read_local_file".into(), r#"{"path":"~/pixie/README.md"}"#.into()),
+        ]);
+        assert!(s.contains("list_dir"), "{s}");
+        assert!(s.contains("read_local_file"), "{s}");
+        let n = crate::mind::extract_tool_calls(&s, 8);
+        assert_eq!(n.len(), 2, "{s}");
     }
 }
 

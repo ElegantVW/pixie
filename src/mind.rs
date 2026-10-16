@@ -1373,6 +1373,14 @@ mod tests {
     }
 
     #[test]
+    fn extract_fenced_json_tool() {
+        let t = "hm…\n```json\n{\"name\":\"list_dir\",\"arguments\":{\"path\":\"~/pixie\"}}\n```\n";
+        let c = extract_tool_calls(t, 8);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].name, "list_dir");
+    }
+
+    #[test]
     fn search_house_hits_own_tree() {
         let r = search_house("RuneKey", 8);
         let hits = r.get("hits").and_then(|x| x.as_array()).cloned().unwrap_or_default();

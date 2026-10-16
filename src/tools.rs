@@ -28,8 +28,13 @@ const TOOL_ROUND_CAP: usize = 4000;
 pub fn alias(name: &str) -> &str {
     match name {
         "create_file" | "create" | "write_file" | "write" | "file_create"
-        | "mkfile" | "writefile" | "write_content" | "write_to_file" | "code_editor"
-        | "text_editor" | "apply_patch" | "file_editor" => "write_local_file",
+        | "mkfile" | "writefile" | "write_content" | "write_to_file" | "code_editor" => {
+            "write_local_file"
+        }
+        "apply_patch" | "text_editor" | "file_editor" | "str_replace" | "replace_in_file"
+        | "edit_file" | "edit" => "edit_local_file",
+        "ls" | "listdir" | "list_directory" | "list" => "list_dir",
+        "grep" | "ripgrep" | "rg_files" | "search_files" => "grep_files",
         "run_command" | "run" | "execute_command" | "shell" | "bash" | "run_bash"
         | "execute_script" | "run_terminal_command" | "shell_command" | "terminal"
         | "run_script" | "run_python" => "execute_bash",
@@ -69,7 +74,22 @@ pub fn norm_args(fname: &str, fargs: &Value) -> Value {
     match fname {
         "write_local_file" => json!({
             "path": first_str(m, &["path", "file_path", "filename", "file", "filepath"]),
-            "content": first_str(m, &["content", "file_text", "text", "new_string", "file_content"]),
+            "content": first_str(m, &["content", "file_text", "text", "file_content"]),
+        }),
+        "edit_local_file" => json!({
+            "path": first_str(m, &["path", "file_path", "filename", "file", "filepath"]),
+            "old_string": first_str(m, &["old_string", "old", "search", "find"]),
+            "new_string": first_str(m, &["new_string", "new", "replace", "content"]),
+        }),
+        "list_dir" => json!({
+            "path": first_str(m, &["path", "dir", "directory", "folder"]),
+            "max": m.get("max").or_else(|| m.get("limit")).cloned().unwrap_or(json!(200)),
+        }),
+        "grep_files" => json!({
+            "path": first_str(m, &["path", "dir", "root"]),
+            "pattern": first_str(m, &["pattern", "query", "q", "search", "needle"]),
+            "glob": first_str(m, &["glob", "include", "filter"]),
+            "max": m.get("max").or_else(|| m.get("limit")).cloned().unwrap_or(json!(40)),
         }),
         "execute_bash" => json!({
             "command": first_str(m, &["command", "cmd", "script", "command_string", "bash_command"]),
@@ -143,6 +163,8 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
             "remember",
             "search_house",
             "wiki",
+            "list_dir",
+            "grep_files",
             "execute_bash",
             "read_local_file",
             "manage_systemd_service",
@@ -155,18 +177,26 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
             "wiki",
             "search_house",
             "read_local_file",
+            "list_dir",
+            "grep_files",
             "look",
         ],
         RuneKey::Build => &[
             "house",
+            "search_house",
+            "list_dir",
+            "grep_files",
             "execute_bash",
             "read_local_file",
+            "edit_local_file",
             "write_local_file",
             "look",
         ],
         RuneKey::Plan => &[
             "execute_bash",
             "read_local_file",
+            "list_dir",
+            "grep_files",
             "search_house",
             "wiki",
             "write_plan",
@@ -195,6 +225,121 @@ fn plan_bash_ok(argv: &[String]) -> bool {
             matches!(sub, "status" | "diff" | "log" | "show" | "rev-parse")
         }
         _ => false,
+    }
+}
+
+fn list_dir_json(p: &Path, max: usize) -> Value {
+    if p.is_file() {
+        return json!({"path": p.display().to_string(), "entries": [{"name": p.file_name().and_then(|s| s.to_str()).unwrap_or(""), "kind": "file"}], "count": 1});
+    }
+    let Ok(rd) = fs::read_dir(p) else {
+        return json!({"error": format!("not a directory: {}", p.display())});
+    };
+    let mut names: Vec<(String, &'static str)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let kind = if e.path().is_dir() { "dir" } else { "file" };
+            Some((name, kind))
+        })
+        .collect();
+    names.sort_by(|a, b| a.0.cmp(&b.0));
+    let count = names.len();
+    let entries: Vec<Value> = names
+        .into_iter()
+        .take(max.max(1))
+        .map(|(name, kind)| json!({"name": name, "kind": kind}))
+        .collect();
+    json!({"path": p.display().to_string(), "entries": entries, "count": count})
+}
+
+fn glob_match(pat: &str, name: &str) -> bool {
+    if pat.is_empty() || pat == "*" {
+        return true;
+    }
+    glob_rec(pat.as_bytes(), name.as_bytes())
+}
+
+fn glob_rec(p: &[u8], s: &[u8]) -> bool {
+    match (p.first().copied(), s.first().copied()) {
+        (None, None) => true,
+        (Some(b'*'), _) => glob_rec(&p[1..], s) || (!s.is_empty() && glob_rec(p, &s[1..])),
+        (Some(b'?'), Some(_)) => glob_rec(&p[1..], &s[1..]),
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => glob_rec(&p[1..], &s[1..]),
+        _ => false,
+    }
+}
+
+fn skip_walk_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "target" | "node_modules" | "__pycache__" | ".cargo" | ".cache"
+    )
+}
+
+fn grep_walk(
+    root: &Path,
+    pattern: &str,
+    glob: &str,
+    max_hits: usize,
+    max_files: usize,
+    hits: &mut Vec<Value>,
+    extra: &mut Vec<String>,
+) {
+    let mut files = Vec::new();
+    if root.is_file() {
+        files.push(root.to_path_buf());
+    } else {
+        collect_files(root, glob, max_files, &mut files);
+    }
+    let needle = pattern.to_lowercase();
+    for p in files {
+        if hits.len() >= max_hits {
+            break;
+        }
+        let Ok(bytes) = fs::read(&p) else { continue };
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for (i, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(&needle) {
+                let path = p.display().to_string();
+                if !extra.iter().any(|e| e == &path) {
+                    extra.push(path.clone());
+                }
+                hits.push(json!({
+                    "path": path,
+                    "line": i + 1,
+                    "text": line.chars().take(200).collect::<String>()
+                }));
+                if hits.len() >= max_hits {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn collect_files(root: &Path, glob: &str, max_files: usize, out: &mut Vec<std::path::PathBuf>) {
+    if out.len() >= max_files {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        if out.len() >= max_files {
+            return;
+        }
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if p.is_dir() {
+            if skip_walk_dir(&name) || name.starts_with('.') {
+                continue;
+            }
+            collect_files(&p, glob, max_files, out);
+        } else if glob_match(glob, &name) {
+            out.push(p);
+        }
     }
 }
 
@@ -380,6 +525,100 @@ pub fn run_tool(
                             })
                         }
                         Err(e) => json!({"error": e.to_string()}),
+                    }
+                }
+            }
+        }
+        "edit_local_file" => {
+            let path = fargs.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let old = fargs.get("old_string").and_then(|x| x.as_str()).unwrap_or("");
+            let new = fargs.get("new_string").and_then(|x| x.as_str()).unwrap_or("");
+            if old.is_empty() {
+                json!({"error": "empty old_string", "next": "read the file and pass the exact text to replace"})
+            } else {
+                match paths::assert_allowed(path) {
+                    Err(e) => json!({"error": e.to_string()}),
+                    Ok(p) => match fs::read_to_string(&p) {
+                        Err(e) => json!({"error": format!("File not found: {path} ({e})"), "next": "list_dir or check the path"}),
+                        Ok(text) => {
+                            let n = text.match_indices(old).count();
+                            if n == 0 {
+                                json!({"error": "old_string not found", "next": "read the file and copy the exact text to replace"})
+                            } else if n > 1 {
+                                json!({"error": format!("old_string appears {n} times"), "next": "read the file and pass a unique old_string"})
+                            } else {
+                                let content = text.replacen(old, new, 1);
+                                match fs::write(&p, &content) {
+                                    Err(e) => json!({"error": e.to_string()}),
+                                    Ok(()) => {
+                                        let lines = diff::diff_text(&text, &content);
+                                        let (added, deleted) = diff::counts(&lines);
+                                        set_touch(FileTouch {
+                                            path: p.display().to_string(),
+                                            kind: FileKind::Write,
+                                            added,
+                                            deleted,
+                                            lines,
+                                            binary: false,
+                                            extra_paths: Vec::new(),
+                                        });
+                                        json!({
+                                            "path": p.display().to_string(),
+                                            "edited": true,
+                                            "added": added,
+                                            "deleted": deleted
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        "list_dir" => {
+            let path = fargs.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let path = if path.is_empty() { "." } else { path };
+            let max = fargs.get("max").and_then(|x| x.as_u64()).unwrap_or(200) as usize;
+            match paths::assert_allowed(path) {
+                Err(e) => json!({"error": e.to_string()}),
+                Ok(p) => list_dir_json(&p, max),
+            }
+        }
+        "grep_files" => {
+            let path = fargs.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let path = if path.is_empty() { "." } else { path };
+            let pattern = fargs.get("pattern").and_then(|x| x.as_str()).unwrap_or("");
+            let glob = fargs.get("glob").and_then(|x| x.as_str()).unwrap_or("");
+            let max = fargs.get("max").and_then(|x| x.as_u64()).unwrap_or(40) as usize;
+            if pattern.trim().is_empty() {
+                json!({"error": "empty pattern"})
+            } else {
+                match paths::assert_allowed(path) {
+                    Err(e) => json!({"error": e.to_string()}),
+                    Ok(p) => {
+                        let mut hits = Vec::new();
+                        let mut extra = Vec::new();
+                        grep_walk(&p, pattern, glob, max, 400, &mut hits, &mut extra);
+                        if let Some(first) = extra.first() {
+                            set_touch(FileTouch {
+                                path: first.clone(),
+                                kind: FileKind::Search,
+                                added: 0,
+                                deleted: 0,
+                                lines: extra
+                                    .iter()
+                                    .take(12)
+                                    .map(|s| DiffLine {
+                                        op: Op::Eq,
+                                        text: s.clone(),
+                                    })
+                                    .collect(),
+                                binary: false,
+                                extra_paths: extra.clone(),
+                            });
+                        }
+                        json!({"path": p.display().to_string(), "pattern": pattern, "hits": hits, "count": hits.len()})
                     }
                 }
             }
@@ -679,7 +918,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 extra_paths: Vec::new(),
             })
         }
-        "write_local_file" => {
+        "write_local_file" | "edit_local_file" => {
             let path = result.get("path").and_then(|x| x.as_str())?;
             let created = result.get("created").and_then(|x| x.as_bool()).unwrap_or(false);
             Some(FileTouch {
@@ -696,7 +935,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 extra_paths: Vec::new(),
             })
         }
-        "search_house" => {
+        "search_house" | "grep_files" => {
             let extra = hit_paths(result);
             let path = extra.first()?.clone();
             Some(FileTouch {
@@ -753,7 +992,9 @@ pub fn tool_body(fname: &str, fargs: &Value, result: &Value, verbose: bool) -> S
         if let Some(s) = result.get("stdout").and_then(|x| x.as_str()) {
             return format!("{routing}\n{}", s.chars().take(120).collect::<String>());
         }
-        if result.get("written").and_then(|x| x.as_bool()).unwrap_or(false) {
+        if result.get("written").and_then(|x| x.as_bool()).unwrap_or(false)
+            || result.get("edited").and_then(|x| x.as_bool()).unwrap_or(false)
+        {
             let bytes = result.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
             let a = result.get("added").and_then(|x| x.as_u64()).unwrap_or(0);
             let d = result.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -776,6 +1017,10 @@ mod tests {
         assert_eq!(alias("cast"), "house");
         assert_eq!(alias("memory"), "remember");
         assert_eq!(alias("code_editor"), "write_local_file");
+        assert_eq!(alias("apply_patch"), "edit_local_file");
+        assert_eq!(alias("str_replace"), "edit_local_file");
+        assert_eq!(alias("listdir"), "list_dir");
+        assert_eq!(alias("grep"), "grep_files");
     }
 
     #[test]
@@ -822,6 +1067,84 @@ mod tests {
         );
         let msg = r["error"].as_str().unwrap_or("");
         assert!(msg.contains("Unknown tool") || msg.contains("web_research"), "{r}");
+    }
+
+    #[test]
+    fn list_dir_and_grep_are_ours() {
+        let dir = paths::cache_dir().join(format!("tool-up-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("note.txt");
+        fs::write(&p, "alpha unique-needle omega\n").unwrap();
+        let path = dir.display().to_string();
+        let listed = run_tool(
+            "list_dir",
+            &json!({"path": path}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
+        assert!(listed["count"].as_u64().unwrap_or(0) >= 1, "{listed}");
+        let grepped = run_tool(
+            "grep_files",
+            &json!({"path": path, "pattern": "unique-needle"}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
+        let blob = grepped.to_string();
+        assert!(blob.contains("unique-needle"), "{grepped}");
+        let etc = run_tool(
+            "list_dir",
+            &json!({"path": "/etc"}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
+        assert!(etc.get("error").is_some(), "{etc}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_replaces_once_and_plan_refuses() {
+        let dir = paths::cache_dir().join(format!("tool-edit-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("x.txt");
+        fs::write(&p, "keep\nold\nalso\n").unwrap();
+        let path = p.display().to_string();
+        let r = run_tool(
+            "apply_patch",
+            &json!({"path": path, "old_string": "old", "new_string": "new"}),
+            RuneKey::Build,
+            "",
+            None,
+            None,
+        );
+        assert_eq!(r.get("edited"), Some(&json!(true)), "{r}");
+        let text = fs::read_to_string(&p).unwrap();
+        assert!(text.contains("new"), "{text}");
+        assert!(!text.contains("old"), "{text}");
+        let miss = run_tool(
+            "edit_local_file",
+            &json!({"path": path, "old_string": "nope", "new_string": "x"}),
+            RuneKey::Build,
+            "",
+            None,
+            None,
+        );
+        assert!(miss.get("error").is_some(), "{miss}");
+        let plan = run_tool(
+            "edit_local_file",
+            &json!({"path": path, "old_string": "keep", "new_string": "no"}),
+            RuneKey::Plan,
+            "",
+            None,
+            None,
+        );
+        assert!(plan["error"].as_str().unwrap_or("").contains("Unknown tool"), "{plan}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

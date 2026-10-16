@@ -1,5 +1,13 @@
 # Pixie changelog
 
+## v0.2.2 tools (2026-10-16)
+
+- Native llama tool_calls: keep up to 4, not only the first.
+- JSON Schema arrays stay arrays. History keeps every tool result in the window.
+- `list_dir` and `grep_files` (in-process walk, no rg/grep binary). `edit_local_file` unique replace. Build gets `search_house`.
+- `apply_patch` / `str_replace` alias to edit, not a full-file clobber.
+- Evidence: `cargo test` 44 pass (no llama).
+
 ## v0.2.1 TUI feel (2026-10-16)
 
 - Splash holds 1.5s (star poses ~350 ms). Wait lines rotate every 5s.

@@ -70,15 +70,12 @@ pub fn chat_messages(chat: &[ChatEntry], rune: &Rune, session_id: &str) -> Vec<V
     let mut msgs = vec![json!({"role": "system", "content": sys})];
     let start = chat.len().saturating_sub(14);
     let history = &chat[start..];
-    let last_tool = history.iter().rposition(|e| matches!(e, ChatEntry::Tool { .. }));
     let n = history.len();
     for (i, entry) in history.iter().enumerate() {
         match entry {
-            ChatEntry::Tool { body, file: _, .. } => {
-                if last_tool == Some(i) {
-                    let cap = body.chars().take(1200).collect::<String>();
-                    msgs.push(json!({"role": "tool", "content": cap}));
-                }
+            ChatEntry::Tool { body, .. } => {
+                let cap = body.chars().take(1200).collect::<String>();
+                msgs.push(json!({"role": "tool", "content": cap}));
             }
             ChatEntry::User(text) => {
                 let mut content = text.clone();
@@ -169,17 +166,8 @@ pub fn run_turn(
         let think_txt = split.think.clone();
 
         let mut tool_calls = Vec::new();
-        if first.trim_start().starts_with('{') {
-            if let Ok(v) = serde_json::from_str::<Value>(first.trim()) {
-                if v.get("name").is_some() {
-                    tool_calls.push(v);
-                }
-            }
-        }
-        if tool_calls.is_empty() {
-            for c in mind::extract_tool_calls(&first, 8) {
-                tool_calls.push(json!({"name": c.name, "arguments": c.arguments}));
-            }
+        for c in mind::extract_tool_calls(&first, 8) {
+            tool_calls.push(json!({"name": c.name, "arguments": c.arguments}));
         }
 
         if tool_calls.is_empty()
@@ -371,4 +359,32 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
         }
     }
     (chat, last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runes::RuneKey;
+
+    #[test]
+    fn chat_messages_keeps_every_tool() {
+        let rune = runes::by_key(RuneKey::Chat);
+        let chat = vec![
+            ChatEntry::User("hi".into()),
+            ChatEntry::Tool {
+                title: "t1".into(),
+                body: "first-tool-body".into(),
+                file: None,
+            },
+            ChatEntry::Tool {
+                title: "t2".into(),
+                body: "second-tool-body".into(),
+                file: None,
+            },
+        ];
+        let msgs = chat_messages(&chat, &rune, "test");
+        let blob = format!("{msgs:?}");
+        assert!(blob.contains("first-tool-body"), "{blob}");
+        assert!(blob.contains("second-tool-body"), "{blob}");
+    }
 }
