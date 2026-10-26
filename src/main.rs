@@ -6,10 +6,13 @@ mod host;
 mod llm;
 mod mind;
 mod paths;
+mod prefs;
+mod privilege;
 mod runes;
 mod think;
 mod tools;
 mod tui;
+mod voice;
 
 use crate::agent::ChatEntry;
 use crate::llm::Abort;
@@ -33,11 +36,20 @@ struct Cli {
     /// Resume a chat in the TUI (latest if omitted)
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
+    /// Start a fresh TUI session instead of resuming the latest
+    #[arg(short = 'n', long = "new", conflicts_with = "resume")]
+    new: bool,
+    /// sudo askpass helper (stdout only). Hidden.
+    #[arg(long, hide = true)]
+    askpass: bool,
     /// One-shot prompt
     prompt: Vec<String>,
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--askpass") {
+        std::process::exit(crate::privilege::askpass_client());
+    }
     let code = match real_main() {
         Ok(c) => c,
         Err(e) => {
@@ -51,12 +63,19 @@ fn main() {
 
 fn real_main() -> Result<i32> {
     let cli = Cli::parse();
+    if cli.askpass {
+        return Ok(crate::privilege::askpass_client());
+    }
     if cli.chats {
         println!("{}", mind::format_chat_list(None));
         return Ok(0);
     }
     if let Some(id) = cli.chat {
-        let name = if id.is_empty() { None } else { Some(id.as_str()) };
+        let name = if id.is_empty() {
+            None
+        } else {
+            Some(id.as_str())
+        };
         let Some(sid) = mind::resolve_session_id(name, None) else {
             if id.is_empty() {
                 eprintln!("pixie: no chats stored yet");
@@ -69,7 +88,11 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     }
     if let Some(id) = cli.resume {
-        let name = if id.is_empty() { None } else { Some(id.as_str()) };
+        let name = if id.is_empty() {
+            None
+        } else {
+            Some(id.as_str())
+        };
         let Some(sid) = mind::resolve_session_id(name, None) else {
             if id.is_empty() {
                 eprintln!("pixie: no chats stored yet");
@@ -78,18 +101,18 @@ fn real_main() -> Result<i32> {
             }
             return Ok(1);
         };
-        tui::run(cli.verbose, Some(sid))?;
+        tui::run(cli.verbose, Some(sid), false)?;
         return Ok(0);
     }
     if cli.prompt.is_empty() {
-        tui::run(cli.verbose, None)?;
+        tui::run(cli.verbose, None, mind::wants_door(cli.new, false))?;
         return Ok(0);
     }
     oneshot(&cli.prompt.join(" "), cli.verbose)
 }
 
 fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
-    let _ = mind::seed_memory(None);
+    mind::seed_memory(None)?;
     if !llm::llm_up() && !llm::ensure_llm_up() {
         eprintln!("pixie: the menagerie brain is asleep");
         eprintln!("  next:  menagerie ensure pixie");
@@ -116,17 +139,13 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
     let mut chat = vec![ChatEntry::User(prompt.into())];
     let abort = Abort::new();
     let t0 = std::time::Instant::now();
-    let out = agent::run_turn(
-        &mut chat,
-        &rune,
-        &sid,
-        &abort,
-        verbose,
-        None,
-        |_| {},
-    );
+    let out = agent::run_turn(&mut chat, &rune, &sid, &abort, verbose, None, |_| {});
     let text = if let Some(e) = out.err {
         format!("(✦ pixie lost the connection: {e})")
+    } else if out.cancelled {
+        out.text
+    } else if crate::prefs::load_ui()?.sparkle {
+        crate::voice::prepend("final answer for the human", &out.text)
     } else {
         out.text
     };
@@ -153,7 +172,11 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
     }
     println!(
         "{}",
-        chrome::box_text(&format!("Pixie ─────── ✦ Thought for {elapsed:.2}s"), &body, chrome::term_width())
+        chrome::box_text(
+            &format!("Pixie ─────── ✦ Thought for {elapsed:.2}s"),
+            &body,
+            chrome::term_width()
+        )
     );
     Ok(0)
 }

@@ -75,10 +75,7 @@ pub fn from_os_release(text: &str) -> OsId {
 }
 
 fn unquote(s: &str) -> String {
-    s.trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string()
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
 pub fn pick_pkg(which_names: &[&str]) -> Pkg {
@@ -116,21 +113,39 @@ pub fn card_text(
     pkg: Pkg,
     shell: &str,
     ram_kb: u64,
+    cpu: &str,
+    cores: u32,
+    gpu: &str,
+    term: &str,
+    session: &str,
 ) -> String {
     let mut lines = vec![
         format!("host: {hostname}"),
         format!("os: {} (id={})", os.name, os.id),
         format!("kernel: {kernel}"),
-        format!("shell: {shell}"),
+        format!(
+            "shell: {shell}  (this box: zsh on Arch — do not assume bashisms beyond POSIX / sh -c)"
+        ),
+        format!("term: {term}"),
+        format!("session: {session}"),
         format!("house PATH: ~/bin:~/.local/bin"),
     ];
+    if !cpu.is_empty() {
+        if cores > 0 {
+            lines.push(format!("cpu: {cpu} ({cores} threads)"));
+        } else {
+            lines.push(format!("cpu: {cpu}"));
+        }
+    }
+    if !gpu.is_empty() {
+        lines.push(format!("gpu: {gpu}"));
+    }
     if ram_kb > 0 {
         lines.push(format!("ram: {:.0} GiB", ram_kb as f64 / 1024.0 / 1024.0));
     }
     match pkg {
         Pkg::Pacman => lines.push(
-            "packages: pacman (alchemy brew/sip/distill) — never apt/apt-get on this box"
-                .into(),
+            "packages: pacman (alchemy brew/sip/distill) — never apt/apt-get on this box".into(),
         ),
         Pkg::Unknown => lines.push("packages: unknown — ask before installing".into()),
         other => {
@@ -149,10 +164,12 @@ pub fn card_text(
     if !os.like.is_empty() {
         lines.push(format!("id_like: {}", os.like));
     }
-    lines.push("one GPU llama at a time on 8 GB class cards".into());
+    lines.push(
+        "one GPU llama at a time on 8 GB class cards (pixie 8080; kur/smolLM 8081 CPU)".into(),
+    );
     let mut s = lines.join("\n");
-    if s.len() > 800 {
-        s.truncate(800);
+    if s.len() > 1400 {
+        s.truncate(1400);
         s.push('…');
     }
     s
@@ -170,14 +187,19 @@ pub fn probe() -> String {
     let kernel = uname(&["-srm"]);
     let hostname = uname(&["-n"]);
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "?".into());
-    let present: Vec<&str> = PKG_ORDER
-        .iter()
-        .copied()
-        .filter(|n| which(n))
-        .collect();
+    let present: Vec<&str> = PKG_ORDER.iter().copied().filter(|n| which(n)).collect();
     let pkg = pick_pkg(&present);
     let ram_kb = mem_total_kb();
-    card_text(&os, &kernel, &hostname, pkg, &shell, ram_kb)
+    let cpu = cpu_model();
+    let cores = cpu_threads();
+    let gpu = gpu_name();
+    let term = std::env::var("TERM").unwrap_or_else(|_| "?".into());
+    let session = std::env::var("XDG_SESSION_TYPE")
+        .or_else(|_| std::env::var("DESKTOP_SESSION"))
+        .unwrap_or_else(|_| "?".into());
+    card_text(
+        &os, &kernel, &hostname, pkg, &shell, ram_kb, &cpu, cores, &gpu, &term, &session,
+    )
 }
 
 fn uname(args: &[&str]) -> String {
@@ -201,6 +223,48 @@ fn which(name: &str) -> bool {
         }
     }
     false
+}
+
+fn cpu_model() -> String {
+    let Ok(text) = fs::read_to_string("/proc/cpuinfo") else {
+        return String::new();
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("model name") {
+            return rest.trim_start_matches(':').trim().to_string();
+        }
+    }
+    String::new()
+}
+
+fn cpu_threads() -> u32 {
+    fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .map(|t| t.lines().filter(|l| l.starts_with("processor")).count() as u32)
+        .unwrap_or(0)
+}
+
+fn gpu_name() -> String {
+    let drm = Path::new("/sys/class/drm");
+    let Ok(rd) = fs::read_dir(drm) else {
+        return String::new();
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let n = name.to_string_lossy();
+        if !n.starts_with("card") || n.contains('-') {
+            continue;
+        }
+        let p = ent.path().join("device/uevent");
+        if let Ok(t) = fs::read_to_string(p) {
+            for line in t.lines() {
+                if let Some(rest) = line.strip_prefix("DRIVER=") {
+                    return rest.trim().to_string();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 fn mem_total_kb() -> u64 {
@@ -237,10 +301,24 @@ VERSION_ID="12"
         assert_eq!(os.id, "arch");
         let pkg = pick_pkg(&["pacman", "apt-get"]);
         assert_eq!(pkg, Pkg::Pacman);
-        let card = card_text(&os, "Linux 6.12 x86_64", "VANGUARDA", pkg, "/usr/bin/zsh", 64 * 1024 * 1024);
+        let card = card_text(
+            &os,
+            "Linux 6.12 x86_64",
+            "VANGUARDA",
+            pkg,
+            "/usr/bin/zsh",
+            64 * 1024 * 1024,
+            "AMD Ryzen",
+            16,
+            "amdgpu",
+            "xterm-kitty",
+            "x11",
+        );
         assert!(card.contains("Arch"), "{card}");
         assert!(card.contains("pacman"), "{card}");
         assert!(card.contains("never apt"), "{card}");
+        assert!(card.contains("zsh"), "{card}");
+        assert!(card.contains("amdgpu") || card.contains("AMD"), "{card}");
         assert!(!card.contains("never pacman"), "{card}");
     }
 
@@ -249,7 +327,19 @@ VERSION_ID="12"
         let os = from_os_release(DEBIAN);
         let pkg = pick_pkg(&["apt-get"]);
         assert_eq!(pkg, Pkg::Apt);
-        let card = card_text(&os, "Linux 6.1 x86_64", "box", pkg, "/bin/bash", 8 * 1024 * 1024);
+        let card = card_text(
+            &os,
+            "Linux 6.1 x86_64",
+            "box",
+            pkg,
+            "/bin/bash",
+            8 * 1024 * 1024,
+            "",
+            0,
+            "",
+            "xterm",
+            "tty",
+        );
         assert!(card.contains("Debian"), "{card}");
         assert!(card.contains("apt-get"), "{card}");
         assert!(card.contains("never pacman"), "{card}");

@@ -8,15 +8,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub fn port() -> u16 {
-    std::env::var("PIXIE_LLM_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8080)
+pub fn port() -> Option<u16> {
+    match std::env::var("PIXIE_LLM_PORT") {
+        Ok(port) => port.parse().ok(),
+        Err(std::env::VarError::NotPresent) => Some(8080),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
 }
 
 pub fn host() -> String {
     std::env::var("PIXIE_LLM_HOST").unwrap_or_else(|_| "127.0.0.1".into())
+}
+
+fn endpoint(host: &str, port: Option<u16>) -> Option<std::net::SocketAddr> {
+    let port = port?;
+    let ip = host
+        .parse()
+        .or_else(|_| host.trim_start_matches('[').trim_end_matches(']').parse())
+        .ok()?;
+    Some(std::net::SocketAddr::new(ip, port))
+}
+
+fn configured_endpoint() -> Option<std::net::SocketAddr> {
+    endpoint(&host(), port())
 }
 
 pub struct Abort {
@@ -56,29 +70,32 @@ impl Clone for Abort {
 }
 
 pub fn llm_up() -> bool {
-    let addr = format!("{}:{}", host(), port());
-    let Ok(mut s) = TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap()),
-        Duration::from_secs(2),
-    ) else {
+    let Some(endpoint) = configured_endpoint() else {
+        return false;
+    };
+    let addr = endpoint.to_string();
+    let Ok(mut s) = TcpStream::connect_timeout(&endpoint, Duration::from_secs(2)) else {
         return false;
     };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let req = format!(
-        "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     if s.write_all(req.as_bytes()).is_err() {
         return false;
     }
+
     let mut buf = String::new();
     let mut r = BufReader::new(s);
     if r.read_line(&mut buf).is_err() {
         return false;
     }
+
     buf.contains("200") || buf.contains("503")
 }
 
 pub fn ensure_llm_up() -> bool {
+    if configured_endpoint().is_none() {
+        return false;
+    }
     if llm_up() {
         return true;
     }
@@ -121,27 +138,14 @@ pub fn stream_chat(
     abort: &Abort,
     mut on_chunk: impl FnMut(&str),
 ) -> StreamOut {
-    let mut body = json!({
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 2048,
-        "stream": true,
-    });
-    if let Some(t) = tools {
-        body["tools"] = t;
-        body["tool_choice"] = json!("auto");
-    }
-    let payload = body.to_string();
-    let addr = format!("{}:{}", host(), port());
-    let sock_addr: std::net::SocketAddr = match addr.parse() {
-        Ok(a) => a,
-        Err(_) => {
-            return StreamOut {
-                text: String::new(),
-                err: Some(format!("bad llm addr {addr}")),
-            };
-        }
+    let payload = chat_payload(messages, tools).to_string();
+    let Some(sock_addr) = configured_endpoint() else {
+        return StreamOut {
+            text: String::new(),
+            err: Some("invalid PIXIE_LLM_HOST or PIXIE_LLM_PORT".into()),
+        };
     };
+    let addr = sock_addr.to_string();
     let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
         Ok(s) => s,
         Err(e) => {
@@ -194,7 +198,8 @@ pub fn stream_chat(
         }
     }
     let mut full = String::new();
-    let mut acc_tools: std::collections::BTreeMap<i64, (String, String)> = std::collections::BTreeMap::new();
+    let mut acc_tools: std::collections::BTreeMap<i64, (String, String)> =
+        std::collections::BTreeMap::new();
     let mut line = String::new();
     loop {
         if abort.is_cancelled() {
@@ -217,12 +222,19 @@ pub fn stream_chat(
         let Ok(d) = serde_json::from_str::<Value>(payload) else {
             continue;
         };
-        for ch in d.get("choices").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
+        for ch in d
+            .get("choices")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
             let delta = ch.get("delta").cloned().unwrap_or(json!({}));
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                 for tc in tcs {
                     let idx = tc.get("index").and_then(|x| x.as_i64()).unwrap_or(0);
-                    let slot = acc_tools.entry(idx).or_insert((String::new(), String::new()));
+                    let slot = acc_tools
+                        .entry(idx)
+                        .or_insert((String::new(), String::new()));
                     if let Some(n) = tc.pointer("/function/name").and_then(|x| x.as_str()) {
                         slot.0.push_str(n);
                     }
@@ -261,6 +273,121 @@ pub fn stream_chat(
     }
 }
 
+/// House sampler body. `tools` is ignored on the wire — Pixie parses JSON
+/// from the assistant text (`mind::extract_tool_calls`). llama.cpp native
+/// tool_calls are a guest we are deleting.
+pub fn chat_payload(messages: &[Value], _tools: Option<Value>) -> Value {
+    json!({
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "stream": true,
+    })
+}
+
+pub fn mouth_up(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(sock) = addr.parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&sock, Duration::from_millis(400)).is_ok()
+}
+
+fn wake_kur(port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    let Ok(sock) = addr.parse::<std::net::SocketAddr>() else {
+        return;
+    };
+    if TcpStream::connect_timeout(&sock, Duration::from_millis(400)).is_ok() {
+        return;
+    }
+    let menagerie = crate::paths::home().join("bin/menagerie");
+    let _ = Command::new(if menagerie.is_file() {
+        menagerie.as_os_str()
+    } else {
+        std::ffi::OsStr::new("menagerie")
+    })
+    .args(["ensure", "kur"])
+    .output();
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect_timeout(&sock, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Short non-stream completion on another mouth (kur/smolLM). None on miss.
+pub fn complete_on(
+    port: u16,
+    messages: &[Value],
+    max_tokens: u32,
+    timeout_s: u64,
+) -> Option<String> {
+    wake_kur(port);
+    complete_on_raw(port, messages, max_tokens, timeout_s)
+}
+
+/// Same as complete_on but never wakes menagerie. Skip if the mouth is down.
+pub fn complete_on_if_up(
+    port: u16,
+    messages: &[Value],
+    max_tokens: u32,
+    timeout_s: u64,
+) -> Option<String> {
+    if !mouth_up(port) {
+        return None;
+    }
+    complete_on_raw(port, messages, max_tokens, timeout_s)
+}
+
+fn complete_on_raw(
+    port: u16,
+    messages: &[Value],
+    max_tokens: u32,
+    timeout_s: u64,
+) -> Option<String> {
+    let addr = format!("127.0.0.1:{port}");
+    let sock: std::net::SocketAddr = addr.parse().ok()?;
+    let payload = json!({
+        "messages": messages,
+        "temperature": 0.85,
+        "max_tokens": max_tokens,
+        "stream": false,
+    })
+    .to_string();
+    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_secs(timeout_s)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(timeout_s)));
+    let _ = stream.set_nodelay(true);
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut header = String::new();
+    loop {
+        header.clear();
+        match reader.read_line(&mut header) {
+            Ok(0) => return None,
+            Ok(_) => {
+                if header == "\r\n" || header == "\n" {
+                    break;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut body = String::new();
+    let _ = reader.read_to_string(&mut body);
+    let d: Value = serde_json::from_str(body.trim()).ok()?;
+    d.pointer("/choices/0/message/content")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Join native llama tool_calls into one JSON object per call (cap 4).
 pub fn synth_tool_calls(calls: &[(String, String)]) -> String {
     let mut parts = Vec::new();
@@ -279,10 +406,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invalid_endpoint_never_falls_back_to_default() {
+        assert_eq!(endpoint("not-an-address", Some(8080)), None);
+        assert_eq!(endpoint("127.0.0.1", None), None);
+        assert_eq!(
+            endpoint("127.0.0.1", Some(9000)),
+            Some("127.0.0.1:9000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn chat_payload_omits_openai_tools() {
+        let tools = json!([{"type":"function","function":{"name":"list_dir"}}]);
+        let body = chat_payload(&[json!({"role":"user","content":"hi"})], Some(tools));
+        assert!(body.get("tools").is_none(), "{body}");
+        assert!(body.get("tool_choice").is_none(), "{body}");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
     fn synth_keeps_every_native_call() {
         let s = synth_tool_calls(&[
             ("list_dir".into(), r#"{"path":"~/pixie"}"#.into()),
-            ("read_local_file".into(), r#"{"path":"~/pixie/README.md"}"#.into()),
+            (
+                "read_local_file".into(),
+                r#"{"path":"~/pixie/README.md"}"#.into(),
+            ),
         ]);
         assert!(s.contains("list_dir"), "{s}");
         assert!(s.contains("read_local_file"), "{s}");

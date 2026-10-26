@@ -5,54 +5,25 @@ use std::time::Instant;
 
 /// Canonical 7-line star (same art as the hero SVG).
 pub const SIGIL: [&str; 7] = [
-    "   *   ",
-    r"  \|/  ",
-    "   |   ",
-    "---*---",
-    "   |   ",
-    r"  /|\  ",
-    "   *   ",
+    "   *   ", r"  \|/  ", "   |   ", "---*---", "   |   ", r"  /|\  ", "   *   ",
 ];
 
 /// Full-pane splash: the star with arms pulsing / rotating.
 pub const SPLASH: [[&str; 7]; 4] = [
     SIGIL,
     [
-        r" \ * / ",
-        r"  \|/  ",
-        "   |   ",
-        "---*---",
-        "   |   ",
-        r"  /|\  ",
-        r" / * \ ",
+        r" \ * / ", r"  \|/  ", "   |   ", "---*---", "   |   ", r"  /|\  ", r" / * \ ",
     ],
     [
-        " *   * ",
-        r"  \ /  ",
-        "   *   ",
-        "-- * --",
-        "   *   ",
-        r"  / \  ",
-        " *   * ",
+        " *   * ", r"  \ /  ", "   *   ", "-- * --", "   *   ", r"  / \  ", " *   * ",
     ],
     [
-        "       ",
-        "   *   ",
-        r"  \|/  ",
-        "---*---",
-        r"  /|\  ",
-        "   *   ",
-        "       ",
+        "       ", "   *   ", r"  \|/  ", "---*---", r"  /|\  ", "   *   ", "       ",
     ],
 ];
 
 /// One-line spinner: the four distinctive rows of the house star, in order.
-pub const SPIN: [&str; 4] = [
-    "   *   ",
-    r"  \|/  ",
-    "---*---",
-    r"  /|\  ",
-];
+pub const SPIN: [&str; 4] = ["   *   ", r"  \|/  ", "---*---", r"  /|\  "];
 
 pub const WAIT: [&str; 8] = [
     "waking the menagerie…",
@@ -117,6 +88,9 @@ mod tests {
     #[test]
     fn wait_holds_long_enough_to_read() {
         assert!(WAIT_MS >= 5000, "wait lines were flashing at {WAIT_MS} ms");
-        assert!(SPLASH_FRAME_MS >= 300, "splash poses were {SPLASH_FRAME_MS} ms");
+        assert!(
+            SPLASH_FRAME_MS >= 300,
+            "splash poses were {SPLASH_FRAME_MS} ms"
+        );
     }
 }

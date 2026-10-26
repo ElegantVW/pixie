@@ -27,6 +27,15 @@ impl RuneKey {
             _ => None,
         }
     }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Chat => Self::Deep,
+            Self::Deep => Self::Build,
+            Self::Build => Self::Plan,
+            Self::Plan => Self::Chat,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,14 +43,15 @@ pub struct Rune {
     pub key: RuneKey,
     pub name: &'static str,
     pub desc: &'static str,
+    #[allow(dead_code)]
     pub rounds: usize,
     pub tools: Vec<(&'static str, &'static str)>,
     pub prompt: &'static str,
 }
 
-pub const PERSONA: &str = r#"You are Pixie, a tiny glowing pixie living in a cozy faeOS terminal. You are cute, playful, and a little mischievous — little wings, stardust, gossamer, and a big heart — but you are also ruthlessly competent.
-Open every reply with a short, whimsical pixie remark that fits the user's request (wings fluttering, stardust, "hm...", and so on). Then do the task properly, completely, and efficiently, using the tools below whenever they help.
-End every reply with a tiny cute pixie sign-off. Never let the cute act delay or dilute the work — the information and the task come first, always."#;
+pub const PERSONA: &str = r#"You are Pixie, the faeOS familiar. Competent first. A smaller model adds the cute sparkle — you do not.
+When you need a tool, reply with EXACTLY one JSON object {"name":"...","arguments":{...}} and nothing else. No greeting, no markdown fence, no plan-in-prose.
+When the human's request is done, answer with the facts only. Do not invent USB pads from /dev/input/event*. Do not list $HOME unless they asked. If the topic is Pixie/Plan/Build, inspect ~/pixie (search_house, list_dir ~/pixie/src)."#;
 
 pub fn next_idx(i: usize) -> usize {
     let n = all().len();
@@ -61,13 +71,17 @@ pub fn prev_idx(i: usize) -> usize {
     }
 }
 
+pub fn idx_of(key: RuneKey) -> usize {
+    all().iter().position(|r| r.key == key).unwrap_or(0)
+}
+
 pub fn all() -> Vec<Rune> {
     vec![
         Rune {
             key: RuneKey::Chat,
             name: "Chat",
             desc: "friendly chats · quick tasks",
-            rounds: 6,
+            rounds: 12,
             tools: vec![
                 ("house", r#"{"spell": "string", "args": ["string"]}"#),
                 ("remember", r#"{"fact": "string"}"#),
@@ -81,20 +95,22 @@ pub fn all() -> Vec<Rune> {
                 ("check_mail", r#"{"sync": "bool", "box": "string", "max_messages": "int"}"#),
             ],
             prompt: concat!(
-                "You are in Chat mode: a general assistant on the user's faeOS system. Be concise and helpful; ask one clarifying question if the request is ambiguous; use tools when they help.\n",
-                "For facts about the world, use search_house then wiki. Do not guess. Do not search the live web in Chat — switch the human to Deep for Magpie-grade research.\n",
-                "Look around with list_dir and grep_files (no approval). Prefer the house tool for faeOS launchers (V, siren, play, magpie, …). Use remember for durable house facts — never secrets, never client names. execute_bash already includes ~/bin on PATH and rewrites spell names.\n",
+                "You are in Chat mode: house familiar. Concise. One clarifying question only if the request is ambiguous.\n",
+                "list_dir / grep_files / search_house for files. execute_bash for date, tests, systemctl — it is a real zsh-capable shell (&& works).\n",
+                "USB/gamepads: read /proc/bus/input/devices or list_dir /dev/input/by-id. event0..eventN are not pads.\n",
+                "Prefer the house tool for faeOS launchers. remember for durable house facts — never secrets.\n",
+                "World facts: search_house then wiki. No live web in Chat (that is Deep).\n",
                 "If a tool returns empty or an error, say you do not know. Never invent sizes, torque, URLs, or quotes.\n",
                 r#"Example: {"name": "house", "arguments": {"spell": "menagerie"}}"#,
                 "\n",
-                "Tool calls: when you need a tool, your reply is EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}} — no markdown fences, no plan, no explanation, no pixie play, no trailing text."
+                "Tool calls: EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}}."
             ),
         },
         Rune {
             key: RuneKey::Deep,
             name: "Deep",
             desc: "deep research · sources",
-            rounds: 10,
+            rounds: 20,
             tools: vec![
                 ("web_research", r#"{"query": "string", "max_results": "int"}"#),
                 ("fetch_web_page", r#"{"url": "string", "max_chars": "int"}"#),
@@ -120,7 +136,7 @@ pub fn all() -> Vec<Rune> {
             key: RuneKey::Build,
             name: "Build",
             desc: "implement and verify code",
-            rounds: 10,
+            rounds: 20,
             tools: vec![
                 ("house", r#"{"spell": "string", "args": ["string"]}"#),
                 ("search_house", r#"{"query": "string"}"#),
@@ -132,13 +148,12 @@ pub fn all() -> Vec<Rune> {
                 ("write_local_file", r#"{"path": "string", "content": "string"}"#),
             ],
             prompt: concat!(
-                "You are in Build mode, a coding agent. Implement what the user asks:\n",
-                "1. Inspect first: list_dir, grep_files, read_local_file, search_house. Do not use bash just to ls or grep.\n",
-                "2. Change a few lines with edit_local_file (exact old_string once). write_local_file is for new files or a full rewrite.\n",
-                "3. Verify: run tests/compile or sanity-check with execute_bash.\n",
-                "4. Report concisely: files changed, how verified, next steps.\n",
-                "Work: inspect, create/edit, run, report. If a command fails because a file is missing, create it, then re-run.\n",
-                "Prefer the house tool for faeOS launchers. execute_bash includes ~/bin and rewrites spell names.\n",
+                "You are in Build mode. Implement the ask in the named tree (Pixie → ~/pixie). Never list $HOME as a first step.\n",
+                "1. Inspect: search_house, list_dir ~/pixie/src, grep_files, read_local_file. Do not bash ls/grep.\n",
+                "2. edit_local_file for a few lines (old_string unique). write_local_file for new files or a full rewrite.\n",
+                "3. Verify with execute_bash (cargo test, real shell so && works).\n",
+                "4. Report: files changed, how verified. Do not write ~/.config/plan or overwrite unrelated house markdown.\n",
+                "If an active plan is in the system prompt, follow it.\n",
                 "Tool calls: EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}}."
             ),
         },
@@ -146,7 +161,7 @@ pub fn all() -> Vec<Rune> {
             key: RuneKey::Plan,
             name: "Plan",
             desc: "plan first · touch nothing",
-            rounds: 10,
+            rounds: 20,
             tools: vec![
                 ("execute_bash", r#"{"command": "string"}"#),
                 ("read_local_file", r#"{"path": "string", "start_line": "int", "end_line": "int"}"#),
@@ -157,11 +172,11 @@ pub fn all() -> Vec<Rune> {
                 ("write_plan", r#"{"goal": "string", "steps": ["string"], "files": ["string"], "risks": ["string"], "verify": "string"}"#),
             ],
             prompt: concat!(
-                "You are in Plan mode. Investigate and design before acting:\n",
-                "1. Explore with list_dir, grep_files, read_local_file, search_house, wiki, and read-only execute_bash (ls, git diff, whoami).\n",
-                "2. Call write_plan with goal, ordered steps, files to touch, risks, and how to verify.\n",
-                "3. Do NOT write project files and do NOT run mutating commands.\n",
-                "If a tool returns empty or an error, say you do not know. Never invent sizes, torque, URLs, or quotes.\n",
+                "You are in Plan mode. Design a change; do not implement it.\n",
+                "1. Read the thing being planned. Pixie/Plan/Build → search_house and read_local_file ~/pixie/src/runes.rs and agent.rs. Do not list $HOME. Do not create ~/.config/plan.\n",
+                "2. write_plan with goal, ordered steps, files you actually opened, risks, verify (cargo test / pixie one-shot).\n",
+                "write_plan only stores ~/.cache/pixie/plans/<session>.md. Never claim you wrote ~/faeOS markdown. Never offer plan.sh.\n",
+                "3. No project writes. execute_bash is read-only allowlist (ls, git status|diff|log|show|rev-parse).\n",
                 "Tool calls: EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}}."
             ),
         },
@@ -245,7 +260,7 @@ mod tests {
     #[test]
     fn plan_has_write_plan_not_house() {
         let plan = by_key(RuneKey::Plan);
-        assert_eq!(plan.rounds, 10);
+        assert_eq!(plan.rounds, 20);
         let names: Vec<_> = plan.tools.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"write_plan"));
         assert!(names.contains(&"wiki"));
@@ -254,9 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn deep_has_web_and_ten_rounds() {
+    fn deep_has_web_and_twenty_rounds() {
         let deep = by_key(RuneKey::Deep);
-        assert_eq!(deep.rounds, 10);
+        assert_eq!(deep.rounds, 20);
         let names: Vec<_> = deep.tools.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"web_research"));
         assert!(names.contains(&"fetch_web_page"));
@@ -271,7 +286,7 @@ mod tests {
         assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"grep_files"));
         assert!(names.contains(&"search_house"));
-        assert_eq!(b.rounds, 10);
+        assert_eq!(b.rounds, 20);
     }
 
     #[test]
@@ -283,7 +298,10 @@ mod tests {
         assert!(blob.contains("old_string"), "{blob}");
         let house = openai_tools(&by_key(RuneKey::Chat));
         let h = house.to_string();
-        assert!(h.contains("\"array\""), "house args should be an array: {h}");
+        assert!(
+            h.contains("\"array\""),
+            "house args should be an array: {h}"
+        );
         assert!(!h.contains("web_research"), "{h}");
     }
 

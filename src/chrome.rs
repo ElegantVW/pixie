@@ -10,6 +10,18 @@ pub fn unicode() -> bool {
     }
 }
 
+pub fn thread_meter(pct: u16) -> String {
+    let pct = pct.min(100);
+    let n = 10usize;
+    let fill = (pct as usize * n) / 100;
+    let (on, off) = if unicode() {
+        ("█", "░")
+    } else {
+        ("#", "-")
+    };
+    format!("[{}{}] {pct}%", on.repeat(fill), off.repeat(n - fill))
+}
+
 pub fn border_set() -> Set {
     if unicode() {
         ROUNDED
@@ -157,6 +169,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thread_meter_is_ten_cells() {
+        let s = thread_meter(0);
+        assert!(s.contains("0%"), "{s}");
+        let s = thread_meter(70);
+        assert!(s.contains("70%"), "{s}");
+        let s = thread_meter(100);
+        assert!(s.contains("100%"), "{s}");
+    }
+
+    #[test]
     fn wrap_splits_on_width() {
         let got = wrap("abcdefghij", 4);
         assert_eq!(got, vec!["abcd", "efgh", "ij"]);
@@ -199,8 +221,14 @@ mod tests {
         let w = ch_cols('✦').max(1);
         let s = star.repeat(8);
         let lines = wrap(&s, w * 4);
-        assert!(lines.len() >= 2, "expected wrap, got {lines:?} (✦ is {w} cols)");
+        assert!(
+            lines.len() >= 2,
+            "expected wrap, got {lines:?} (✦ is {w} cols)"
+        );
         let (row, col) = wrap_cursor(&format!("✦ {}", "x".repeat(20)), 10, 22);
-        assert!(row >= 1, "cursor should leave row 0, got row={row} col={col}");
+        assert!(
+            row >= 1,
+            "cursor should leave row 0, got row={row} col={col}"
+        );
     }
 }

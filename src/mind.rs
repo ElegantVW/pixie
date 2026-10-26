@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const MEMORY_INJECT_CAP: usize = 2000;
-pub const MEMORY_FILE_CAP: usize = 8000;
+pub const MEMORY_INJECT_CAP: usize = 6000;
+pub const MEMORY_FILE_CAP: usize = 24000;
 pub const SESSION_TEXT_CAP: usize = 32000;
 pub const SESSION_TOOL_CAP: usize = 1200;
 pub const HOUSE_PACK_CAP: usize = 2500;
@@ -79,12 +79,20 @@ pub fn spells_line(spells: &HashMap<String, Spell>) -> String {
     if names.is_empty() {
         "House spells: (none loaded).".into()
     } else {
-        format!("House spells (prefer the house tool): {}.", names.join(", "))
+        format!(
+            "House spells (prefer the house tool): {}.",
+            names.join(", ")
+        )
     }
 }
 
 pub fn house_pack() -> String {
-    let mut chunks = vec![HOUSE_MD.to_string(), OS_MD.to_string(), TOOLS_MD.to_string(), VOICE_MD.to_string()];
+    let mut chunks = vec![
+        HOUSE_MD.to_string(),
+        OS_MD.to_string(),
+        TOOLS_MD.to_string(),
+        VOICE_MD.to_string(),
+    ];
     let live = paths::config_dir().join("context");
     if live.is_dir() {
         let mut loaded = Vec::new();
@@ -139,6 +147,21 @@ pub struct Resolved {
     pub spell: String,
 }
 
+pub fn needs_shell(command: &str) -> bool {
+    let c = command.trim();
+    c.contains("&&")
+        || c.contains("||")
+        || c.contains(';')
+        || c.contains('|')
+        || c.contains('$')
+        || c.contains('`')
+        || c.contains('>')
+        || c.contains('<')
+        || c.contains('\n')
+        || c.contains("$( ")
+        || (c.contains('*') && !c.starts_with("rg "))
+}
+
 pub fn rewrite_bash(command: &str, spells: &HashMap<String, Spell>) -> Result<Vec<String>, String> {
     let argv = split_argv(command)?;
     if argv.is_empty() {
@@ -163,6 +186,7 @@ pub fn run_argv(argv: &[String], timeout: Duration) -> Value {
         cmd.args(&argv[1..]);
     }
     cmd.env("PATH", paths::house_path());
+    apply_sudo_env(&mut cmd);
     cmd.stdin(Stdio::null());
     match spawn_timeout(cmd, timeout, None) {
         SpawnOut::Err(e) => json!({"error": e}),
@@ -188,6 +212,7 @@ pub fn run_argv_cancel(
         cmd.args(&argv[1..]);
     }
     cmd.env("PATH", paths::house_path());
+    apply_sudo_env(&mut cmd);
     cmd.stdin(Stdio::null());
     match spawn_timeout(cmd, timeout, Some(cancel)) {
         SpawnOut::Err(e) => json!({"error": e, "argv": argv}),
@@ -200,9 +225,32 @@ pub fn run_argv_cancel(
     }
 }
 
+fn apply_sudo_env(cmd: &mut Command) {
+    if let Some((k, v)) = crate::privilege::child_env() {
+        cmd.env(k, v);
+    } else {
+        cmd.env("SUDO_ASKPASS", "/bin/false");
+    }
+}
+
 enum SpawnOut {
     Ok(std::process::Output),
     Err(String),
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn setsid() -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn stop_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = kill(-(child.id() as i32), 9);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_timeout(
@@ -212,6 +260,18 @@ fn spawn_timeout(
 ) -> SpawnOut {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                if setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = match cmd.spawn() {
         Err(e) => {
             return SpawnOut::Err(if e.kind() == std::io::ErrorKind::NotFound {
@@ -224,22 +284,32 @@ fn spawn_timeout(
     };
     let start = std::time::Instant::now();
     let status = loop {
-        if cancel.map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
-            let _ = child.kill();
-            let _ = child.wait();
+        if cancel
+            .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            stop_child_group(&mut child);
             return SpawnOut::Err("cancelled".into());
         }
         match child.try_wait() {
-            Ok(Some(st)) => break st,
+            Ok(Some(st)) => {
+                #[cfg(unix)]
+                unsafe {
+                    let _ = kill(-(child.id() as i32), 9);
+                }
+                break st;
+            }
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_child_group(&mut child);
                     return SpawnOut::Err(format!("timed out after {}s", timeout.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(40));
             }
-            Err(e) => return SpawnOut::Err(e.to_string()),
+            Err(e) => {
+                stop_child_group(&mut child);
+                return SpawnOut::Err(e.to_string());
+            }
         }
     };
     let mut stdout = Vec::new();
@@ -257,21 +327,47 @@ fn spawn_timeout(
     })
 }
 
-pub fn seed_memory(path: Option<&Path>) -> PathBuf {
-    let p = path.map(|p| p.to_path_buf()).unwrap_or_else(paths::memory_path);
+pub fn seed_memory(path: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let p = path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(paths::memory_path);
     if let Some(d) = p.parent() {
-        let _ = fs::create_dir_all(d);
+        fs::create_dir_all(d)
+            .map_err(|e| anyhow::anyhow!("creating memory directory {}: {e}", d.display()))?;
     }
-    let empty = fs::read_to_string(&p).map(|t| t.trim().is_empty()).unwrap_or(true);
-    if empty {
-        let _ = fs::write(&p, SEED);
+    match fs::read_to_string(&p) {
+        Ok(contents) if contents.trim().is_empty() => {
+            paths::write_atomic(&p, SEED.as_bytes())
+                .map_err(|e| anyhow::anyhow!("seeding memory {}: {e}", p.display()))?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            paths::write_atomic(&p, SEED.as_bytes())
+                .map_err(|e| anyhow::anyhow!("seeding memory {}: {e}", p.display()))?;
+        }
+        Err(error) => return Err(anyhow::anyhow!("reading memory {}: {error}", p.display())),
     }
-    p
+    Ok(p)
 }
 
 pub fn load_memory_inject(path: Option<&Path>, cap: usize) -> String {
-    let p = seed_memory(path);
-    let mut text = fs::read_to_string(&p).unwrap_or_default();
+    let p = match seed_memory(path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("pixie: could not load house memory: {error}");
+            return String::new();
+        }
+    };
+    let mut text = match fs::read_to_string(&p) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!(
+                "pixie: could not read house memory {}: {error}",
+                p.display()
+            );
+            return String::new();
+        }
+    };
     if text.len() > cap {
         text.truncate(cap);
         text.push('…');
@@ -284,8 +380,14 @@ pub fn remember(fact: &str, path: Option<&Path>) -> Value {
     if fact.is_empty() {
         return json!({"error": "empty fact"});
     }
-    let p = seed_memory(path);
-    let mut body = fs::read_to_string(&p).unwrap_or_default();
+    let p = match seed_memory(path) {
+        Ok(path) => path,
+        Err(error) => return json!({"error": format!("could not load memory: {error}")}),
+    };
+    let mut body = match fs::read_to_string(&p) {
+        Ok(body) => body,
+        Err(error) => return json!({"error": format!("could not read {}: {error}", p.display())}),
+    };
     if body.to_lowercase().contains(&fact.to_lowercase()) {
         return json!({"path": p.display().to_string(), "wrote": false, "note": "already known"});
     }
@@ -316,7 +418,9 @@ pub fn remember(fact: &str, path: Option<&Path>) -> Value {
         }
         body = head.concat() + &rest.concat();
     }
-    let _ = fs::write(&p, &body);
+    if let Err(error) = paths::write_atomic(&p, body.as_bytes()) {
+        return json!({"error": format!("could not save {}: {error}", p.display())});
+    }
     json!({"path": p.display().to_string(), "wrote": true})
 }
 
@@ -341,7 +445,20 @@ fn chrono_today() -> String {
         }
     }
     let ly = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let md = [31, if ly { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let md = [
+        31,
+        if ly { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 1u32;
     for d in md {
         if rem >= d {
@@ -400,10 +517,17 @@ pub fn session_path(id: &str, dir: Option<&Path>) -> PathBuf {
 }
 
 pub fn append_session(id: &str, rec: &SessionRec, dir: Option<&Path>) {
-    let dir = dir.map(|d| d.to_path_buf()).unwrap_or_else(paths::sessions_dir);
-    let _ = fs::create_dir_all(&dir);
-    let p = dir.join(format!("{id}.jsonl"));
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&p) {
+    let result = (|| -> anyhow::Result<()> {
+        let dir = dir
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(paths::sessions_dir);
+        fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+        let p = dir.join(format!("{id}.jsonl"));
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .map_err(|e| anyhow::anyhow!("opening {}: {e}", p.display()))?;
         let mut rec = rec.clone();
         rec.text = cap_str(&rec.text, SESSION_TEXT_CAP);
         rec.raw = cap_str(&rec.raw, SESSION_TOOL_CAP);
@@ -413,9 +537,13 @@ pub fn append_session(id: &str, rec: &SessionRec, dir: Option<&Path>) {
         if let Some(r) = rec.result.take() {
             rec.result = Some(cap_value(&r, SESSION_TOOL_CAP));
         }
-        if let Ok(line) = serde_json::to_string(&rec) {
-            let _ = writeln!(f, "{line}");
-        }
+        let line = serde_json::to_string(&rec)
+            .map_err(|e| anyhow::anyhow!("encoding session record: {e}"))?;
+        writeln!(f, "{line}").map_err(|e| anyhow::anyhow!("writing {}: {e}", p.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("pixie: could not save session record for {id}: {error}");
     }
 }
 
@@ -443,7 +571,9 @@ pub fn read_session(id: &str, dir: Option<&Path>) -> Vec<Value> {
 }
 
 pub fn list_sessions(dir: Option<&Path>) -> Vec<Value> {
-    let d = dir.map(|d| d.to_path_buf()).unwrap_or_else(paths::sessions_dir);
+    let d = dir
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(paths::sessions_dir);
     let Ok(rd) = fs::read_dir(&d) else {
         return Vec::new();
     };
@@ -453,7 +583,11 @@ pub fn list_sessions(dir: Option<&Path>) -> Vec<Value> {
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
-        let id = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let id = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         let mtime = e
             .metadata()
             .ok()
@@ -509,6 +643,345 @@ pub fn latest_session_id(dir: Option<&Path>) -> Option<String> {
         .and_then(|r| r.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionRow {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub users: u64,
+    pub assistants: u64,
+    pub mtime: u64,
+}
+
+/// Newest first. Name + blurb for the dashboard.
+pub fn session_previews(dir: Option<&Path>) -> Vec<SessionRow> {
+    list_sessions(dir)
+        .iter()
+        .filter_map(|r| {
+            let id = r
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let meta = load_meta(&id, dir);
+            let name = if !meta.name.is_empty() {
+                meta.name.clone()
+            } else {
+                id.clone()
+            };
+            let first = preview_safe(r.get("first_user").and_then(|x| x.as_str()).unwrap_or(""));
+            let summary = if !meta.summary.is_empty() {
+                preview_safe(&meta.summary)
+            } else if let Some(c) = last_compact_text(&id, dir) {
+                preview_safe(&c)
+            } else {
+                first
+            };
+            Some(SessionRow {
+                id,
+                name,
+                summary,
+                users: r.get("user").and_then(|x| x.as_u64()).unwrap_or(0),
+                assistants: r.get("assistant").and_then(|x| x.as_u64()).unwrap_or(0),
+                mtime: r.get("mtime").and_then(|x| x.as_u64()).unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+pub fn age_label(mtime: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let d = now.saturating_sub(mtime);
+    if d < 120 {
+        "now".into()
+    } else if d < 3600 {
+        format!("{}m", d / 60)
+    } else if d < 86400 {
+        format!("{}h", d / 3600)
+    } else if d < 86400 * 7 {
+        format!("{}d", d / 86400)
+    } else {
+        "older".into()
+    }
+}
+
+pub fn last_compact_text(id: &str, dir: Option<&Path>) -> Option<String> {
+    read_session(id, dir)
+        .into_iter()
+        .rev()
+        .find(|r| r.get("role").and_then(|x| x.as_str()) == Some("compact"))
+        .and_then(|r| {
+            r.get("text")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+pub fn needs_summary(id: &str, dir: Option<&Path>) -> bool {
+    load_meta(id, dir).summary.trim().is_empty() && last_compact_text(id, dir).is_none()
+}
+
+pub fn set_summary(id: &str, text: &str, dir: Option<&Path>) {
+    let mut m = load_meta(id, dir);
+    let text = preview_safe(text);
+    if text.is_empty() {
+        return;
+    }
+    m.summary = text.chars().take(80).collect();
+    save_meta(id, &m, dir);
+}
+
+pub fn hydrate_compact_blurbs(dir: Option<&Path>) {
+    for row in session_previews(dir) {
+        if !load_meta(&row.id, dir).summary.trim().is_empty() {
+            continue;
+        }
+        if let Some(c) = last_compact_text(&row.id, dir) {
+            set_summary(&row.id, &c, dir);
+        }
+    }
+}
+
+pub fn delete_session(id: &str, dir: Option<&Path>) -> bool {
+    if id.trim().is_empty() || id.contains('/') || id.contains("..") {
+        return false;
+    }
+    let jsonl = session_path(id, dir);
+    let meta = meta_path(id, dir);
+    let mut ok = false;
+    if jsonl.is_file() {
+        ok = fs::remove_file(&jsonl).is_ok();
+    }
+    if meta.is_file() {
+        let _ = fs::remove_file(&meta);
+    }
+    ok
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionMeta {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub renamed: bool,
+    #[serde(default)]
+    pub named_from: usize,
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl SessionMeta {
+    fn for_id(id: &str) -> Self {
+        Self {
+            name: id.to_string(),
+            renamed: false,
+            named_from: 0,
+            summary: String::new(),
+        }
+    }
+}
+
+pub fn meta_path(id: &str, dir: Option<&Path>) -> PathBuf {
+    session_path(id, dir).with_extension("meta.json")
+}
+
+pub fn load_meta(id: &str, dir: Option<&Path>) -> SessionMeta {
+    let p = meta_path(id, dir);
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<SessionMeta>(&t).ok())
+        .map(|mut m| {
+            if m.name.trim().is_empty() {
+                m.name = id.to_string();
+            }
+            m
+        })
+        .unwrap_or_else(|| SessionMeta::for_id(id))
+}
+
+pub fn save_meta(id: &str, meta: &SessionMeta, dir: Option<&Path>) {
+    let p = meta_path(id, dir);
+    if let Some(d) = p.parent() {
+        if let Err(error) = fs::create_dir_all(d) {
+            eprintln!(
+                "pixie: could not create session metadata directory {}: {error}",
+                d.display()
+            );
+            return;
+        }
+    }
+    match serde_json::to_string_pretty(meta) {
+        Ok(contents) => {
+            if let Err(error) = paths::write_atomic(&p, contents.as_bytes()) {
+                eprintln!(
+                    "pixie: could not save session metadata {}: {error}",
+                    p.display()
+                );
+            }
+        }
+        Err(error) => eprintln!("pixie: could not encode session metadata: {error}"),
+    }
+}
+
+pub fn rename_session(id: &str, name: &str, dir: Option<&Path>) {
+    let mut m = load_meta(id, dir);
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    m.name = name.chars().take(40).collect();
+    m.renamed = true;
+    save_meta(id, &m, dir);
+}
+
+/// True if kur should retitle (under 10 user lines, not user-renamed).
+pub fn should_retitle(id: &str, dir: Option<&Path>) -> bool {
+    let m = load_meta(id, dir);
+    !m.renamed && m.named_from < 10
+}
+
+pub fn bump_named_from(id: &str, dir: Option<&Path>) -> usize {
+    let mut m = load_meta(id, dir);
+    if m.renamed {
+        return m.named_from;
+    }
+    m.named_from = m.named_from.saturating_add(1).min(10);
+    save_meta(id, &m, dir);
+    m.named_from
+}
+
+pub fn set_session_name(id: &str, name: &str, dir: Option<&Path>) {
+    let mut m = load_meta(id, dir);
+    if m.renamed {
+        return;
+    }
+    let name = name.trim();
+    if name.is_empty() || is_red_fact(name) {
+        return;
+    }
+    m.name = name.chars().take(40).collect();
+    save_meta(id, &m, dir);
+}
+
+pub fn user_texts(id: &str, dir: Option<&Path>, limit: usize) -> Vec<String> {
+    read_session(id, dir)
+        .into_iter()
+        .filter(|r| r.get("role").and_then(|x| x.as_str()) == Some("user"))
+        .filter_map(|r| {
+            r.get("text")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.trim().is_empty())
+        .take(limit)
+        .collect()
+}
+
+/// Bare `pixie` opens the door. `--new` / `--resume` skip it.
+pub fn wants_door(new: bool, resume: bool) -> bool {
+    !new && !resume
+}
+
+/// Last few you/Pixie lines, clipped so kur's tiny ctx can recap them.
+pub fn compact_seed(lines: &[(String, String)]) -> String {
+    let start = lines.len().saturating_sub(4);
+    let mut out = String::new();
+    for (role, text) in &lines[start..] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let clip: String = text.chars().take(220).collect();
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(&clip);
+    }
+    out
+}
+
+pub(crate) fn preview_safe(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if is_red_fact(t) {
+        return "(house note)".into();
+    }
+    t.chars().take(80).collect()
+}
+
+pub(crate) fn is_red_fact(s: &str) -> bool {
+    let l = s.to_lowercase();
+    [
+        "wifi",
+        "wi-fi",
+        "essid",
+        "bssid",
+        "aircrack",
+        "airodump",
+        "aireplay",
+        "handshake",
+        "password",
+        "passwd",
+        "nif",
+        ".pem",
+        "wpa-",
+        "wep",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
+/// Mid-thread compact blob: keep recap lines, drop secrets and radio.
+pub fn scrub_compact(raw: &str) -> String {
+    let mut out = String::new();
+    for l in raw.lines() {
+        let l = l.trim();
+        if l.is_empty() || l.eq_ignore_ascii_case("none") || is_red_fact(l) || l.starts_with('{') {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(l);
+        if out.lines().count() >= 40 || out.len() >= 4000 {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse a kur recap into durable house bullets. Drops secrets and radio.
+pub fn durable_facts(raw: &str) -> Vec<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    t.lines()
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(['-', '*', '•'])
+                .trim()
+                .trim_matches('"')
+                .to_string()
+        })
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.eq_ignore_ascii_case("none"))
+        .filter(|l| !is_red_fact(l))
+        .filter(|l| !l.starts_with('{'))
+        .take(8)
+        .collect()
+}
+
 pub fn resolve_session_id(sid: Option<&str>, dir: Option<&Path>) -> Option<String> {
     if let Some(s) = sid {
         let name = Path::new(s)
@@ -535,9 +1008,19 @@ pub fn format_chat_list(dir: Option<&Path>) -> String {
             let u = r.get("user").and_then(|x| x.as_u64()).unwrap_or(0);
             let a = r.get("assistant").and_then(|x| x.as_u64()).unwrap_or(0);
             let t = r.get("tool").and_then(|x| x.as_u64()).unwrap_or(0);
-            let preview = r.get("first_user").and_then(|x| x.as_str()).unwrap_or("(empty)");
-            let preview = if preview.is_empty() { "(empty)" } else { preview };
-            format!("{id}  u:{u} a:{a} t:{t}  {preview}")
+            let preview = preview_safe(r.get("first_user").and_then(|x| x.as_str()).unwrap_or(""));
+            let preview = if preview.is_empty() {
+                "(empty)".into()
+            } else {
+                preview
+            };
+            let meta = load_meta(id, dir);
+            let name = if !meta.name.is_empty() && meta.name != id {
+                format!("{}  ", meta.name)
+            } else {
+                String::new()
+            };
+            format!("{name}{id}  u:{u} a:{a} t:{t}  {preview}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -572,7 +1055,11 @@ pub fn format_chat(id: &str, dir: Option<&Path>) -> String {
                     "{head} pixie: {}",
                     rec.get("text").and_then(|x| x.as_str()).unwrap_or("")
                 );
-                if rec.get("cancelled").and_then(|x| x.as_bool()).unwrap_or(false) {
+                if rec
+                    .get("cancelled")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false)
+                {
                     line.push_str("  (cancelled)");
                 }
                 if let Some(th) = rec.get("think").and_then(|x| x.as_str()) {
@@ -582,6 +1069,10 @@ pub fn format_chat(id: &str, dir: Option<&Path>) -> String {
                     }
                 }
                 blocks.push(line);
+            }
+            "compact" => {
+                let text = rec.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                blocks.push(format!("{head} compact: {text}"));
             }
             "tool" => {
                 let name = rec.get("tool").and_then(|x| x.as_str()).unwrap_or("tool");
@@ -666,7 +1157,9 @@ pub fn search_house(query: &str, max_hits: usize) -> Value {
             }
         }
         'outer: for p in files {
-            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let Ok(text) = fs::read_to_string(&p) else {
+                continue;
+            };
             for (i, ln) in text.lines().enumerate() {
                 if ln.to_lowercase().contains(&needle) {
                     hits.push(json!({
@@ -709,14 +1202,17 @@ pub fn wiki(query: &str, max_results: i64) -> Value {
         max_results.max(1).min(8)
     );
     match curl_get(&url, 20) {
-        Err(e) => json!({"query": query, "engine": "wikipedia", "results": [], "count": 0, "error": e}),
+        Err(e) => {
+            json!({"query": query, "engine": "wikipedia", "results": [], "count": 0, "error": e})
+        }
         Ok(body) => {
             let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
             let mut items = Vec::new();
             if let Some(arr) = v.pointer("/query/search").and_then(|x| x.as_array()) {
                 for r in arr {
                     let title = r.get("title").and_then(|x| x.as_str()).unwrap_or("");
-                    let snippet = strip_tags(r.get("snippet").and_then(|x| x.as_str()).unwrap_or(""));
+                    let snippet =
+                        strip_tags(r.get("snippet").and_then(|x| x.as_str()).unwrap_or(""));
                     items.push(json!({
                         "title": title,
                         "url": format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
@@ -734,10 +1230,7 @@ pub fn search_web(query: &str, max_results: i64) -> Value {
     if query.is_empty() {
         return json!({"error": "empty query"});
     }
-    let url = format!(
-        "https://html.duckduckgo.com/html/?q={}",
-        urlencode(query)
-    );
+    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(query));
     match curl_get(&url, 25) {
         Err(e) => json!({
             "query": query, "results": [], "count": 0,
@@ -818,11 +1311,7 @@ pub fn note_source(session_id: &str, url: &str, title: &str) {
     let _ = fs::create_dir_all(&dir);
     let p = dir.join(format!("{session_id}.jsonl"));
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(
-            f,
-            "{}",
-            json!({"url": url, "title": title})
-        );
+        let _ = writeln!(f, "{}", json!({"url": url, "title": title}));
     }
 }
 
@@ -862,10 +1351,39 @@ pub fn write_plan(
     } else {
         session_id.to_string()
     };
-    let dir = paths::plans_dir();
-    let _ = fs::create_dir_all(&dir);
+    write_plan_in(
+        &paths::plans_dir(),
+        &sid,
+        &goal,
+        steps,
+        files,
+        risks,
+        verify,
+    )
+}
+
+fn write_plan_in(
+    dir: &Path,
+    sid: &str,
+    goal: &str,
+    steps: &Value,
+    files: &Value,
+    risks: &Value,
+    verify: &str,
+) -> Value {
+    if let Err(e) = fs::create_dir_all(dir) {
+        return json!({
+            "error": format!("could not create plan directory: {e}"),
+            "wrote": false
+        });
+    }
     let p = dir.join(format!("{sid}.md"));
-    let mut lines = vec!["# Plan".into(), String::new(), format!("**Goal:** {goal}"), String::new()];
+    let mut lines = vec![
+        "# Plan".into(),
+        String::new(),
+        format!("**Goal:** {goal}"),
+        String::new(),
+    ];
     let st = bullets(steps);
     if !st.is_empty() {
         lines.push("## Steps".into());
@@ -895,8 +1413,20 @@ pub fn write_plan(
         lines.push(verify.trim().into());
         lines.push(String::new());
     }
-    let _ = fs::write(&p, lines.join("\n"));
-    json!({"path": p.display().to_string(), "wrote": true, "session": sid})
+    if let Err(e) = fs::write(&p, lines.join("\n")) {
+        return json!({
+            "error": format!("could not write plan: {e}"),
+            "wrote": false
+        });
+    }
+    json!({
+        "path": p.display().to_string(),
+        "wrote": true,
+        "session": sid,
+        "cache_only": true,
+        "files_cited": fl,
+        "note": "stored under ~/.cache/pixie/plans only. Do not tell the human you wrote ~/faeOS markdown."
+    })
 }
 
 pub fn load_plan(session_id: &str, cap: usize) -> String {
@@ -968,7 +1498,10 @@ fn bullets(val: &Value) -> Vec<String> {
 
 pub fn drop_oldest(msgs: &mut Vec<Value>, keep_ratio: f32) -> bool {
     let mut dropped = false;
-    let non_sys = msgs.iter().filter(|m| m.get("role").and_then(|x| x.as_str()) != Some("system")).count();
+    let non_sys = msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|x| x.as_str()) != Some("system"))
+        .count();
     let budget = 1.max(((non_sys as f32) * (1.0 - keep_ratio)) as usize);
     let mut n = 0;
     msgs.retain(|m| {
@@ -1021,10 +1554,20 @@ pub fn tool_was_empty(result: &Value) -> bool {
     if result.get("count").and_then(|x| x.as_u64()) == Some(0) {
         return true;
     }
-    if result.get("hits").and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+    if result
+        .get("hits")
+        .and_then(|x| x.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
-    if result.get("results").and_then(|x| x.as_array()).map(|a| a.is_empty()).unwrap_or(false) {
+    if result
+        .get("results")
+        .and_then(|x| x.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+    {
         return true;
     }
     let code = result.get("exit_code").and_then(|x| x.as_i64());
@@ -1081,7 +1624,9 @@ pub fn extract_tool_calls(text: &str, limit: usize) -> Vec<ToolCall> {
     let mut rest = text;
     let mut offset = 0usize;
     while out.len() < limit {
-        let Some(i) = rest.find("<tool_call>") else { break };
+        let Some(i) = rest.find("<tool_call>") else {
+            break;
+        };
         let abs = offset + i;
         let after = &rest[i + 11..];
         if let Some(j) = after.find("</tool_call>") {
@@ -1347,7 +1892,15 @@ mod tests {
     #[test]
     fn unknown_spell() {
         let mut s = HashMap::new();
-        s.insert("spark".into(), Spell { bin: Some("true".into()), args: None, confirm: Some(false), note: None });
+        s.insert(
+            "spark".into(),
+            Spell {
+                bin: Some("true".into()),
+                args: None,
+                confirm: Some(false),
+                note: None,
+            },
+        );
         assert!(resolve_spell("nope", &[], &s).is_err());
     }
 
@@ -1362,6 +1915,23 @@ mod tests {
         let again = remember("tea at dusk", Some(&p));
         assert_eq!(again.get("wrote"), Some(&json!(false)));
         assert!(remember("   ", Some(&p)).get("error").is_some());
+    }
+
+    #[test]
+    fn failed_plan_directory_creation_is_not_reported_as_written() {
+        let file_as_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let result = write_plan_in(
+            &file_as_dir,
+            "plan-test",
+            "test plan",
+            &json!([]),
+            &json!([]),
+            &json!([]),
+            "",
+        );
+        assert_eq!(result["wrote"], false);
+        assert!(result.get("error").is_some());
+        assert!(result.get("path").is_none());
     }
 
     #[test]
@@ -1383,7 +1953,11 @@ mod tests {
     #[test]
     fn search_house_hits_own_tree() {
         let r = search_house("RuneKey", 8);
-        let hits = r.get("hits").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let hits = r
+            .get("hits")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
         let blob = format!("{hits:?}");
         assert!(
             blob.contains("pixie") && (blob.contains("runes") || blob.contains("src")),
@@ -1415,5 +1989,107 @@ mod tests {
         let recs = read_session("t1", Some(&dir));
         assert_eq!(recs[0]["role"], "user");
         assert!(format_chat("t1", Some(&dir)).contains("you: hi"));
+        assert_eq!(latest_session_id(Some(&dir)).as_deref(), Some("t1"));
+        let prev = session_previews(Some(&dir));
+        assert_eq!(prev[0].id, "t1");
+        assert_eq!(prev[0].name, "t1");
+        assert_eq!(prev[0].summary, "hi");
+        assert_eq!(preview_safe("hi there"), "hi there");
+        assert_eq!(preview_safe("sudo password is secret"), "(house note)");
+        rename_session("t1", "Tea at dusk", Some(&dir));
+        let m = load_meta("t1", Some(&dir));
+        assert_eq!(m.name, "Tea at dusk");
+        assert!(m.renamed);
+        assert!(!should_retitle("t1", Some(&dir)));
+        assert!(wants_door(false, false));
+        assert!(!wants_door(true, false));
+        assert!(!wants_door(false, true));
+        for _ in 0..10 {
+            bump_named_from("t1", Some(&dir));
+        }
+        // renamed already, so retitle stays off
+        assert!(!should_retitle("t1", Some(&dir)));
+        append_session(
+            "t2",
+            &SessionRec {
+                ts: "now".into(),
+                role: "user".into(),
+                rune: "chat".into(),
+                text: "second thread".into(),
+                tool: String::new(),
+                args: None,
+                result: None,
+                raw: String::new(),
+                think: String::new(),
+                cancelled: false,
+            },
+            Some(&dir),
+        );
+        assert!(should_retitle("t2", Some(&dir)));
+        for _ in 0..10 {
+            bump_named_from("t2", Some(&dir));
+        }
+        assert!(!should_retitle("t2", Some(&dir)));
+        set_session_name("t2", "Morning brew", Some(&dir));
+        assert_eq!(load_meta("t2", Some(&dir)).name, "Morning brew");
+        assert!(!load_meta("t2", Some(&dir)).renamed);
+        set_summary("t2", "wiring the door", Some(&dir));
+        assert_eq!(load_meta("t2", Some(&dir)).summary, "wiring the door");
+        assert!(delete_session("t2", Some(&dir)));
+        assert!(read_session("t2", Some(&dir)).is_empty());
+        assert!(!delete_session("../etc", Some(&dir)));
+    }
+
+    #[test]
+    fn scrub_compact_keeps_house_drops_radio() {
+        let s = scrub_compact(
+            "- Host is VANGUARDA Arch\n- crack wifi with aircrack\n- Pixie lives in ~/pixie\n",
+        );
+        assert!(s.contains("Host is VANGUARDA Arch"));
+        assert!(s.contains("Pixie lives in ~/pixie"));
+        assert!(!s.to_lowercase().contains("wifi"));
+    }
+
+    #[test]
+    fn durable_facts_keeps_house_drops_radio() {
+        let raw = "- Host is VANGUARDA Arch\n- crack wifi with aircrack\n- NONE\n- Pixie lives in ~/pixie\n";
+        let f = durable_facts(raw);
+        assert_eq!(f, vec!["Host is VANGUARDA Arch", "Pixie lives in ~/pixie"]);
+        assert!(durable_facts("NONE").is_empty());
+        let seed = compact_seed(&[
+            ("you".into(), "hi".into()),
+            ("pixie".into(), "hello from the crate".into()),
+        ]);
+        assert!(seed.contains("you: hi"));
+        assert!(seed.contains("pixie: hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_shell_does_not_leave_pipe_holding_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 &"]);
+        let started = std::time::Instant::now();
+        let result = spawn_timeout(command, Duration::from_secs(3), None);
+        assert!(matches!(result, SpawnOut::Ok(_)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_the_process_group() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let child_cancel = cancel.clone();
+        let task = std::thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 30 & wait"]);
+            spawn_timeout(command, Duration::from_secs(30), Some(&child_cancel))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(task.join().unwrap(), SpawnOut::Err(message) if message == "cancelled"));
     }
 }

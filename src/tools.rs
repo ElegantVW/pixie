@@ -27,17 +27,24 @@ const TOOL_ROUND_CAP: usize = 4000;
 
 pub fn alias(name: &str) -> &str {
     match name {
-        "create_file" | "create" | "write_file" | "write" | "file_create"
-        | "mkfile" | "writefile" | "write_content" | "write_to_file" | "code_editor" => {
-            "write_local_file"
-        }
+        "create_file" | "create" | "write_file" | "write" | "file_create" | "mkfile"
+        | "writefile" | "write_content" | "write_to_file" | "code_editor" => "write_local_file",
         "apply_patch" | "text_editor" | "file_editor" | "str_replace" | "replace_in_file"
         | "edit_file" | "edit" => "edit_local_file",
         "ls" | "listdir" | "list_directory" | "list" => "list_dir",
         "grep" | "ripgrep" | "rg_files" | "search_files" => "grep_files",
-        "run_command" | "run" | "execute_command" | "shell" | "bash" | "run_bash"
-        | "execute_script" | "run_terminal_command" | "shell_command" | "terminal"
-        | "run_script" | "run_python" => "execute_bash",
+        "run_command"
+        | "run"
+        | "execute_command"
+        | "shell"
+        | "bash"
+        | "run_bash"
+        | "execute_script"
+        | "run_terminal_command"
+        | "shell_command"
+        | "terminal"
+        | "run_script"
+        | "run_python" => "execute_bash",
         "read_file" | "read" => "read_local_file",
         "search_web" | "web_search" => "web_research",
         "fetch_url" | "open_url" | "read_page" => "fetch_web_page",
@@ -113,8 +120,15 @@ pub fn norm_args(fname: &str, fargs: &Value) -> Value {
         }
         "house" => {
             let mut spell = first_str(m, &["spell", "name", "command", "bin"]);
-            let mut args: Vec<String> = match m.get("args").or_else(|| m.get("arguments")).or_else(|| m.get("extra")) {
-                Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect(),
+            let mut args: Vec<String> = match m
+                .get("args")
+                .or_else(|| m.get("arguments"))
+                .or_else(|| m.get("extra"))
+            {
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect(),
                 Some(Value::String(s)) => mind::split_argv(s).unwrap_or_else(|_| vec![s.clone()]),
                 _ => Vec::new(),
             };
@@ -218,8 +232,8 @@ fn plan_bash_ok(argv: &[String]) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or(&argv[0]);
     match head {
-        "ls" | "find" | "file" | "wc" | "head" | "tail" | "rg" | "grep"
-        | "true" | "false" | "echo" | "whoami" | "pwd" | "uname" | "date" => true,
+        "ls" | "find" | "file" | "wc" | "head" | "tail" | "rg" | "grep" | "true" | "false"
+        | "echo" | "whoami" | "pwd" | "uname" | "date" => true,
         "git" => {
             let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("");
             matches!(sub, "status" | "diff" | "log" | "show" | "rev-parse")
@@ -394,9 +408,17 @@ pub fn run_tool(
             if rune == RuneKey::Plan && !plan_bash_ok(&argv) {
                 return json!({"error": format!("Plan mode is read-only. '{}' is not on the allowlist (ls/find/file/wc/head/tail/rg/grep/git status|diff|log|show|rev-parse). Stay in Plan or switch to Build.", argv[0])});
             }
-            let mut argv = argv;
-            let head = Path::new(&argv[0]).file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(head, "systemctl" | "journalctl") && !argv.iter().any(|a| a == "--no-pager") {
+            let mut argv = if rune != RuneKey::Plan && mind::needs_shell(cmd) {
+                vec!["sh".into(), "-c".into(), cmd.to_string()]
+            } else {
+                argv
+            };
+            let head = Path::new(&argv[0])
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if matches!(head, "systemctl" | "journalctl") && !argv.iter().any(|a| a == "--no-pager")
+            {
                 argv.insert(1, "--no-pager".into());
             }
             match cancel {
@@ -408,68 +430,66 @@ pub fn run_tool(
             let path = fargs.get("path").and_then(|x| x.as_str()).unwrap_or("");
             match paths::assert_allowed(path) {
                 Err(e) => json!({"error": e.to_string()}),
-                Ok(p) => {
-                    match fs::read(&p) {
-                        Err(e) => json!({"error": format!("File not found: {path} ({e})")}),
-                        Ok(bytes) => {
-                            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-                                set_touch(FileTouch {
-                                    path: p.display().to_string(),
-                                    kind: FileKind::Read,
-                                    added: 0,
-                                    deleted: 0,
-                                    lines: Vec::new(),
-                                    binary: true,
-                                    extra_paths: Vec::new(),
-                                });
-                                return json!({
-                                    "path": p.display().to_string(),
-                                    "error": "not a text file"
-                                });
-                            }
-                            let text = String::from_utf8_lossy(&bytes);
-                            let lines: Vec<&str> = text.lines().collect();
-                            let start = fargs
-                                .get("start_line")
-                                .and_then(|x| x.as_i64())
-                                .map(|n| (n as usize).saturating_sub(1).min(lines.len()))
-                                .unwrap_or(0);
-                            let end = fargs
-                                .get("end_line")
-                                .and_then(|x| x.as_i64())
-                                .map(|n| (n as usize).min(lines.len()))
-                                .unwrap_or(lines.len());
-                            let slice = if start < end {
-                                lines[start..end].join("\n")
-                            } else {
-                                lines[start..].join("\n")
-                            };
-                            let preview: Vec<DiffLine> = slice
-                                .lines()
-                                .take(80)
-                                .map(|t| DiffLine {
-                                    op: Op::Eq,
-                                    text: t.to_string(),
-                                })
-                                .collect();
+                Ok(p) => match fs::read(&p) {
+                    Err(e) => json!({"error": format!("File not found: {path} ({e})")}),
+                    Ok(bytes) => {
+                        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
                             set_touch(FileTouch {
                                 path: p.display().to_string(),
                                 kind: FileKind::Read,
                                 added: 0,
                                 deleted: 0,
-                                lines: preview,
-                                binary: false,
+                                lines: Vec::new(),
+                                binary: true,
                                 extra_paths: Vec::new(),
                             });
-                            json!({
+                            return json!({
                                 "path": p.display().to_string(),
-                                "content": slice,
-                                "bounded_from": start + 1,
-                                "bounded_to": end.max(start)
-                            })
+                                "error": "not a text file"
+                            });
                         }
+                        let text = String::from_utf8_lossy(&bytes);
+                        let lines: Vec<&str> = text.lines().collect();
+                        let start = fargs
+                            .get("start_line")
+                            .and_then(|x| x.as_i64())
+                            .map(|n| (n as usize).saturating_sub(1).min(lines.len()))
+                            .unwrap_or(0);
+                        let end = fargs
+                            .get("end_line")
+                            .and_then(|x| x.as_i64())
+                            .map(|n| (n as usize).min(lines.len()))
+                            .unwrap_or(lines.len());
+                        let slice = if start < end {
+                            lines[start..end].join("\n")
+                        } else {
+                            lines[start..].join("\n")
+                        };
+                        let preview: Vec<DiffLine> = slice
+                            .lines()
+                            .take(80)
+                            .map(|t| DiffLine {
+                                op: Op::Eq,
+                                text: t.to_string(),
+                            })
+                            .collect();
+                        set_touch(FileTouch {
+                            path: p.display().to_string(),
+                            kind: FileKind::Read,
+                            added: 0,
+                            deleted: 0,
+                            lines: preview,
+                            binary: false,
+                            extra_paths: Vec::new(),
+                        });
+                        json!({
+                            "path": p.display().to_string(),
+                            "content": slice,
+                            "bounded_from": start + 1,
+                            "bounded_to": end.max(start)
+                        })
                     }
-                }
+                },
             }
         }
         "write_local_file" => {
@@ -531,15 +551,23 @@ pub fn run_tool(
         }
         "edit_local_file" => {
             let path = fargs.get("path").and_then(|x| x.as_str()).unwrap_or("");
-            let old = fargs.get("old_string").and_then(|x| x.as_str()).unwrap_or("");
-            let new = fargs.get("new_string").and_then(|x| x.as_str()).unwrap_or("");
+            let old = fargs
+                .get("old_string")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let new = fargs
+                .get("new_string")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
             if old.is_empty() {
                 json!({"error": "empty old_string", "next": "read the file and pass the exact text to replace"})
             } else {
                 match paths::assert_allowed(path) {
                     Err(e) => json!({"error": e.to_string()}),
                     Ok(p) => match fs::read_to_string(&p) {
-                        Err(e) => json!({"error": format!("File not found: {path} ({e})"), "next": "list_dir or check the path"}),
+                        Err(e) => {
+                            json!({"error": format!("File not found: {path} ({e})"), "next": "list_dir or check the path"})
+                        }
                         Ok(text) => {
                             let n = text.match_indices(old).count();
                             if n == 0 {
@@ -628,7 +656,11 @@ pub fn run_tool(
             let extra: Vec<String> = fargs
                 .get("args")
                 .and_then(|x| x.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
             match mind::resolve_spell(spell, &extra, &spells) {
                 Err(e) => json!({"error": e}),
@@ -651,9 +683,15 @@ pub fn run_tool(
                 }
             }
         }
-        "remember" => mind::remember(fargs.get("fact").and_then(|x| x.as_str()).unwrap_or(""), None),
+        "remember" => mind::remember(
+            fargs.get("fact").and_then(|x| x.as_str()).unwrap_or(""),
+            None,
+        ),
         "search_house" => {
-            let r = mind::search_house(fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""), 12);
+            let r = mind::search_house(
+                fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
+                12,
+            );
             let extra = hit_paths(&r);
             if let Some(first) = extra.first() {
                 set_touch(FileTouch {
@@ -678,7 +716,10 @@ pub fn run_tool(
         "wiki" => {
             let r = mind::wiki(
                 fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
-                fargs.get("max_results").and_then(|x| x.as_i64()).unwrap_or(5),
+                fargs
+                    .get("max_results")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(5),
             );
             if !session_id.is_empty() {
                 if let Some(arr) = r.get("results").and_then(|x| x.as_array()) {
@@ -696,7 +737,10 @@ pub fn run_tool(
         "web_research" => {
             let r = mind::search_web(
                 fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
-                fargs.get("max_results").and_then(|x| x.as_i64()).unwrap_or(5),
+                fargs
+                    .get("max_results")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(5),
             );
             if !session_id.is_empty() {
                 if let Some(arr) = r.get("results").and_then(|x| x.as_array()) {
@@ -714,7 +758,10 @@ pub fn run_tool(
         "fetch_web_page" => {
             let r = mind::read_page(
                 fargs.get("url").and_then(|x| x.as_str()).unwrap_or(""),
-                fargs.get("max_chars").and_then(|x| x.as_i64()).unwrap_or(6000) as usize,
+                fargs
+                    .get("max_chars")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(6000) as usize,
             );
             if !session_id.is_empty() {
                 mind::note_source(
@@ -758,14 +805,26 @@ pub fn run_tool(
             r
         }
         "manage_systemd_service" => {
-            let mut s_name = fargs.get("service_name").and_then(|x| x.as_str()).unwrap_or("menagerie.service");
-            if matches!(s_name, "your_user_name" | "your_user_service" | "default" | "user-environment" | "") {
+            let mut s_name = fargs
+                .get("service_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("menagerie.service");
+            if matches!(
+                s_name,
+                "your_user_name" | "your_user_service" | "default" | "user-environment" | ""
+            ) {
                 s_name = "menagerie.service";
             }
-            if !s_name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-')) {
+            if !s_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | ':' | '-'))
+            {
                 return json!({"error": format!("invalid service name: {s_name:?}")});
             }
-            let action = fargs.get("action").and_then(|x| x.as_str()).unwrap_or("status");
+            let action = fargs
+                .get("action")
+                .and_then(|x| x.as_str())
+                .unwrap_or("status");
             if !matches!(action, "status" | "restart" | "logs") {
                 return json!({"error": format!("Invalid action: {action}")});
             }
@@ -785,17 +844,25 @@ pub fn run_tool(
                     cmd.push(s_name.into());
                 }
                 _ => {
-                    cmd = vec![
-                        "journalctl".into(),
-                    ];
+                    cmd = vec!["journalctl".into()];
                     if user {
                         cmd.push("--user".into());
                     }
-                    cmd.extend(["-u".into(), s_name.into(), "-n".into(), "15".into(), "--no-pager".into()]);
+                    cmd.extend([
+                        "-u".into(),
+                        s_name.into(),
+                        "-n".into(),
+                        "15".into(),
+                        "--no-pager".into(),
+                    ]);
                 }
             }
             let r = mind::run_argv(&cmd, Duration::from_secs(15));
-            let mut stdout = r.get("stdout").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let mut stdout = r
+                .get("stdout")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if action == "status" && r.get("exit_code") == Some(&json!(0)) {
                 stdout = stdout
                     .lines()
@@ -816,8 +883,14 @@ pub fn run_tool(
         }
         "check_mail" => check_mail(
             fargs.get("sync").and_then(|x| x.as_bool()).unwrap_or(true),
-            fargs.get("box").and_then(|x| x.as_str()).unwrap_or("unread"),
-            fargs.get("max_messages").and_then(|x| x.as_i64()).unwrap_or(20),
+            fargs
+                .get("box")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unread"),
+            fargs
+                .get("max_messages")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(20),
         ),
         _ => json!({"error": format!("Unknown function mapping: {fname}")}),
     }
@@ -920,7 +993,10 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
         }
         "write_local_file" | "edit_local_file" => {
             let path = result.get("path").and_then(|x| x.as_str())?;
-            let created = result.get("created").and_then(|x| x.as_bool()).unwrap_or(false);
+            let created = result
+                .get("created")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
             Some(FileTouch {
                 path: path.into(),
                 kind: if created {
@@ -931,7 +1007,10 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 added: result.get("added").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
                 deleted: result.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
                 lines: Vec::new(),
-                binary: result.get("binary").and_then(|x| x.as_bool()).unwrap_or(false),
+                binary: result
+                    .get("binary")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
                 extra_paths: Vec::new(),
             })
         }
@@ -987,13 +1066,22 @@ pub fn tool_body(fname: &str, fargs: &Value, result: &Value, verbose: bool) -> S
     let routing = format!("Routing: {fname} -> {fargs}");
     if !verbose {
         if let Some(e) = result.get("error") {
-            return format!("{routing}\nerror: {}", e.to_string().chars().take(180).collect::<String>());
+            return format!(
+                "{routing}\nerror: {}",
+                e.to_string().chars().take(180).collect::<String>()
+            );
         }
         if let Some(s) = result.get("stdout").and_then(|x| x.as_str()) {
             return format!("{routing}\n{}", s.chars().take(120).collect::<String>());
         }
-        if result.get("written").and_then(|x| x.as_bool()).unwrap_or(false)
-            || result.get("edited").and_then(|x| x.as_bool()).unwrap_or(false)
+        if result
+            .get("written")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false)
+            || result
+                .get("edited")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
         {
             let bytes = result.get("bytes").and_then(|x| x.as_u64()).unwrap_or(0);
             let a = result.get("added").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1031,6 +1119,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_bash_honors_and() {
+        let yes: &dyn Fn(&str, &Value) -> bool = &|_, _| true;
+        let r = run_tool(
+            "execute_bash",
+            &json!({"command": "echo a && echo b"}),
+            RuneKey::Chat,
+            "",
+            Some(yes),
+            None,
+        );
+        let out = r["stdout"].as_str().unwrap_or("");
+        assert!(out.contains('a') && out.contains('b'), "{r}");
+        assert_eq!(r["argv"][0], "sh");
+        assert_eq!(r["argv"][1], "-c");
+    }
+
+    #[test]
     fn plan_refuses_rm() {
         let r = run_tool(
             "execute_bash",
@@ -1042,7 +1147,10 @@ mod tests {
         );
         assert!(r.get("error").is_some(), "{r}");
         let msg = r["error"].as_str().unwrap();
-        assert!(msg.contains("read-only") || msg.contains("allowlist"), "{msg}");
+        assert!(
+            msg.contains("read-only") || msg.contains("allowlist"),
+            "{msg}"
+        );
         // mutating git is also refused
         let r2 = run_tool(
             "execute_bash",
@@ -1066,7 +1174,10 @@ mod tests {
             None,
         );
         let msg = r["error"].as_str().unwrap_or("");
-        assert!(msg.contains("Unknown tool") || msg.contains("web_research"), "{r}");
+        assert!(
+            msg.contains("Unknown tool") || msg.contains("web_research"),
+            "{r}"
+        );
     }
 
     #[test]
@@ -1143,13 +1254,26 @@ mod tests {
             None,
             None,
         );
-        assert!(plan["error"].as_str().unwrap_or("").contains("Unknown tool"), "{plan}");
+        assert!(
+            plan["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Unknown tool"),
+            "{plan}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn look_stub() {
-        let r = run_tool("look", &json!({"target": "screen"}), RuneKey::Chat, "", None, None);
+        let r = run_tool(
+            "look",
+            &json!({"target": "screen"}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
         assert!(r["error"].as_str().unwrap().contains("sleeping"));
     }
 
@@ -1169,8 +1293,14 @@ mod tests {
         );
         assert_eq!(r.get("written"), Some(&json!(true)), "{r}");
         assert_eq!(r.get("created"), Some(&json!(true)), "{r}");
-        assert!(r.get("added").and_then(|x| x.as_u64()).unwrap_or(0) >= 2, "{r}");
-        assert!(r.get("hunks").is_none(), "model payload must not dump hunks: {r}");
+        assert!(
+            r.get("added").and_then(|x| x.as_u64()).unwrap_or(0) >= 2,
+            "{r}"
+        );
+        assert!(
+            r.get("hunks").is_none(),
+            "model payload must not dump hunks: {r}"
+        );
         let blob = r.to_string();
         assert!(!blob.contains("hunks"), "{blob}");
         let touch = take_touch().expect("file touch");
@@ -1185,10 +1315,19 @@ mod tests {
             None,
         );
         assert_eq!(r2.get("created"), Some(&json!(false)), "{r2}");
-        assert!(r2.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) >= 1, "{r2}");
+        assert!(
+            r2.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0) >= 1,
+            "{r2}"
+        );
         let t2 = take_touch().expect("edit touch");
-        assert!(t2.lines.iter().any(|l| l.op == Op::Del && l.text.contains("beta")));
-        assert!(t2.lines.iter().any(|l| l.op == Op::Add && l.text.contains("gamma")));
+        assert!(t2
+            .lines
+            .iter()
+            .any(|l| l.op == Op::Del && l.text.contains("beta")));
+        assert!(t2
+            .lines
+            .iter()
+            .any(|l| l.op == Op::Add && l.text.contains("gamma")));
         let _ = fs::remove_dir_all(&dir);
     }
 
