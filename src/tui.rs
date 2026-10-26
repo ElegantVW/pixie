@@ -742,6 +742,15 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         return Ok(KeyOut::Continue);
     }
 
+    if crate::grove_keys::is_cycle_next(k.code, k.modifiers) {
+        app.rune_idx = runes::next_idx(app.rune_idx);
+        return Ok(KeyOut::Continue);
+    }
+    if crate::grove_keys::is_cycle_previous(k.code, k.modifiers) {
+        app.rune_idx = runes::prev_idx(app.rune_idx);
+        return Ok(KeyOut::Continue);
+    }
+
     match k.code {
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.busy {
@@ -779,12 +788,6 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             app.session_rows = mind::session_previews(None);
             app.session_idx = 0;
             app.session_menu = true;
-        }
-        KeyCode::Tab => {
-            app.rune_idx = runes::next_idx(app.rune_idx);
-        }
-        KeyCode::BackTab => {
-            app.rune_idx = runes::prev_idx(app.rune_idx);
         }
         KeyCode::Char('r') if k.modifiers.contains(KeyModifiers::CONTROL) => {
             app.rune_idx = runes::next_idx(app.rune_idx);

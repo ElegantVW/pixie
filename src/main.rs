@@ -2,6 +2,7 @@ mod agent;
 mod chrome;
 mod diff;
 mod glyph;
+mod grove_keys;
 mod host;
 mod llm;
 mod mind;

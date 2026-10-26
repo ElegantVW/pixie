@@ -13,7 +13,8 @@
 - File tools canonicalize the home directory and the nearest existing path ancestor before authorizing a target, so a new file under an external symlink is refused. The gate fails closed if `HOME` is missing or relative.
 - Shell commands run in their own process group. Timeout and cancellation stop the group; the group is also closed after its leader exits so orphaned descendants cannot hold session output open.
 - Preferences and session metadata are replaced atomically. Invalid preference JSON prevents startup with a clear error, and memory/session persistence failures are reported. LLM checks and requests reject malformed `PIXIE_LLM_HOST` / `PIXIE_LLM_PORT` instead of probing the default address.
-- Bubbled TUI, Runes **Tab / Shift-Tab** (Ctrl-R alias):
+- Bubbled TUI, Runes **Tab / Shift-Tab** from the Grove `cycle_next` /
+  `cycle_previous` catalog (Ctrl-R remains a compatibility alias):
   - **Chat** (12) — house, remember, search_house, wiki, list_dir, grep_files, bash (`sh -c`, confirm), files, systemd, mail. **No Magpie search**.
   - **Deep** (20) — light DDG HTML `web_research`, `fetch_web_page`, wiki, search_house, list_dir, grep_files. Never `menagerie ensure magpie`.
   - **Build** (20) — inspect `~/pixie` first; `edit_local_file` / `write_local_file`; search_house.
@@ -25,6 +26,9 @@
 - Barge-in: type + Enter aborts the in-flight reply. Quiet hides `<think>` but jsonl stores it.
 - `look` stub: eye still sleeping (no VL GGUF on disk). Vision later hops the GPU the same way Imp does: park the 8B, run the eye, restore Pixie. This box has 8 GiB VRAM — one GPU mouth at a time.
 - `menagerie ensure pixie` on demand. Quit keeps the server warm unless `PIXIE_STOP_LLM_ON_EXIT=1`.
+
+The Rust key adapter is generated from Grove's central catalog:
+`python3 ../faeOS/tools/sync-keyboard-shortcuts.py --check`.
 
 ## llama.cpp vs Menagerie
 
