@@ -533,6 +533,9 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                         raw: String::new(),
                         think: String::new(),
                         cancelled: false,
+                        from_rune: String::new(),
+                        to_rune: String::new(),
+                        reason: String::new(),
                     },
                     None,
                 );
@@ -556,6 +559,9 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                         raw: String::new(),
                         think,
                         cancelled: false,
+                        from_rune: String::new(),
+                        to_rune: String::new(),
+                        reason: String::new(),
                     },
                     None,
                 );
@@ -722,10 +728,32 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 app.plan_menu = false;
                 match act {
                     "approve" => {
+                        let from = app.rune_key();
                         app.rune_idx = runes::all()
                             .iter()
                             .position(|r| r.key == RuneKey::Build)
                             .unwrap_or(app.rune_idx);
+                        let to = app.rune_key();
+                        if from != to {
+                            let plan_summary = mind::load_plan(&app.session_id, 1200);
+                            let text = if plan_summary.is_empty() {
+                                "Switched modes: Plan → Build (plan approved). Implement the active plan in ~/pixie.".to_string()
+                            } else {
+                                format!(
+                                    "Switched modes: Plan → Build (plan approved). Active plan:\n{}",
+                                    plan_summary
+                                )
+                            };
+                            mind::append_transition(
+                                &app.session_id,
+                                from.as_str(),
+                                to.as_str(),
+                                "plan_approved",
+                                &text,
+                                None,
+                            );
+                            app.status = "Plan → Build (approved)".into();
+                        }
                         send(
                             app,
                             "Implement the active plan in ~/pixie. Do not write ~/.config/plan. Follow the cached plan.",
@@ -743,11 +771,57 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
     }
 
     if crate::grove_keys::is_cycle_next(k.code, k.modifiers) {
+        let from = app.rune_key();
         app.rune_idx = runes::next_idx(app.rune_idx);
+        let to = app.rune_key();
+        if from != to {
+            let from_name = runes::all()
+                .iter()
+                .find(|r| r.key == from)
+                .map(|r| r.name)
+                .unwrap_or(from.as_str());
+            let to_name = runes::all()
+                .iter()
+                .find(|r| r.key == to)
+                .map(|r| r.name)
+                .unwrap_or(to.as_str());
+            mind::append_transition(
+                &app.session_id,
+                from.as_str(),
+                to.as_str(),
+                "user_cycled",
+                &format!("Switched modes: {from_name} → {to_name} (Tab/Shift+Tab)."),
+                None,
+            );
+            app.status = format!("switched {from_name} → {to_name}");
+        }
         return Ok(KeyOut::Continue);
     }
     if crate::grove_keys::is_cycle_previous(k.code, k.modifiers) {
+        let from = app.rune_key();
         app.rune_idx = runes::prev_idx(app.rune_idx);
+        let to = app.rune_key();
+        if from != to {
+            let from_name = runes::all()
+                .iter()
+                .find(|r| r.key == from)
+                .map(|r| r.name)
+                .unwrap_or(from.as_str());
+            let to_name = runes::all()
+                .iter()
+                .find(|r| r.key == to)
+                .map(|r| r.name)
+                .unwrap_or(to.as_str());
+            mind::append_transition(
+                &app.session_id,
+                from.as_str(),
+                to.as_str(),
+                "user_cycled",
+                &format!("Switched modes: {from_name} → {to_name} (Shift+Tab)."),
+                None,
+            );
+            app.status = format!("switched {from_name} → {to_name}");
+        }
         return Ok(KeyOut::Continue);
     }
 
@@ -1289,6 +1363,9 @@ fn send(app: &mut App, text: &str) {
             raw: String::new(),
             think: String::new(),
             cancelled: false,
+            from_rune: String::new(),
+            to_rune: String::new(),
+            reason: String::new(),
         },
         None,
     );

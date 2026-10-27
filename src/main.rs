@@ -134,6 +134,9 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
             raw: String::new(),
             think: String::new(),
             cancelled: false,
+            from_rune: String::new(),
+            to_rune: String::new(),
+            reason: String::new(),
         },
         None,
     );
@@ -163,6 +166,9 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
             raw: String::new(),
             think: out.think.clone(),
             cancelled: out.cancelled,
+            from_rune: String::new(),
+            to_rune: String::new(),
+            reason: String::new(),
         },
         None,
     );

@@ -76,6 +76,23 @@ pub fn system_prompt(rune: &Rune, session_id: &str, cwd: &str) -> String {
             ));
         }
     }
+    if let Some((from, to, reason, _)) = mind::last_transition(session_id, None) {
+        if !to.is_empty() && to == rune.key.as_str() {
+            extra.push_str("\n\n## Mode transition\n");
+            if from.is_empty() {
+                extra.push_str(&format!(
+                    "Switched to {} mode. Reason: {}.\n",
+                    rune.name, reason
+                ));
+            } else {
+                extra.push_str(&format!(
+                    "Switched from {} to {} mode. Reason: {}.\n",
+                    from, rune.name, reason
+                ));
+            }
+            extra.push_str("Preserve relevant context from the previous mode. Follow the tools available in this mode.\n");
+        }
+    }
     let persona = persona_block();
     format!(
         "{persona}\n\nHost card:\n{host_card}\n\n{pack}\n\n{}\n\nCurrent working directory: {cwd}\nUse real, existing paths.\n\nHouse memory:\n{mem}\n{extra}\n\n{}\n\nAvailable tools in this mode:\n{tools_block}",
@@ -208,6 +225,9 @@ pub fn commit_compact(chat: &mut Vec<ChatEntry>, session_id: &str, text: String)
             raw: String::new(),
             think: String::new(),
             cancelled: false,
+            from_rune: String::new(),
+            to_rune: String::new(),
+            reason: String::new(),
         },
         None,
     );
@@ -466,6 +486,9 @@ pub fn run_turn(
                         raw: first.chars().take(1200).collect(),
                         think: think_txt.clone(),
                         cancelled: false,
+                        from_rune: String::new(),
+                        to_rune: String::new(),
+                        reason: String::new(),
                     },
                     None,
                 );
@@ -591,6 +614,9 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
             }
         }
         match rec.get("role").and_then(|x| x.as_str()).unwrap_or("") {
+            "transition" => {
+                continue;
+            }
             "user" => chat.push(ChatEntry::User(
                 rec.get("text")
                     .and_then(|x| x.as_str())

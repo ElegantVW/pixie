@@ -507,12 +507,101 @@ pub struct SessionRec {
     pub think: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_rune: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub to_rune: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+impl Default for SessionRec {
+    fn default() -> Self {
+        Self {
+            ts: String::new(),
+            role: String::new(),
+            rune: String::new(),
+            text: String::new(),
+            tool: String::new(),
+            args: None,
+            result: None,
+            raw: String::new(),
+            think: String::new(),
+            cancelled: false,
+            from_rune: String::new(),
+            to_rune: String::new(),
+            reason: String::new(),
+        }
+    }
 }
 
 pub fn session_path(id: &str, dir: Option<&Path>) -> PathBuf {
     dir.map(|d| d.to_path_buf())
         .unwrap_or_else(paths::sessions_dir)
         .join(format!("{id}.jsonl"))
+}
+
+pub fn append_transition(
+    id: &str,
+    from_rune: &str,
+    to_rune: &str,
+    reason: &str,
+    text: &str,
+    dir: Option<&std::path::Path>,
+) {
+    append_session(
+        id,
+        &SessionRec {
+            ts: now_ts(),
+            role: "transition".into(),
+            rune: to_rune.into(),
+            text: text.into(),
+            tool: String::new(),
+            args: None,
+            result: None,
+            raw: String::new(),
+            think: String::new(),
+            cancelled: false,
+            from_rune: from_rune.into(),
+            to_rune: to_rune.into(),
+            reason: reason.into(),
+        },
+        dir,
+    );
+}
+
+pub fn last_transition(id: &str, dir: Option<&Path>) -> Option<(String, String, String, String)> {
+    let recs = read_session(id, dir);
+    for rec in recs.into_iter().rev() {
+        if rec.get("role").and_then(|x| x.as_str()) == Some("transition") {
+            let from = rec
+                .get("from_rune")
+                .and_then(|x| x.as_str())
+                .or_else(|| rec.get("from").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let to = rec
+                .get("to_rune")
+                .and_then(|x| x.as_str())
+                .or_else(|| rec.get("to").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let reason = rec
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = rec
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !from.is_empty() || !to.is_empty() {
+                return Some((from, to, reason, text));
+            }
+        }
+    }
+    None
 }
 
 pub fn append_session(id: &str, rec: &SessionRec, dir: Option<&Path>) {
@@ -1982,6 +2071,9 @@ mod tests {
                 raw: String::new(),
                 think: String::new(),
                 cancelled: false,
+                from_rune: String::new(),
+                to_rune: String::new(),
+                reason: String::new(),
             },
             Some(&dir),
         );
@@ -2021,6 +2113,9 @@ mod tests {
                 raw: String::new(),
                 think: String::new(),
                 cancelled: false,
+                from_rune: String::new(),
+                to_rune: String::new(),
+                reason: String::new(),
             },
             Some(&dir),
         );
