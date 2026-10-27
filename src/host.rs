@@ -128,7 +128,7 @@ pub fn card_text(
         ),
         format!("term: {term}"),
         format!("session: {session}"),
-        format!("house PATH: ~/bin:~/.local/bin"),
+        "house PATH: ~/bin:~/.local/bin".to_string(),
     ];
     if !cpu.is_empty() {
         if cores > 0 {

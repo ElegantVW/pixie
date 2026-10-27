@@ -61,7 +61,7 @@ pub fn alias(name: &str) -> &str {
     }
 }
 
-fn first_str<'a>(m: &'a Map<String, Value>, keys: &[&str]) -> String {
+fn first_str(m: &Map<String, Value>, keys: &[&str]) -> String {
     for k in keys {
         if let Some(v) = m.get(*k) {
             if let Some(s) = v.as_str() {

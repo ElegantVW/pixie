@@ -643,7 +643,7 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
                 }
                 chat.push(ChatEntry::Tool {
                     name: name.into(),
-                    title: format!("{name}"),
+                    title: name.to_string(),
                     body: tools::tool_body(name, &args, &result, true),
                     file: tools::touch_from_rec(name, &args, &result),
                     think,

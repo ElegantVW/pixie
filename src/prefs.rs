@@ -28,7 +28,7 @@ pub fn load_ui() -> anyhow::Result<UiPrefs> {
 }
 
 fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
-    let t = match fs::read_to_string(&path) {
+    let t = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(UiPrefs::default()),
         Err(error) => return Err(anyhow::anyhow!("reading {}: {error}", path.display())),

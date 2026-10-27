@@ -261,7 +261,7 @@ pub fn askpass_client() -> i32 {
     if buf.is_empty() {
         return 1;
     }
-    print!("{buf}\n");
+    println!("{buf}");
     let _ = std::io::stdout().flush();
     0
 }

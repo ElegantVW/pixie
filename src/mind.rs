@@ -169,9 +169,8 @@ pub fn rewrite_bash(command: &str, spells: &HashMap<String, Spell>) -> Result<Ve
     }
     let argv: Vec<String> = argv.into_iter().map(|a| expand_tilde(&a)).collect();
     if spells.contains_key(&argv[0]) {
-        match resolve_spell(&argv[0], &argv[1..], spells) {
-            Ok(r) => return Ok(r.argv),
-            Err(_) => {}
+        if let Ok(r) = resolve_spell(&argv[0], &argv[1..], spells) {
+            return Ok(r.argv);
         }
     }
     Ok(argv)
@@ -435,7 +434,7 @@ fn chrono_today() -> String {
     let mut y = 1970u32;
     let mut rem = days;
     loop {
-        let ly = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let ly = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
         let yl = if ly { 366 } else { 365 };
         if rem >= yl {
             rem -= yl;
@@ -444,7 +443,7 @@ fn chrono_today() -> String {
             break;
         }
     }
-    let ly = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let ly = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let md = [
         31,
         if ly { 29 } else { 28 },

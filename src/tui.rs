@@ -889,10 +889,8 @@ fn handle_door_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 app.rename = Some(row.name.clone());
             }
         }
-        KeyCode::Char('d') if !ctrl(k) => {
-            if app.session_rows.get(app.session_idx).is_some() {
-                app.delete_ask = true;
-            }
+        KeyCode::Char('d') if !ctrl(k) && app.session_rows.get(app.session_idx).is_some() => {
+            app.delete_ask = true;
         }
         _ => {}
     }
@@ -983,7 +981,7 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         KeyCode::Left => cycle_option(app, -1),
         KeyCode::Right => cycle_option(app, 1),
         KeyCode::Enter => match app.opt_idx {
-            0 | 1 | 2 => apply_mouth_async(app),
+            0..=2 => apply_mouth_async(app),
             3 => open_persona(app),
             4 => {
                 app.sparkle = !app.sparkle;
