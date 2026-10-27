@@ -136,6 +136,8 @@ struct App {
     verbose: bool,
     sparkle: bool,
     default_rune: RuneKey,
+    build_audit_rounds: bool,
+    sudo_less_safe: bool,
     help: bool,
     busy: bool,
     waking: bool,
@@ -143,6 +145,7 @@ struct App {
     door: bool,
     options: bool,
     opt_idx: usize,
+    opt_hits: Vec<Rect>,
     mouth: prefs::Mouth,
     mouth_note: String,
     mouth_busy: bool,
@@ -197,6 +200,8 @@ fn persist_ui(app: &App) {
         verbose: app.verbose,
         sparkle: app.sparkle,
         rune: app.default_rune,
+        build_audit_rounds: app.build_audit_rounds,
+        sudo_less_safe: app.sudo_less_safe,
     }) {
         eprintln!("pixie: could not save house preferences: {error}");
     }
@@ -235,6 +240,8 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         verbose: verbose || ui.verbose,
         sparkle: ui.sparkle,
         default_rune: ui.rune,
+        build_audit_rounds: ui.build_audit_rounds,
+        sudo_less_safe: ui.sudo_less_safe,
         help: false,
         busy: false,
         waking,
@@ -242,6 +249,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         door,
         options: false,
         opt_idx: 0,
+        opt_hits: Vec::new(),
         mouth: prefs::pixie_mouth(),
         mouth_note: String::new(),
         mouth_busy: false,
@@ -344,6 +352,57 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
                         let row = m.row;
                         if app.door && !app.options && !app.session_menu {
                             handle_dash_click(&mut app, col, row);
+                        }
+                        if app.options {
+                            for (i, rect) in app.opt_hits.iter().enumerate() {
+                                if col >= rect.x
+                                    && col < rect.x.saturating_add(rect.width)
+                                    && row >= rect.y
+                                    && row < rect.y.saturating_add(rect.height)
+                                {
+                                    app.opt_idx = i;
+                                    // toggle/cycle on click
+                                    if i <= 2 {
+                                        apply_mouth_async(&mut app);
+                                    } else if i == 3 {
+                                        open_persona(&mut app);
+                                    } else if i == 4 {
+                                        app.sparkle = !app.sparkle;
+                                        persist_ui(&mut app);
+                                    } else if i == 5 {
+                                        app.verbose = !app.verbose;
+                                        persist_ui(&mut app);
+                                    } else if i == 6 {
+                                        app.default_rune = app.default_rune.next();
+                                        if app.door {
+                                            app.rune_idx = runes::idx_of(app.default_rune);
+                                        }
+                                        persist_ui(&mut app);
+                                    } else if i == 7 {
+                                        app.status =
+                                            "eye is sleeping — no vision GGUF on disk".into();
+                                    } else if i == 8 {
+                                        app.status = "Imp hops the GPU; park Pixie first".into();
+                                    } else if i == 9 {
+                                        app.build_audit_rounds = !app.build_audit_rounds;
+                                        persist_ui(&mut app);
+                                        app.status = format!(
+                                            "build audit rounds: {}",
+                                            if app.build_audit_rounds { "on" } else { "off" }
+                                        );
+                                    } else if i == 10 {
+                                        app.sudo_less_safe = !app.sudo_less_safe;
+                                        persist_ui(&mut app);
+                                        app.status = format!(
+                                            "sudo less-safe: {}",
+                                            if app.sudo_less_safe { "on" } else { "off" }
+                                        );
+                                    } else if i == 11 {
+                                        toggle_sudo(&mut app);
+                                    }
+                                    break;
+                                }
+                            }
                         }
                         for (rect, fi) in &app.file_hits {
                             if col >= rect.x
@@ -871,11 +930,15 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         KeyCode::Char('l') if ctrl(k) => open_look(app),
         KeyCode::Char('o') if ctrl(k) => request_open(app),
         KeyCode::Enter => {
-            let text = app.buf.trim().to_string();
-            if !text.is_empty() {
-                app.buf.clear();
-                app.cursor = 0;
-                send(app, &text);
+            if k.modifiers.contains(KeyModifiers::SHIFT) {
+                insert_text(&mut app.buf, &mut app.cursor, "\n");
+            } else {
+                let text = app.buf.trim().to_string();
+                if !text.is_empty() {
+                    app.buf.clear();
+                    app.cursor = 0;
+                    send(app, &text);
+                }
             }
         }
         KeyCode::Backspace => {
@@ -1015,8 +1078,9 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 if pw.is_empty() {
                     app.status = "sudo still off".into();
                 } else {
-                    match privilege::enable_secret(pw) {
-                        Ok(()) => app.status = "sudo on · sitting".into(),
+                    // Try sitting first; could be extended to choose mode
+                    match privilege::enable_less_safe(pw) {
+                        Ok(()) => app.status = "sudo on · less-safe".into(),
                         Err(e) => app.status = format!("sudo setup failed: {e}"),
                     }
                 }
@@ -1040,7 +1104,7 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 }
 
 fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
-    const N: usize = 10;
+    const N: usize = 12;
     match k.code {
         KeyCode::Esc => {
             app.options = false;
@@ -1074,7 +1138,23 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             }
             7 => app.status = "eye is sleeping — no vision GGUF on disk".into(),
             8 => app.status = "Imp hops the GPU; park Pixie first".into(),
-            9 => toggle_sudo(app),
+            9 => {
+                app.build_audit_rounds = !app.build_audit_rounds;
+                persist_ui(app);
+                app.status = format!(
+                    "build audit rounds: {}",
+                    if app.build_audit_rounds { "on" } else { "off" }
+                );
+            }
+            10 => {
+                app.sudo_less_safe = !app.sudo_less_safe;
+                persist_ui(app);
+                app.status = format!(
+                    "sudo less-safe: {}",
+                    if app.sudo_less_safe { "on" } else { "off" }
+                );
+            }
+            11 => toggle_sudo(app),
             _ => {}
         },
         _ => {}
@@ -1122,7 +1202,15 @@ fn cycle_option(app: &mut App, dir: i32) {
             }
             persist_ui(app);
         }
-        9 => toggle_sudo(app),
+        9 => {
+            app.build_audit_rounds = !app.build_audit_rounds;
+            persist_ui(app);
+        }
+        10 => {
+            app.sudo_less_safe = !app.sudo_less_safe;
+            persist_ui(app);
+        }
+        11 => toggle_sudo(app),
         _ => {}
     }
 }
@@ -1139,7 +1227,7 @@ fn toggle_sudo(app: &mut App) {
         return;
     }
     app.sudo_buf = Some(String::new());
-    app.status = "sudo can leave $HOME · RAM only · 15 min".into();
+    app.status = "sudo: enter password (sitting). less-safe available via code/config".into();
 }
 
 fn open_persona(app: &mut App) {
@@ -2031,7 +2119,8 @@ fn draw_door_card(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
-fn draw_options_card(f: &mut Frame, area: Rect, app: &App) {
+fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
+    app.opt_hits.clear();
     let persona = if prefs::persona_text().is_some() {
         "overlay"
     } else {
@@ -2045,6 +2134,8 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &App) {
         "ready"
     };
     let ctx_s = app.mouth.ctx.to_string();
+    let audit = if app.build_audit_rounds { "on" } else { "off" };
+    let less_safe = if app.sudo_less_safe { "on" } else { "off" };
     let rows = [
         ("Model", app.mouth.model.as_str()),
         ("Backend", app.mouth.backend.as_str()),
@@ -2055,20 +2146,40 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &App) {
         ("Rune", app.default_rune.as_str()),
         ("Eye", eye),
         ("Imp", "hop · one GPU tenant"),
+        ("Audit", audit),
+        ("LessSafe", less_safe),
         ("Sudo", privilege::status_label()),
     ];
     let mut t = String::from(
-        "left/right cycle  ·  enter apply  ·  C-o persona\nSudo is RAM only · 15 min · she can leave $HOME\n\n",
+        "mouse/sliders-like ◀▶ or click  ·  enter toggle/apply\nSudo: off/ticket/sitting (less-safe optional)\n\n",
     );
     for (i, (label, val)) in rows.iter().enumerate() {
         let mark = if i == app.opt_idx { "▸ " } else { "  " };
-        t.push_str(&format!("{mark}{label:<8}  {val}\n"));
+        t.push_str(&format!("{mark}{label:<10}  {val}\n"));
     }
     if !app.status.is_empty() {
         t.push('\n');
         t.push_str(&app.status);
     }
     f.render_widget(Clear, area);
+    let block_area = area;
+    let inner = Rect {
+        x: block_area.x + 1,
+        y: block_area.y + 3,
+        width: block_area.width.saturating_sub(2),
+        height: 12,
+    };
+    for i in 0..rows.len() {
+        let y = inner.y + i as u16;
+        if y < inner.y + inner.height {
+            app.opt_hits.push(Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            });
+        }
+    }
     f.render_widget(
         Paragraph::new(t)
             .wrap(Wrap { trim: false })
@@ -2586,11 +2697,17 @@ fn file_bubble(
 
 fn diff_line(op: Op, text: &str) -> Line<'static> {
     match op {
-        Op::Add => Line::from(Span::styled(
-            format!("+ {text}"),
-            Style::default().fg(GREEN),
-        )),
-        Op::Del => Line::from(Span::styled(format!("- {text}"), Style::default().fg(RED))),
+        Op::Add => Line::from(vec![
+            Span::styled(
+                "+ ",
+                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text.to_string(), Style::default().fg(GREEN)),
+        ]),
+        Op::Del => Line::from(vec![
+            Span::styled("- ", Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(text.to_string(), Style::default().fg(RED)),
+        ]),
         Op::Eq => Line::from(Span::styled(
             format!("  {text}"),
             Style::default().fg(SILVER),

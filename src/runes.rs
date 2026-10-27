@@ -153,6 +153,7 @@ pub fn all() -> Vec<Rune> {
                 "2. edit_local_file for a few lines (old_string unique). write_local_file for new files or a full rewrite.\n",
                 "3. Verify with execute_bash (cargo test, real shell so && works).\n",
                 "4. Report: files changed, how verified. Do not write ~/.config/plan or overwrite unrelated house markdown.\n",
+                "5. Self-audit rounds (default on): analysis → testing/diagnosis → docs/update notes → commit (if requested/clean) → push. Do each round explicitly, report findings, and make each round optional per user preference.\n",
                 "If an active plan is in the system prompt, follow it.\n",
                 "Tool calls: EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}}."
             ),

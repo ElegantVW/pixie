@@ -11,6 +11,8 @@ pub struct UiPrefs {
     pub verbose: bool,
     pub sparkle: bool,
     pub rune: RuneKey,
+    pub build_audit_rounds: bool,
+    pub sudo_less_safe: bool,
 }
 
 impl Default for UiPrefs {
@@ -19,6 +21,8 @@ impl Default for UiPrefs {
             verbose: false,
             sparkle: true,
             rune: RuneKey::Chat,
+            build_audit_rounds: true,
+            sudo_less_safe: false,
         }
     }
 }
@@ -44,6 +48,14 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
         verbose: v.get("verbose").and_then(|x| x.as_bool()).unwrap_or(false),
         sparkle: v.get("sparkle").and_then(|x| x.as_bool()).unwrap_or(true),
         rune,
+        build_audit_rounds: v
+            .get("build_audit_rounds")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
+        sudo_less_safe: v
+            .get("sudo_less_safe")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -56,6 +68,8 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
         "verbose": p.verbose,
         "sparkle": p.sparkle,
         "rune": p.rune.as_str(),
+        "build_audit_rounds": p.build_audit_rounds,
+        "sudo_less_safe": p.sudo_less_safe,
     })
     .to_string();
     paths::write_atomic(&path, contents.as_bytes())

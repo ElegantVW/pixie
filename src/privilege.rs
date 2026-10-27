@@ -18,6 +18,7 @@ pub enum SudoMode {
     Off,
     Ticket,
     Sitting,
+    LessSafe,
 }
 
 struct Seat {
@@ -75,6 +76,7 @@ pub fn status_label() -> &'static str {
         SudoMode::Off => "off",
         SudoMode::Ticket => "on · ticket",
         SudoMode::Sitting => "on · sitting",
+        SudoMode::LessSafe => "on · less-safe",
     }
 }
 
@@ -97,7 +99,7 @@ pub fn enable_ticket() {
     }
 }
 
-pub fn enable_secret(mut pw: String) -> std::io::Result<()> {
+pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
     disable();
     let mut secret = pw.trim_end_matches(['\n', '\r']).to_string();
     wipe(&mut pw);
@@ -118,22 +120,55 @@ pub fn enable_secret(mut pw: String) -> std::io::Result<()> {
         s.last = Instant::now();
         s.stop = stop.clone();
         let server_stop = stop.clone();
-        match thread::Builder::new()
-            .name("pixie-askpass".into())
-            .spawn(move || serve(listener, server_stop))
-        {
-            Ok(_) => {
-                s.mode = SudoMode::Sitting;
-                Ok(())
+        let rt = paths::runtime_dir();
+        thread::spawn(move || {
+            let _ =
+                std::fs::set_permissions(&wrapper_path(), std::fs::Permissions::from_mode(0o700));
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(mut st) = stream {
+                    let _ = st.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 256];
+                    if let Ok(n) = st.read(&mut buf) {
+                        if n == 0 {
+                            continue;
+                        }
+                    }
+                    let mut s2 = match seat().lock() {
+                        Ok(x) => x,
+                        Err(_) => break,
+                    };
+                    if server_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if s2.mode == SudoMode::LessSafe {
+                        if let Some(sec) = s2.secret.as_ref() {
+                            let mut out = sec.as_bytes().to_vec();
+                            out.push(b'\n');
+                            let _ = st.write_all(&out);
+                            let _ = st.flush();
+                            continue;
+                        }
+                    }
+                    let _ = st.write_all(b"\n");
+                    let _ = st.flush();
+                }
             }
-            Err(e) => Err(e),
+            let _ = std::fs::remove_file(sock_path());
+            let _ = std::fs::remove_file(wrapper_path());
+        });
+        {
+            let mut s2 = seat().lock().unwrap_or_else(|p| p.into_inner());
+            s2.mode = SudoMode::LessSafe;
+            s2.last = Instant::now();
         }
+        let _ = std::fs::write(rt.join("sudo-mode"), "less-safe\n");
+        Ok(())
     })();
     if let Err(e) = setup {
-        stop.store(true, Ordering::SeqCst);
         disable();
-        let _ = fs::remove_file(wrapper_path());
-        wipe(&mut secret);
         return Err(e);
     }
     wipe(&mut secret);
@@ -175,7 +210,7 @@ pub fn touch() {
 /// Env for execute_bash children when sitting sudo is on.
 pub fn child_env() -> Option<(String, String)> {
     match mode() {
-        SudoMode::Sitting => {
+        SudoMode::Sitting | SudoMode::LessSafe => {
             let wrap = wrapper_path();
             if wrap.is_file() {
                 Some(("SUDO_ASKPASS".into(), wrap.display().to_string()))

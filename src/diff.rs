@@ -43,6 +43,7 @@ pub struct FileTouch {
     pub lines: Vec<DiffLine>,
     pub binary: bool,
     pub extra_paths: Vec<String>,
+    pub collapsed: bool,
 }
 
 impl FileTouch {

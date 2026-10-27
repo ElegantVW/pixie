@@ -442,6 +442,7 @@ pub fn run_tool(
                                 lines: Vec::new(),
                                 binary: true,
                                 extra_paths: Vec::new(),
+                                collapsed: false,
                             });
                             return json!({
                                 "path": p.display().to_string(),
@@ -481,6 +482,7 @@ pub fn run_tool(
                             lines: preview,
                             binary: false,
                             extra_paths: Vec::new(),
+                            collapsed: false,
                         });
                         json!({
                             "path": p.display().to_string(),
@@ -533,6 +535,7 @@ pub fn run_tool(
                                 lines,
                                 binary,
                                 extra_paths: Vec::new(),
+                                collapsed: false,
                             });
                             json!({
                                 "path": p.display().to_string(),
@@ -589,6 +592,7 @@ pub fn run_tool(
                                             lines,
                                             binary: false,
                                             extra_paths: Vec::new(),
+                                            collapsed: false,
                                         });
                                         json!({
                                             "path": p.display().to_string(),
@@ -644,6 +648,7 @@ pub fn run_tool(
                                     .collect(),
                                 binary: false,
                                 extra_paths: extra.clone(),
+                                collapsed: false,
                             });
                         }
                         json!({"path": p.display().to_string(), "pattern": pattern, "hits": hits, "count": hits.len()})
@@ -709,6 +714,7 @@ pub fn run_tool(
                         .collect(),
                     binary: false,
                     extra_paths: extra.clone(),
+                    collapsed: false,
                 });
             }
             r
@@ -800,6 +806,7 @@ pub fn run_tool(
                     lines: preview,
                     binary: false,
                     extra_paths: Vec::new(),
+                    collapsed: false,
                 });
             }
             r
@@ -989,6 +996,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 lines: Vec::new(),
                 binary: false,
                 extra_paths: Vec::new(),
+                collapsed: false,
             })
         }
         "write_local_file" | "edit_local_file" => {
@@ -1012,6 +1020,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false),
                 extra_paths: Vec::new(),
+                collapsed: false,
             })
         }
         "search_house" | "grep_files" => {
@@ -1025,6 +1034,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 lines: Vec::new(),
                 binary: false,
                 extra_paths: extra,
+                collapsed: false,
             })
         }
         "write_plan" => {
@@ -1037,6 +1047,7 @@ pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTo
                 lines: Vec::new(),
                 binary: false,
                 extra_paths: Vec::new(),
+                collapsed: false,
             })
         }
         _ => None,
