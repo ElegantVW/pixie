@@ -131,26 +131,27 @@ pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
                         let _ = st.set_read_timeout(Some(Duration::from_secs(2)));
                         let mut buf = [0u8; 256];
                         let _ = st.read(&mut buf);
-                        let mut s2 = match seat().lock() {
-                            Ok(x) => x,
-                            Err(_) => break,
-                        };
-                        if server_stop.load(Ordering::SeqCst) {
-                            drop(s2);
-                            break;
-                        }
-                        if s2.mode == SudoMode::LessSafe {
-                            if let Some(sec) = s2.secret.as_ref() {
-                                let mut out = sec.as_bytes().to_vec();
-                                out.push(b'\n');
-                                let _ = st.write_all(&out);
-                                let _ = st.flush();
-                                drop(s2);
-                                drop(st);
-                                continue;
+                        let secret_copy = {
+                            let mut s2 = match seat().lock() {
+                                Ok(x) => x,
+                                Err(_) => break,
+                            };
+                            if server_stop.load(Ordering::SeqCst) {
+                                None
+                            } else if s2.mode == SudoMode::LessSafe {
+                                s2.secret.as_ref().map(|sec| sec.clone())
+                            } else {
+                                None
                             }
+                        };
+                        if let Some(sec) = secret_copy {
+                            let mut out = sec.as_bytes().to_vec();
+                            out.push(b'\n');
+                            let _ = st.write_all(&out);
+                            let _ = st.flush();
+                            drop(st);
+                            continue;
                         }
-                        drop(s2);
                         let _ = st.write_all(b"\n");
                         let _ = st.flush();
                         drop(st);
