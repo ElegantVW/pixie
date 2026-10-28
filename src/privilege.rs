@@ -127,10 +127,6 @@ pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
             while !server_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut st, _)) => {
-                        touch();
-                        let _ = st.set_read_timeout(Some(Duration::from_secs(2)));
-                        let mut buf = [0u8; 256];
-                        let _ = st.read(&mut buf);
                         let secret_copy = {
                             let mut s2 = match seat().lock() {
                                 Ok(x) => x,
