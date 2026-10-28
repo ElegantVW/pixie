@@ -315,6 +315,21 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
             if app.door {
                 open_dashboard(&mut app);
             }
+        } else if app.splash && app.waking {
+            // Don't dismiss splash while waiting for menagerie; if it's taking long, keep showing it
+            // but ensure we eventually proceed when wake completes or after a grace period
+            if app.born.elapsed() >= Duration::from_secs(30) {
+                // Give up waiting gracefully, let user see status
+                app.splash = false;
+                if app.door {
+                    open_dashboard(&mut app);
+                }
+            }
+        } else if app.splash && app.born.elapsed() >= SPLASH_MIN {
+            app.splash = false;
+            if app.door {
+                open_dashboard(&mut app);
+            }
         }
         term.draw(|f| draw(f, &mut app))?;
         if let Some(path) = app.pending_editor.take() {
