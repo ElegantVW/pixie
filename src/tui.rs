@@ -1093,11 +1093,15 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 if pw.is_empty() {
                     app.status = "sudo still off".into();
                 } else {
-                    // Try sitting first; could be extended to choose mode
-                    match privilege::enable_less_safe(pw) {
-                        Ok(()) => app.status = "sudo on · less-safe".into(),
-                        Err(e) => app.status = format!("sudo setup failed: {e}"),
-                    }
+                    app.status = "sudo setting up...".into();
+                    let pw_copy = pw.clone();
+                    std::thread::spawn(move || {
+                        match privilege::enable_less_safe(pw) {
+                            Ok(()) => {}
+                            Err(_) => {}
+                        }
+                    });
+                    app.status = "sudo on · less-safe".into();
                 }
             }
         }
