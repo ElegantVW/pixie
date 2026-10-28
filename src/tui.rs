@@ -312,12 +312,14 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
             handle_msg(&mut app, msg);
         }
         privilege::idle_tick();
-        if app.status.starts_with("sudo setting up") && !privilege::is_on() {
+        if app.status.starts_with("sudo setting up") {
             let sp = ["|", "/", "-", "\\"][app.sudo_spin as usize % 4];
             app.sudo_spin = app.sudo_spin.wrapping_add(1);
-            app.status = format!("sudo setting up {}", sp);
-        } else if app.status.starts_with("sudo setting up") && privilege::is_on() {
-            app.status = "sudo on · less-safe".into();
+            if privilege::is_on() {
+                app.status = "sudo on · less-safe".into();
+            } else {
+                app.status = format!("sudo setting up {}", sp);
+            }
         }
         if app.splash && !app.waking && app.born.elapsed() >= SPLASH_MIN {
             app.splash = false;
