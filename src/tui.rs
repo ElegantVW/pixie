@@ -151,6 +151,7 @@ struct App {
     mouth_busy: bool,
     compacting: bool,
     sudo_buf: Option<String>,
+    sudo_spin: u8,
     delete_ask: bool,
     live: String,
     live_think: String,
@@ -255,6 +256,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         mouth_busy: false,
         compacting: false,
         sudo_buf: None,
+        sudo_spin: 0,
         delete_ask: false,
         live: String::new(),
         live_think: String::new(),
@@ -310,6 +312,13 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
             handle_msg(&mut app, msg);
         }
         privilege::idle_tick();
+        if app.status.starts_with("sudo setting up") && !privilege::is_on() {
+            let sp = ["|", "/", "-", "\\"][app.sudo_spin as usize % 4];
+            app.sudo_spin = app.sudo_spin.wrapping_add(1);
+            app.status = format!("sudo setting up {}", sp);
+        } else if app.status.starts_with("sudo setting up") && privilege::is_on() {
+            app.status = "sudo on · less-safe".into();
+        }
         if app.splash && !app.waking && app.born.elapsed() >= SPLASH_MIN {
             app.splash = false;
             if app.door {
@@ -1093,7 +1102,8 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 if pw.is_empty() {
                     app.status = "sudo still off".into();
                 } else {
-                    app.status = "sudo setting up...".into();
+                    app.status = "sudo setting up |".into();
+                    app.sudo_spin = 0;
                     std::thread::spawn(move || {
                         let _ = privilege::enable_less_safe(pw);
                     });
