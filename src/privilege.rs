@@ -114,6 +114,8 @@ pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
     let setup = (|| -> std::io::Result<()> {
         write_wrapper()?;
         let listener = bind_server()?;
+        // Make it blocking for simplicity
+        listener.set_nonblocking(false)?;
         let mut s = seat().lock().unwrap_or_else(|p| p.into_inner());
         s.mode = SudoMode::Off;
         s.secret = Some(secret.clone());
@@ -124,41 +126,27 @@ pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
         thread::spawn(move || {
             let _ =
                 std::fs::set_permissions(&wrapper_path(), std::fs::Permissions::from_mode(0o700));
-            while !server_stop.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut st, _)) => {
-                        let _ = st.set_read_timeout(Some(Duration::from_secs(1)));
-                        let mut buf = [0u8; 64];
-                        let _ = st.read(&mut buf);
-                        let secret_copy = {
-                            let s2 = match seat().lock() {
-                                Ok(x) => x,
-                                Err(_) => break,
-                            };
-                            if server_stop.load(Ordering::SeqCst) {
-                                None
-                            } else if s2.mode == SudoMode::LessSafe {
-                                s2.secret.as_ref().map(|sec| sec.clone())
-                            } else {
-                                None
-                            }
-                        };
-                        if let Some(sec) = secret_copy {
-                            let mut out = sec.as_bytes().to_vec();
-                            out.push(b'\n');
-                            let _ = st.write_all(&out);
-                            let _ = st.flush();
-                            drop(st);
-                            continue;
-                        }
-                        let _ = st.write_all(b"\n");
+            for stream in listener.incoming() {
+                if server_stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if let Ok(mut st) = stream {
+                    let _ = st.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 64];
+                    let _ = st.read(&mut buf);
+                    let secret_copy = seat()
+                        .lock()
+                        .ok()
+                        .and_then(|s| if server_stop.load(Ordering::SeqCst) { None } else if s.mode == SudoMode::LessSafe { s.secret.clone() } else { None });
+                    if let Some(sec) = secret_copy {
+                        let mut out = sec.as_bytes().to_vec();
+                        out.push(b'\n');
+                        let _ = st.write_all(&out);
                         let _ = st.flush();
-                        drop(st);
+                        continue;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(40));
-                    }
-                    Err(_) => break,
+                    let _ = st.write_all(b"\n");
+                    let _ = st.flush();
                 }
             }
             let _ = std::fs::remove_file(sock_path());
