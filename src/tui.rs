@@ -118,6 +118,9 @@ enum UiMsg {
     SudoReady {
         err: Option<String>,
     },
+    Spoke {
+        err: Option<String>,
+    },
     Done {
         gen: u64,
         text: String,
@@ -144,6 +147,7 @@ struct App {
     session_name: String,
     verbose: bool,
     sparkle: bool,
+    speak_on: bool,
     default_rune: RuneKey,
     build_audit_rounds: bool,
     sudo_less_safe: bool,
@@ -214,10 +218,47 @@ enum KeyOut {
     Quit,
 }
 
+fn toggle_speak(app: &mut App) {
+    app.speak_on = !app.speak_on;
+    persist_ui(app);
+    if app.speak_on {
+        if !crate::speak::ready() {
+            app.status = crate::speak::sleeping_reason();
+        } else {
+            app.status = format!("tongue: {}", crate::speak::SPEAKER);
+            warm_tongue(app);
+        }
+    } else {
+        crate::speak::stop_sidecar();
+        app.status = "tongue off".into();
+    }
+}
+
+fn warm_tongue(app: &App) {
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        crate::forge::set_phase("warming tongue");
+        let err = crate::speak::ensure_sidecar().err();
+        crate::forge::clear_phase();
+        let _ = tx.send(UiMsg::Spoke { err });
+    });
+}
+
+fn spawn_say(app: &App, text: String) {
+    let tx = app.tx.clone();
+    std::thread::spawn(move || {
+        crate::forge::set_phase("speaking");
+        let err = crate::speak::say(&text).err();
+        crate::forge::clear_phase();
+        let _ = tx.send(UiMsg::Spoke { err });
+    });
+}
+
 fn persist_ui(app: &App) {
     if let Err(error) = prefs::save_ui(&prefs::UiPrefs {
         verbose: app.verbose,
         sparkle: app.sparkle,
+        speak_on: app.speak_on,
         rune: app.default_rune,
         build_audit_rounds: app.build_audit_rounds,
         sudo_less_safe: app.sudo_less_safe,
@@ -260,6 +301,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         session_name,
         verbose: verbose || ui.verbose,
         sparkle: ui.sparkle,
+        speak_on: ui.speak_on,
         default_rune: ui.rune,
         build_audit_rounds: ui.build_audit_rounds,
         sudo_less_safe: ui.sudo_less_safe,
@@ -311,6 +353,9 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         kitty_frame: HashMap::new(),
         kitty_sent: HashMap::new(),
     };
+    if app.speak_on {
+        warm_tongue(&app);
+    }
     if app.waking {
         let tx = app.tx.clone();
         std::thread::spawn(move || {
@@ -473,6 +518,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         event::DisableBracketedPaste
     )?;
     compact_on_quit(&app);
+    crate::speak::stop_sidecar();
     privilege::disable();
     if std::env::var("PIXIE_STOP_LLM_ON_EXIT").is_ok() {
         llm::unload();
@@ -595,6 +641,11 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                 app.status = "mouth applied".into();
             }
         }
+        UiMsg::Spoke { err } => {
+            if let Some(e) = err {
+                app.status = e;
+            }
+        }
         UiMsg::Done {
             gen,
             text,
@@ -645,6 +696,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                     None,
                 );
             } else if !text.trim().is_empty() {
+                let speak_text = text.clone();
                 app.chat.push(ChatEntry::Assistant {
                     text: text.clone(),
                     clock: agent::clock_now(),
@@ -670,6 +722,9 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                     },
                     None,
                 );
+                if app.speak_on {
+                    spawn_say(app, speak_text);
+                }
             }
             app.live.clear();
             app.phase.clear();
@@ -966,6 +1021,9 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
+        KeyCode::Char('v') if !ctrl(k) && app.buf.is_empty() => {
+            toggle_speak(app);
+        }
         KeyCode::Char('h') if ctrl(k) => app.help = !app.help,
         KeyCode::Char('s') if ctrl(k) && !app.busy => {
             app.plan_menu = false;
@@ -1173,7 +1231,7 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 }
 
 fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
-    const N: usize = 15;
+    const N: usize = 16;
     match k.code {
         KeyCode::Esc => {
             app.options = false;
@@ -1232,27 +1290,28 @@ fn cycle_option(app: &mut App, dir: i32) {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        7 => {
+        7 => toggle_speak(app),
+        8 => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        10 => {
+        11 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
         }
-        11 => cycle_art_dir(app, dir),
-        12 => {
+        12 => cycle_art_dir(app, dir),
+        13 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
         }
-        13 => {
+        14 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
         }
-        14 => toggle_sudo(app),
+        15 => toggle_sudo(app),
         _ => {}
     }
 }
@@ -1269,22 +1328,23 @@ fn activate_option(app: &mut App) {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        7 => {
+        7 => toggle_speak(app),
+        8 => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        8 => {
+        9 => {
             app.status = if prefs::eye_asleep() {
                 "eye is sleeping — no mmproj on disk".into()
             } else {
                 "look hops the GPU (park 8B, VL 7B, restore Chat)".into()
             };
         }
-        9 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
-        10 => {
+        10 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
+        11 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
             app.status = format!(
@@ -1292,11 +1352,11 @@ fn activate_option(app: &mut App) {
                 if app.enhance_image { "on" } else { "off" }
             );
         }
-        11 => {
+        12 => {
             cycle_art_dir(app, 1);
             app.status = format!("art folder: {}", app.art_dir);
         }
-        12 => {
+        13 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
             app.status = format!(
@@ -1304,7 +1364,7 @@ fn activate_option(app: &mut App) {
                 if app.build_audit_rounds { "on" } else { "off" }
             );
         }
-        13 => {
+        14 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
             app.status = format!(
@@ -1312,7 +1372,7 @@ fn activate_option(app: &mut App) {
                 if app.sudo_less_safe { "on" } else { "off" }
             );
         }
-        14 => toggle_sudo(app),
+        15 => toggle_sudo(app),
         _ => {}
     }
 }
@@ -1454,8 +1514,13 @@ fn refresh_mouth_note(app: &mut App) {
     } else {
         "eye"
     };
+    let tongue = if crate::speak::ready() {
+        "tongue vivian"
+    } else {
+        "tongue asleep"
+    };
     app.mouth_note = format!(
-        "pixie {p} {} {} · kur {k} · {eye}",
+        "pixie {p} {} {} · kur {k} · {eye} · {tongue}",
         app.mouth.backend, app.mouth.ctx
     );
 }
@@ -1975,10 +2040,13 @@ fn prompt_text(app: &App, rune_desc: &str) -> (String, bool) {
             false,
         );
     }
-    if app.busy {
-        if let Some(p) = crate::forge::phase_status(spin) {
+    if let Some(p) = crate::forge::phase_status(spin) {
+        if app.busy {
             return (format!("{p}  (type + enter barge-in)"), false);
         }
+        return (p, false);
+    }
+    if app.busy {
         let phase = if app.phase.is_empty() {
             wait.to_string()
         } else {
@@ -2156,7 +2224,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.help {
         let help = Paragraph::new(
             "enter send · esc clear/cancel · C-q quit · tab / shift-tab runes · C-v verbose · C-h help\n\
-             C-s sessions · C-u clip · C-l look · C-o open editor · C-p / C-n files · esc home · C-q quit",
+             C-s sessions · C-u clip · C-l look · C-o open editor · C-p / C-n files · empty v speak · esc home · C-q quit",
         )
         .style(Style::default().fg(SILVER))
         .block(
@@ -2238,6 +2306,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             "  · C-v"
         },
         if app.verbose {
+            Style::default().fg(PINK)
+        } else {
+            Style::default().fg(SILVER)
+        },
+    ));
+    footer.push(Span::styled(
+        if app.speak_on { "  · v speak" } else { "  · v" },
+        if app.speak_on {
             Style::default().fg(PINK)
         } else {
             Style::default().fg(SILVER)
@@ -2406,6 +2482,13 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let sparkle = if app.sparkle { "on" } else { "off" };
     let verbose = if app.verbose { "on" } else { "off" };
+    let voice = if !app.speak_on {
+        "off".to_string()
+    } else if crate::speak::ready() {
+        format!("on · {}", crate::speak::SPEAKER)
+    } else {
+        "on · sleeping".into()
+    };
     let eye = if prefs::eye_asleep() {
         "asleep  (no VL GGUF)"
     } else {
@@ -2423,6 +2506,7 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         ("Persona", persona),
         ("Sparkle", sparkle),
         ("Verbose", verbose),
+        ("Voice", voice.as_str()),
         ("Rune", app.default_rune.as_str()),
         ("Eye", eye),
         ("Imp", "hop · one GPU tenant"),
@@ -3247,6 +3331,10 @@ mod tests {
         assert!(
             src.contains("  · C-v verbose"),
             "footer must label C-v as verbose"
+        );
+        assert!(
+            src.contains("empty v speak"),
+            "help must teach empty-prompt v as speak"
         );
         assert!(src.contains("C-s sessions"), "help must teach C-s sessions");
         assert!(src.contains("n new"), "dashboard must offer New");

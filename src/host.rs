@@ -204,6 +204,8 @@ pub fn probe() -> String {
     s.push_str(&now_line());
     s.push('\n');
     s.push_str(&mouth_line());
+    s.push('\n');
+    s.push_str(&tongue_line());
     s
 }
 
@@ -232,6 +234,18 @@ fn mouth_line() -> String {
     let backend = app.get("backend").and_then(|x| x.as_str()).unwrap_or("?");
     let ctx = app.get("ctx").and_then(|x| x.as_u64()).unwrap_or(0);
     format!("mouth: pixie/chat {model} {backend} ctx={ctx}")
+}
+
+fn tongue_line() -> String {
+    if crate::speak::ready() {
+        format!(
+            "tongue: {} cpu :{}",
+            crate::speak::SPEAKER,
+            crate::speak::PORT
+        )
+    } else {
+        "tongue: sleeping".into()
+    }
 }
 
 fn uname(args: &[&str]) -> String {

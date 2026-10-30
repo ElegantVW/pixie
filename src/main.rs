@@ -13,6 +13,7 @@ mod paths;
 mod prefs;
 mod privilege;
 mod runes;
+mod speak;
 mod think;
 mod tools;
 mod tui;

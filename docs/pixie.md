@@ -2,7 +2,7 @@
 
 **Role:** Local AI familiar with tools (files, shell, house spells), fully offline. `pixie` / `pixie "…"`; llama-server on `127.0.0.1:8080` via `menagerie`.
 
-**Status:** Rust engine (v0.3.8). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
+**Status:** Rust engine (v0.3.9). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
 
 ## Current
 
@@ -24,7 +24,8 @@
   - **Plan** (20) — read-only bash allowlist + inspect + `write_plan` (cache only). Overlay shows the plan. y → Build in `~/pixie`.
 - Tool results are tagged `<tool_result>` (not llama `role: tool`). Kur `:8081` titles the first 10 user lines and adds the cute sparkle; the 8B does JSON, facts, and mid-thread compact. Sparkle is an Options toggle.
 - You/Pixie sit in content-sized bubbles (right blush / left pink). House star splash on launch; wait spinner is the star’s own rows (`*` `\|/` `---*---` `/|\`), not a generic ticker. Prompt box grows with wrapped text (same wrap for height, paint, and cursor).
-- File cards: green `+` / red `−` on writes; **C-u** clip · **C-l** look · **C-o** open · **C-p / C-n** cycle. **C-h** help · **C-v** verbose · **C-s** sessions · **C-q** quit. Bare letters always type.
+- File cards: green `+` / red `−` on writes; **C-u** clip · **C-l** look · **C-o** open · **C-p / C-n** cycle. **C-h** help · **C-v** verbose · **C-s** sessions · **C-q** quit. Empty-prompt **v** toggles Voice. Bare letters always type.
+- **Voice** speaks the final assistant reply through a CPU CrispASR sidecar (`127.0.0.1:8084`, Qwen3-TTS 0.6B CustomVoice `vivian`). No GPU hop. Default off. Missing guest/codec: tongue sleeps. Never Siren.
 - Host card every turn (OS, zsh, CPU, GPU, RAM, term, session). House pack in `config/pixie/context/`.
 - Barge-in: type + Enter aborts the in-flight reply. Quiet hides `<think>` but jsonl stores it.
 - `look` hops like Imp: park the 8B, bind pixie vision (Qwen2.5-VL-7B IQ4_XS + mmproj-f16, ctx 4096), describe the picture, restore Chat. One GPU tenant. Missing mmproj keeps the eye asleep.
@@ -62,7 +63,9 @@ you → pixie TUI  --HTTP-->  llama-server :8080  (llama.cpp)
 | `~/.cache/pixie/sessions/*.jsonl` | transcripts |
 | `~/.cache/pixie/sessions/*.meta.json` | session name / renamed / named_from |
 | `~/.config/pixie/persona.md` | optional persona overlay |
-| `~/.config/pixie/ui.json` | verbose / sparkle / default rune / enhance_image / art_dir |
+| `~/.config/pixie/ui.json` | verbose / sparkle / speak_on / default rune / enhance_image / art_dir |
+| `~/.cache/pixie/speak/last.wav` | last spoken clip |
+| `~/.local/lib/crispasr/crispasr` | CPU TTS guest |
 | `$XDG_RUNTIME_DIR/pixie/askpass*` | sitting sudo helper (not config) |
 
 ## Later

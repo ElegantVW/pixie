@@ -1,5 +1,11 @@
 # Pixie changelog
 
+## v0.3.9 spoken tongue (2026-10-30)
+
+- Options **Voice** (default off) and empty-prompt `v` speak the final Pixie reply. `C-v` stays verbose. Bare letters still type.
+- CPU CrispASR sidecar on `:8084` (no hop, no GPU). Speaker `vivian` plus a short all-ages fairy instruct. Playback is `paplay` / `pw-play`, never Siren.
+- Missing guest or codec stays an honest sleep. Tests never start CrispASR or play audio.
+
 ## v0.3.8 real pictures, clips, eye (2026-10-30)
 
 - Image bubbles paint the real PNG through kitty's graphics protocol (unicode placeholders, Magpie's framing). TTY fallback is unlabeled half-blocks.
