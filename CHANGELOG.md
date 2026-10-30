@@ -1,5 +1,12 @@
 # Pixie changelog
 
+## v0.3.12 speak the intro, skip the sparkles (2026-10-30)
+
+- `check_whatsapp` `norm_args` keeps `caption`/`path`/`file`. `send_voice` speaks that caption. Confirm names the caption or “last speech”. Last wav only when caption/text/path are empty.
+- TTS speaks `spoken_plain`: drop fences, URLs, paths, markdown; map laughs/yawns/gasps/etc to words; strip the rest of the pictographs. Glass keeps the raw reply.
+- First clause plays immediately. Glass waits for that sentence to start (`Heard`) so text meets sound. 8 s dump if the first PCM never arrives.
+- VibeVoice is compiled into CrispASR 0.8.48. No VibeVoice GGUF on disk; a probe without `-m` started an ASR fetch and was killed. Design stays. Vulkan still a follow-up.
+
 ## v0.3.11 hear design while she talks (2026-10-30)
 
 - Default tongue is **design**. A-v still toggles. Options still cycles off / vivian / design.

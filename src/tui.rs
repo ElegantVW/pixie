@@ -199,6 +199,12 @@ struct App {
     pending_files: Vec<Attach>,
     kitty_frame: HashMap<u32, kitty::Place>,
     kitty_sent: HashMap<u32, (u16, u16)>,
+    heard: String,
+    speak_full: String,
+    speak_think: String,
+    speaking: bool,
+    speak_since: Option<Instant>,
+    speak_gen: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -225,6 +231,7 @@ fn toggle_speak(app: &mut App) {
     if app.speak_on {
         apply_tongue(app);
     } else {
+        commit_held(app);
         crate::speak::stop_sidecar();
         app.status = "tongue off".into();
     }
@@ -242,6 +249,7 @@ fn cycle_voice(app: &mut App, dir: i32) {
         0 => {
             app.speak_on = false;
             persist_ui(app);
+            commit_held(app);
             crate::speak::stop_sidecar();
             app.status = "tongue off".into();
         }
@@ -310,6 +318,8 @@ fn persist_ui(app: &App) {
 pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Result<()> {
     mind::seed_memory(None)?;
     let (tx, rx) = mpsc::channel();
+    let (hear_tx, hear_rx) = mpsc::channel();
+    crate::speak::set_hear(hear_tx);
     let ui = prefs::load_ui()?;
     let (chat, rune_idx, session_id, session_name, door) = if let Some(id) = resume {
         let (c, k) = agent::from_session(&id);
@@ -391,6 +401,12 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         pending_files: Vec::new(),
         kitty_frame: HashMap::new(),
         kitty_sent: HashMap::new(),
+        heard: String::new(),
+        speak_full: String::new(),
+        speak_think: String::new(),
+        speaking: false,
+        speak_since: None,
+        speak_gen: 0,
     };
     if app.speak_on {
         warm_tongue(&app);
@@ -423,6 +439,18 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             handle_msg(&mut app, msg);
+        }
+        while let Ok(ev) = hear_rx.try_recv() {
+            handle_hear(&mut app, ev);
+        }
+        if app.speaking {
+            if let Some(t0) = app.speak_since {
+                if app.heard.trim().is_empty() && t0.elapsed() >= Duration::from_secs(8) {
+                    commit_held(&mut app);
+                } else if t0.elapsed() >= Duration::from_secs(120) {
+                    commit_held(&mut app);
+                }
+            }
         }
         privilege::idle_tick();
         if app.status.starts_with("sudo setting up") {
@@ -588,6 +616,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
         }
         UiMsg::Calling(name) => {
             crate::speak::drop_partial();
+            app.heard.clear();
             app.live = format!("calling {name}…");
         }
         UiMsg::Round { n, cap } => {
@@ -621,6 +650,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                 ok,
             });
             crate::speak::drop_partial();
+            app.heard.clear();
             app.live.clear();
         }
         UiMsg::Wake { err } => {
@@ -704,6 +734,11 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
             app.busy = false;
             let compact_ok = !cancelled && err.is_none();
             if cancelled {
+                app.speaking = false;
+                app.heard.clear();
+                app.speak_full.clear();
+                app.speak_think.clear();
+                app.speak_since = None;
                 if !text.trim().is_empty() {
                     app.chat.push(ChatEntry::Assistant {
                         text,
@@ -713,6 +748,11 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                     });
                 }
             } else if let Some(e) = err {
+                app.speaking = false;
+                app.heard.clear();
+                app.speak_full.clear();
+                app.speak_think.clear();
+                app.speak_since = None;
                 let msg = format!("(✦ pixie lost the connection: {e})");
                 app.chat.push(ChatEntry::Assistant {
                     text: msg.clone(),
@@ -741,24 +781,18 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                 );
             } else if !text.trim().is_empty() {
                 let speak_text = text.clone();
-                app.chat.push(ChatEntry::Assistant {
-                    text: text.clone(),
-                    clock: agent::clock_now(),
-                    think: think.clone(),
-                    cancelled: false,
-                });
                 mind::append_session(
                     &app.session_id,
                     &SessionRec {
                         ts: mind::now_ts(),
                         role: "assistant".into(),
                         rune: app.rune_key().as_str().into(),
-                        text,
+                        text: text.clone(),
                         tool: String::new(),
                         args: None,
                         result: None,
                         raw: String::new(),
-                        think,
+                        think: think.clone(),
                         cancelled: false,
                         from_rune: String::new(),
                         to_rune: String::new(),
@@ -767,11 +801,30 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                     None,
                 );
                 if app.speak_on {
+                    app.speak_full = speak_text.clone();
+                    app.speak_think = think;
+                    app.speaking = true;
+                    if app.speak_since.is_none() {
+                        app.speak_since = Some(Instant::now());
+                    }
                     crate::speak::flush_remainder(app.tongue);
                     if !crate::speak::emitted_this_turn() {
                         spawn_say(app, speak_text);
                     }
+                } else {
+                    app.chat.push(ChatEntry::Assistant {
+                        text,
+                        clock: agent::clock_now(),
+                        think,
+                        cancelled: false,
+                    });
                 }
+            } else {
+                app.speaking = false;
+                app.heard.clear();
+                app.speak_full.clear();
+                app.speak_think.clear();
+                app.speak_since = None;
             }
             app.live.clear();
             app.phase.clear();
@@ -1749,7 +1802,15 @@ fn send(app: &mut App, text: &str) {
     app.live.clear();
     app.live_think.clear();
     if app.speak_on {
-        crate::speak::begin_turn();
+        commit_held(app);
+        app.speak_gen = crate::speak::begin_turn();
+        app.heard.clear();
+        app.speak_full.clear();
+        app.speak_think.clear();
+        app.speaking = true;
+        app.speak_since = Some(Instant::now());
+    } else {
+        commit_held(app);
     }
     app.scroll = 0;
     let rune = runes::all()[app.rune_idx].clone();
@@ -2191,10 +2252,52 @@ fn sanitize_input(text: &str) -> String {
 }
 
 fn live_speech(app: &App) -> String {
+    if app.speak_on && app.speaking {
+        return app.heard.clone();
+    }
     mask_live_speech(
         &app.live,
         app.confirm.peek().as_ref().map(|(n, _)| n.as_str()),
     )
+}
+
+fn handle_hear(app: &mut App, ev: crate::speak::HearEvent) {
+    match ev {
+        crate::speak::HearEvent::Line { gen, text } => {
+            if gen != app.speak_gen {
+                return;
+            }
+            if !app.heard.is_empty() && !app.heard.ends_with(' ') {
+                app.heard.push(' ');
+            }
+            app.heard.push_str(text.trim());
+        }
+        crate::speak::HearEvent::Caught { gen } => {
+            if gen == app.speak_gen {
+                commit_held(app);
+            }
+        }
+    }
+}
+
+fn commit_held(app: &mut App) {
+    if !app.speaking {
+        return;
+    }
+    let text = std::mem::take(&mut app.speak_full);
+    let think = std::mem::take(&mut app.speak_think);
+    app.speaking = false;
+    app.heard.clear();
+    app.speak_since = None;
+    if text.trim().is_empty() {
+        return;
+    }
+    app.chat.push(ChatEntry::Assistant {
+        text,
+        clock: agent::clock_now(),
+        think,
+        cancelled: false,
+    });
 }
 
 /// Hide a live JSON tool call. Keep a normal reply even if it mentions a tool.
@@ -2681,6 +2784,7 @@ fn load_session(app: &mut App, id: &str) {
     app.file_sel = 0;
     app.live.clear();
     app.live_think.clear();
+    commit_held(app);
     app.busy = false;
     wake_if_needed(app);
 }
@@ -2694,6 +2798,7 @@ fn new_session(app: &mut App) {
     app.file_sel = 0;
     app.live.clear();
     app.live_think.clear();
+    commit_held(app);
     app.busy = false;
     wake_if_needed(app);
 }
@@ -3039,8 +3144,12 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
             }
         }
     }
-    if app.busy {
-        push_think_bubble(&mut out, app.verbose, &app.live_think, &mut think_n);
+    if app.busy || (app.speaking && app.speak_on) {
+        if app.busy {
+            push_think_bubble(&mut out, app.verbose, &app.live_think, &mut think_n);
+        } else {
+            push_think_bubble(&mut out, app.verbose, &app.speak_think, &mut think_n);
+        }
         let vis = live_speech(app);
         let spin = glyph::spin_line(app.born);
         if !vis.is_empty() {

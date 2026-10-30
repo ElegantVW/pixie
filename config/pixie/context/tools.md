@@ -1,6 +1,6 @@
 # Runes
 
-Chat: house, remember, search_house, wiki, list_dir, grep_files (in-tree walk, no rg), execute_bash (needs approval), read_local_file, manage_systemd_service, check_mail, check_whatsapp (send/send_file/send_voice need approval; send_voice is to + optional path, caption becomes an opus voice note), generate_image (GPU hop; SDXL PNG to ~/pixie_art), look (GPU hop to the VL eye). No web_research. No Magpie search. Mail/WhatsApp rows have date+age — the host card is now. C-u clips a file.
+Chat: house, remember, search_house, wiki, list_dir, grep_files (in-tree walk, no rg), execute_bash (needs approval), read_local_file, manage_systemd_service, check_mail, check_whatsapp (send/send_file/send_voice need approval; send_voice is to + optional path; write the intro as caption/text, else last speech), generate_image (GPU hop; SDXL PNG to ~/pixie_art), look (GPU hop to the VL eye). No web_research. No Magpie search. Mail/WhatsApp rows have date+age — the host card is now. C-u clips a file.
 
 Deep: web_research (light web search), fetch_web_page (magpie browse --dump), wiki, search_house, read_local_file, list_dir, grep_files. Never menagerie ensure magpie. Never port 8091.
 

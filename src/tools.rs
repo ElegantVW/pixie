@@ -144,7 +144,10 @@ pub fn norm_args(fname: &str, fargs: &Value) -> Value {
                 "chat": first_str(m, &["chat", "jid", "name"]),
                 "id": first_str(m, &["id", "msgid", "message_id"]),
                 "to": first_str(m, &["to", "recipient"]),
-                "text": first_str(m, &["text", "message", "body"]),
+                "text": first_str(m, &["text", "message", "body", "caption"]),
+                "caption": first_str(m, &["caption", "text", "message", "body"]),
+                "path": first_str(m, &["path", "file", "filepath", "file_path"]),
+                "file": first_str(m, &["file", "path", "filepath", "file_path"]),
                 "after": first_str(m, &["after", "since"]),
                 "before": first_str(m, &["before", "until"]),
                 "limit": m.get("limit").or_else(|| m.get("max")).and_then(|x| x.as_i64()).unwrap_or(20),
@@ -1962,7 +1965,17 @@ pub fn confirm_line(name: &str, args: &Value) -> String {
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
                 if a == "send_voice" && path.trim().is_empty() {
-                    return format!("send a voice note to {to}?  [y/N]");
+                    let cap = args
+                        .get("caption")
+                        .or_else(|| args.get("text"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if !cap.is_empty() {
+                        let clip: String = cap.chars().take(60).collect();
+                        return format!("send a voice note to {to}?  {clip}  [y/N]");
+                    }
+                    return format!("send a voice note to {to}?  last speech  [y/N]");
                 }
                 let pretty = pretty_home(if path.trim().is_empty() {
                     "~/.cache/pixie/speak/last.wav"
@@ -2376,6 +2389,24 @@ mod tests {
             &json!({"action": "send_voice", "to": "Ada"}),
         );
         assert!(voice_line.contains("voice note"), "{voice_line}");
+        assert!(voice_line.contains("last speech"), "{voice_line}");
+        let cap_line = confirm_line(
+            "check_whatsapp",
+            &json!({"action": "send_voice", "to": "Ada", "caption": "hello from pixie"}),
+        );
+        assert!(cap_line.contains("hello from pixie"), "{cap_line}");
+        let n = norm_args(
+            "check_whatsapp",
+            &json!({
+                "action": "send_voice",
+                "to": "Ada",
+                "caption": "hello from pixie"
+            }),
+        );
+        assert_eq!(n["caption"], "hello from pixie", "{n}");
+        assert_eq!(n["text"], "hello from pixie", "{n}");
+        let after = check_whatsapp(&n);
+        assert_eq!(after["source"], "caption", "{after}");
         let voice_denied = check_whatsapp(&json!({
             "action": "send_voice",
             "to": "Ada",

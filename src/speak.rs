@@ -147,10 +147,16 @@ fn sidecar_log() -> PathBuf {
 }
 
 const SENTENCE_FLOOR: usize = 12;
+const FIRST_CLAUSE_FLOOR: usize = 24;
 const WAV_RATE: u32 = 24_000;
 
 /// Pull complete sentences off `buf`. Remainder has no terminal `.?!` yet, or is under the floor.
 pub fn take_sentences(buf: &str) -> (Vec<String>, String) {
+    take_speech_units(buf, false)
+}
+
+/// First breath of a turn: any `.?!` goes, and a long first clause may split on `,;:`.
+pub fn take_speech_units(buf: &str, first: bool) -> (Vec<String>, String) {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -160,10 +166,28 @@ pub fn take_sentences(buf: &str) -> (Vec<String>, String) {
             None => break,
         };
         let n = ch.len_utf8();
-        if matches!(ch, '.' | '!' | '?') {
+        let stop = matches!(ch, '.' | '!' | '?');
+        let clause = first && out.is_empty() && matches!(ch, ',' | ';' | ':');
+        if stop || clause {
             let end = i + n;
+            if clause {
+                let next = buf[end..].chars().next();
+                if next.map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    i += n;
+                    continue;
+                }
+            }
             let piece = buf[start..end].trim();
-            if piece.chars().count() >= SENTENCE_FLOOR {
+            let need = if stop {
+                if first && out.is_empty() {
+                    1
+                } else {
+                    SENTENCE_FLOOR
+                }
+            } else {
+                FIRST_CLAUSE_FLOOR
+            };
+            if piece.chars().count() >= need {
                 out.push(piece.to_string());
                 start = end;
             }
@@ -176,6 +200,39 @@ pub fn take_sentences(buf: &str) -> (Vec<String>, String) {
 enum Job {
     Begin { gen: u64 },
     Line { gen: u64, tongue: Tongue, text: String },
+    Flush { gen: u64 },
+}
+
+enum PlayJob {
+    Begin { gen: u64 },
+    Clip { gen: u64, text: String, path: PathBuf },
+    Flush { gen: u64 },
+}
+
+/// Play-worker → TUI. Glass paints `Line` when that sentence starts playing.
+#[derive(Debug, Clone)]
+pub enum HearEvent {
+    Line { gen: u64, text: String },
+    Caught { gen: u64 },
+}
+
+fn hear_cell() -> &'static Mutex<Option<std::sync::mpsc::Sender<HearEvent>>> {
+    static C: OnceLock<Mutex<Option<std::sync::mpsc::Sender<HearEvent>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_hear(tx: std::sync::mpsc::Sender<HearEvent>) {
+    if let Ok(mut g) = hear_cell().lock() {
+        *g = Some(tx);
+    }
+}
+
+fn emit_hear(ev: HearEvent) {
+    if let Ok(g) = hear_cell().lock() {
+        if let Some(tx) = g.as_ref() {
+            let _ = tx.send(ev);
+        }
+    }
 }
 
 struct Streamer {
@@ -205,7 +262,7 @@ fn jobs() -> Option<std::sync::mpsc::Sender<Job>> {
     Some(
         TX.get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let (play_tx, play_rx) = std::sync::mpsc::channel::<PathBuf>();
+            let (play_tx, play_rx) = std::sync::mpsc::channel::<PlayJob>();
             let _ = std::thread::Builder::new()
                 .name("pixie-tongue-play".into())
                 .spawn(move || play_worker(play_rx));
@@ -218,7 +275,7 @@ fn jobs() -> Option<std::sync::mpsc::Sender<Job>> {
     )
 }
 
-fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Sender<PathBuf>) {
+fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Sender<PlayJob>) {
     let mut n = 0u32;
     let mut gen = 0u64;
     while let Ok(job) = rx.recv() {
@@ -226,7 +283,7 @@ fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Se
             Job::Begin { gen: g } => {
                 gen = g;
                 n = 0;
-                let _ = play_tx.send(PathBuf::new());
+                let _ = play_tx.send(PlayJob::Begin { gen: g });
             }
             Job::Line {
                 gen: g,
@@ -236,7 +293,7 @@ fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Se
                 if g != gen {
                     continue;
                 }
-                let clip = spoken_clip(&text);
+                let clip = spoken_plain(&text);
                 if clip.is_empty() {
                     continue;
                 }
@@ -246,23 +303,39 @@ fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Se
                     .join(format!("part-{n:03}.wav"));
                 let _ = fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")));
                 if synth_to(tongue, &clip, &dest).is_ok() {
-                    let _ = play_tx.send(dest);
+                    let _ = play_tx.send(PlayJob::Clip {
+                        gen: g,
+                        text,
+                        path: dest,
+                    });
+                }
+            }
+            Job::Flush { gen: g } => {
+                if g == gen {
+                    let _ = play_tx.send(PlayJob::Flush { gen: g });
                 }
             }
         }
     }
 }
 
-fn play_worker(rx: std::sync::mpsc::Receiver<PathBuf>) {
+fn play_worker(rx: std::sync::mpsc::Receiver<PlayJob>) {
     let mut pcm = Vec::new();
-    while let Ok(path) = rx.recv() {
-        if path.as_os_str().is_empty() {
-            pcm.clear();
-            continue;
+    while let Ok(job) = rx.recv() {
+        match job {
+            PlayJob::Begin { .. } => {
+                pcm.clear();
+            }
+            PlayJob::Clip { gen, text, path } => {
+                emit_hear(HearEvent::Line { gen, text });
+                let _ = play_wav(&path);
+                append_wav_pcm(&mut pcm, &path);
+                let _ = write_pcm_wav(&pcm, &cache_wav());
+            }
+            PlayJob::Flush { gen } => {
+                emit_hear(HearEvent::Caught { gen });
+            }
         }
-        let _ = play_wav(&path);
-        append_wav_pcm(&mut pcm, &path);
-        let _ = write_pcm_wav(&pcm, &cache_wav());
     }
 }
 
@@ -297,9 +370,9 @@ fn write_pcm_wav(pcm: &[u8], dest: &Path) -> Result<(), String> {
     fs::write(dest, out).map_err(|e| format!("pixie: tongue wav: {e}"))
 }
 
-pub fn begin_turn() {
+pub fn begin_turn() -> u64 {
     if cfg!(test) {
-        return;
+        return 0;
     }
     let gen = if let Ok(mut g) = streamer().lock() {
         g.last_clip.clear();
@@ -313,6 +386,7 @@ pub fn begin_turn() {
     if let Some(tx) = jobs() {
         let _ = tx.send(Job::Begin { gen });
     }
+    gen
 }
 
 pub fn drop_partial() {
@@ -355,7 +429,8 @@ pub fn push_live(tongue: Tongue, visible: &str) {
             return;
         }
         g.remainder.push_str(&extra);
-        let (got, rest) = take_sentences(&g.remainder);
+        let first = g.emitted == 0;
+        let (got, rest) = take_speech_units(&g.remainder, first);
         g.remainder = rest;
         g.emitted = g.emitted.saturating_add(got.len() as u32);
         sents = got;
@@ -384,6 +459,10 @@ pub fn flush_remainder(tongue: Tongue) {
     if !rest.is_empty() {
         enqueue(tongue, rest.to_string());
     }
+    let gen = streamer().lock().map(|g| g.gen).unwrap_or(0);
+    if let Some(tx) = jobs() {
+        let _ = tx.send(Job::Flush { gen });
+    }
 }
 
 fn enqueue(tongue: Tongue, text: String) {
@@ -401,7 +480,7 @@ pub fn synth_to(tongue: Tongue, text: &str, dest: &Path) -> Result<(), String> {
     if cfg!(test) {
         return Ok(());
     }
-    let clip = spoken_clip(text);
+    let clip = spoken_plain(text);
     if clip.is_empty() {
         return Ok(());
     }
@@ -501,6 +580,333 @@ pub fn spoken_clip(text: &str) -> String {
         return clipped.trim().to_string();
     }
     out
+}
+
+/// What the talker says. Glass keeps the raw reply.
+pub fn spoken_plain(text: &str) -> String {
+    let clip = spoken_clip(text);
+    if clip.is_empty() {
+        return String::new();
+    }
+    let cleaned = strip_technical(&clip);
+    let glossed = gloss_emoji(&cleaned);
+    collapse_ws(&glossed)
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn strip_technical(s: &str) -> String {
+    let s = strip_fences(s);
+    let s = strip_inline_code(&s);
+    let s = strip_md_media(&s);
+    let s = strip_urls(&s);
+    let s = strip_html(&s);
+    let s = strip_emphasis(&s);
+    strip_path_tokens(&s)
+}
+
+fn strip_fences(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("```") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 3..];
+        if let Some(nl) = rest.find('\n') {
+            rest = &rest[nl + 1..];
+        }
+        if let Some(j) = rest.find("```") {
+            rest = &rest[j + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_inline_code(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('`') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        if let Some(j) = rest.find('`') {
+            let inner = &rest[..j];
+            if inner.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-') {
+                out.push_str(inner);
+            }
+            rest = &rest[j + 1..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_md_media(s: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '!' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            if let Some(end) = skip_md_link(&chars, i + 1) {
+                i = end;
+                continue;
+            }
+        }
+        if chars[i] == '[' {
+            if let Some((text, end)) = take_md_link(&chars, i) {
+                out.push_str(&text);
+                i = end;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn skip_md_link(chars: &[char], open: usize) -> Option<usize> {
+    let ( _, end) = take_md_link(chars, open)?;
+    Some(end)
+}
+
+fn take_md_link(chars: &[char], open: usize) -> Option<(String, usize)> {
+    if open >= chars.len() || chars[open] != '[' {
+        return None;
+    }
+    let mut i = open + 1;
+    let mut text = String::new();
+    while i < chars.len() && chars[i] != ']' {
+        text.push(chars[i]);
+        i += 1;
+        if text.len() > 200 {
+            return None;
+        }
+    }
+    if i + 1 >= chars.len() || chars[i] != ']' || chars[i + 1] != '(' {
+        return None;
+    }
+    i += 2;
+    let mut depth = 1i32;
+    while i < chars.len() {
+        if chars[i] == '(' {
+            depth += 1;
+        } else if chars[i] == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some((text, i + 1));
+            }
+        }
+        i += 1;
+        if i - open > 400 {
+            return None;
+        }
+    }
+    None
+}
+
+fn strip_urls(s: &str) -> String {
+    let mut out = String::new();
+    for w in s.split_whitespace() {
+        let t = w.trim_matches(|c: char| "<>()[]{},;\"'".contains(c));
+        let low = t.to_ascii_lowercase();
+        if low.starts_with("http://")
+            || low.starts_with("https://")
+            || low.starts_with("ftp://")
+            || low.starts_with("file://")
+            || low.starts_with("www.")
+        {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
+}
+
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+            continue;
+        }
+        if ch == '>' && in_tag {
+            in_tag = false;
+            continue;
+        }
+        if !in_tag {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn strip_emphasis(s: &str) -> String {
+    s.replace("**", "")
+        .replace("__", "")
+        .replace("~~", "")
+        .replace('*', "")
+        .replace('_', " ")
+}
+
+fn strip_path_tokens(s: &str) -> String {
+    let mut out = String::new();
+    for w in s.split_whitespace() {
+        if looks_like_path(w) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
+}
+
+fn looks_like_path(w: &str) -> bool {
+    let t = w.trim_matches(|c: char| "()[]{},;:\"'".contains(c));
+    if t.starts_with("~/") || t.starts_with("/home/") || t.starts_with("/usr/") || t.starts_with("/etc/")
+        || t.starts_with("/var/") || t.starts_with("/tmp/") || t.starts_with("/opt/")
+        || t.starts_with("/dev/")
+    {
+        return true;
+    }
+    let low = t.to_ascii_lowercase();
+    if low.ends_with(".gguf")
+        || low.ends_with(".wav")
+        || low.ends_with(".ogg")
+        || low.ends_with(".opus")
+        || low.ends_with(".json")
+        || low.ends_with(".jsonl")
+        || low.ends_with(".toml")
+        || low.ends_with(".lock")
+    {
+        return t.contains('/') || t.contains('\\');
+    }
+    t.matches('/').count() >= 2 && t.contains('.')
+}
+
+fn gloss_emoji(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if is_cluster_cont(c) {
+            i += 1;
+            continue;
+        }
+        if (0x1F1E6..=0x1F1FF).contains(&(c as u32)) {
+            i += 1;
+            if i < chars.len() && (0x1F1E6..=0x1F1FF).contains(&(chars[i] as u32)) {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(g) = emoji_gloss(c) {
+            i += 1;
+            while i < chars.len() && is_cluster_cont(chars[i]) {
+                i += 1;
+            }
+            if !g.is_empty() {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(g);
+                out.push(' ');
+            }
+            continue;
+        }
+        if is_emoji_char(c) {
+            i += 1;
+            while i < chars.len() && is_cluster_cont(chars[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn is_cluster_cont(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x200D | 0xFE0E | 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF
+    )
+}
+
+fn is_emoji_char(c: char) -> bool {
+    let u = c as u32;
+    matches!(
+        u,
+        0x2190..=0x21FF
+            | 0x2300..=0x23FF
+            | 0x25A0..=0x25FF
+            | 0x2600..=0x27BF
+            | 0x2B00..=0x2BFF
+            | 0x1F000..=0x1FAFF
+    )
+}
+
+/// Spoken gloss for a lead emoji. Empty string = drop. None = not an emoji we map.
+fn emoji_gloss(c: char) -> Option<&'static str> {
+    Some(match c {
+        '😀' | '😃' | '😄' | '😁' | '😆' | '😅' | '😂' | '🤣' | '😹' | '😸' | '😺' | '🙃'
+        | '🫠' => "ha ha",
+        '🤭' | '😏' | '😼' | '😜' | '😝' | '😛' | '🤪' => "heh",
+        '🤔' | '🧐' | '🤨' => "hmm",
+        '😴' | '😪' | '🤤' | '🥱' | '💤' => "yawn",
+        '🤧' => "achoo",
+        '😱' | '😨' | '😰' => "ah",
+        '😮' | '😲' | '😯' | '😦' | '😧' => "oh",
+        '🥳' | '🎉' | '🎊' | '🎈' => "yay",
+        '😢' | '😭' | '😿' | '😞' | '😔' | '😟' | '🙁' | '☹' | '🥺' | '🥹' => "aw",
+        '👏' => "clap",
+        '🎵' | '🎶' | '🎤' => "hum",
+        '🤫' => "shh",
+        '😤' | '😠' | '😡' | '🤬' => "hmph",
+        '😇' | '😊' | '🙂' | '☺' | '🥰' | '😍' | '🤩' | '😘' | '😗' | '😚' | '😙' | '🤗' => "",
+        '❤' | '💕' | '💖' | '💗' | '💓' | '💞' | '💘' | '💝' | '💟' | '🧡' | '💛' | '💚'
+        | '💙' | '💜' | '🖤' | '🤍' | '🤎' | '💔' | '💋' => "",
+        '✨' | '⭐' | '🌟' | '💫' | '⚡' | '🔥' | '💯' => "",
+        '👍' | '👎' | '👌' | '✌' | '🤞' | '🤟' | '🤘' | '👋' | '🤚' | '✋' | '🖐' | '🙏'
+        | '🙌' | '💪' | '🤷' | '🤦' => "",
+        '👀' | '👁' | '🧠' | '💀' | '☠' | '👻' | '🤖' | '👽' | '💩' | '😈' | '👿' => "",
+        '🧚' | '🧙' | '🧛' | '🧜' | '🧝' | '🪄' => "",
+        '🌙' | '☀' | '🌞' | '🌝' | '🌸' | '🌺' | '🌹' | '🌷' | '🌼' | '🌈' | '🦄' | '🐶'
+        | '🐱' => "",
+        '🍕' | '🍔' | '☕' | '⏰' | '🎁' | '🎂' => "",
+        '📱' | '📞' | '💻' | '🖥' | '⌨' | '📧' | '📨' | '📩' => "",
+        '✅' | '✔' | '☑' | '❌' | '❎' | '✖' | '⚠' | '⛔' | '🚫' | '❓' | '❔' | '❗' | '❕' => "",
+        '📌' | '📍' | '🔗' | '📁' | '📂' | '📄' | '📝' | '🔒' | '🔓' | '🔑' | '⚙' | '🔧'
+        | '🛠' | '🚀' | '💰' | '💸' | '💬' | '🫡' | '🫣' => "",
+        _ => return None,
+    })
 }
 
 fn push_common(
@@ -892,12 +1298,16 @@ pub fn say_tongue(tongue: Tongue, text: &str) -> Result<(), String> {
     if !ready_tongue(tongue) {
         return Err(sleeping_reason_tongue(tongue));
     }
-    let (sents, rest) = take_sentences(&clip);
+    let (sents, rest) = take_speech_units(&clip, true);
     for s in sents {
         enqueue(tongue, s);
     }
     if !rest.trim().is_empty() {
         enqueue(tongue, rest.trim().to_string());
+    }
+    let gen = streamer().lock().map(|g| g.gen).unwrap_or(0);
+    if let Some(tx) = jobs() {
+        let _ = tx.send(Job::Flush { gen });
     }
     Ok(())
 }
@@ -1046,6 +1456,59 @@ mod tests {
         let (all, empty) = take_sentences("Quick and kind. A little sparkle.");
         assert_eq!(all.len(), 2, "{all:?}");
         assert!(empty.trim().is_empty(), "{empty}");
+    }
+
+    #[test]
+    fn first_clause_goes_immediately() {
+        let (got, rest) = take_speech_units("Hi.", true);
+        assert_eq!(got, vec!["Hi.".to_string()]);
+        assert!(rest.trim().is_empty(), "{rest}");
+        let (got, rest) = take_speech_units(
+            "Once upon a warm hearth, the kettle sang for everyone nearby.",
+            true,
+        );
+        assert!(!got.is_empty(), "{got:?}");
+        assert!(got[0].contains("hearth"), "{got:?}");
+        assert!(
+            rest.contains("kettle") || got.iter().any(|s| s.contains("kettle")),
+            "{got:?} {rest}"
+        );
+    }
+
+    #[test]
+    fn spoken_plain_maps_laughs_and_drops_sparkles() {
+        let s = spoken_plain("Hello 😂✨ world 🤣");
+        assert!(s.contains("ha ha"), "{s}");
+        assert!(s.contains("Hello"), "{s}");
+        assert!(s.contains("world"), "{s}");
+        assert!(!s.contains('✨'), "{s}");
+        assert!(!s.contains('😂'), "{s}");
+    }
+
+    #[test]
+    fn spoken_plain_maps_more_than_laughs() {
+        let s = spoken_plain("Wait 🤔 I yawn 😴 achoo 🤧 shock 😮 party 🎉 sad 😢 shh 🤫");
+        assert!(s.contains("hmm"), "{s}");
+        assert!(s.contains("yawn"), "{s}");
+        assert!(s.contains("achoo"), "{s}");
+        assert!(s.contains("oh"), "{s}");
+        assert!(s.contains("yay"), "{s}");
+        assert!(s.contains("aw"), "{s}");
+        assert!(s.contains("shh"), "{s}");
+        assert!(!s.contains('🤔'), "{s}");
+    }
+
+    #[test]
+    fn spoken_plain_strips_technical_junk() {
+        let s = spoken_plain(
+            "See [docs](https://example.com/x) and `src/speak.rs` plus ~/.cache/pixie/speak/last.wav **bold**.",
+        );
+        assert!(s.contains("See"), "{s}");
+        assert!(s.contains("docs"), "{s}");
+        assert!(!s.contains("example.com"), "{s}");
+        assert!(!s.contains("last.wav"), "{s}");
+        assert!(!s.contains("**"), "{s}");
+        assert!(!s.contains('`'), "{s}");
     }
 
     #[test]
