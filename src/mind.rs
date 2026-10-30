@@ -15,7 +15,7 @@ pub const MEMORY_INJECT_CAP: usize = 6000;
 pub const MEMORY_FILE_CAP: usize = 24000;
 pub const SESSION_TEXT_CAP: usize = 32000;
 pub const SESSION_TOOL_CAP: usize = 1200;
-pub const HOUSE_PACK_CAP: usize = 2500;
+pub const HOUSE_PACK_CAP: usize = 4000;
 
 const SEED: &str = r#"# Pixie memory
 
@@ -1202,6 +1202,10 @@ pub fn search_house(query: &str, max_hits: usize) -> Value {
         home.join("pixie/docs"),
         home.join("pixie/src"),
         home.join("pixie/config"),
+        home.join("menagerie/src"),
+        home.join("menagerie/README.md"),
+        home.join("goblin/src"),
+        home.join("imp/src"),
         paths::memory_path(),
     ];
     let mut hits = Vec::new();

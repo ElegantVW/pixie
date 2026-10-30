@@ -1,13 +1,16 @@
 use crate::agent::{self, ChatEntry, Event};
+use crate::attach::{self, Attach};
 use crate::chrome;
 use crate::diff::{self, FileTouch, Op};
 use crate::glyph;
+use crate::kitty;
 use crate::llm::{self, Abort};
 use crate::mind::{self, SessionRec};
 use crate::paths;
 use crate::prefs;
 use crate::privilege;
 use crate::runes::{self, RuneKey};
+use crate::tools;
 use crossterm::{
     event::{
         self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
@@ -24,6 +27,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -90,6 +94,7 @@ enum UiMsg {
         file: Option<FileTouch>,
         name: String,
         think: String,
+        ok: bool,
     },
     Wake {
         err: Option<String>,
@@ -110,6 +115,9 @@ enum UiMsg {
     Mouth {
         err: Option<String>,
     },
+    SudoReady {
+        err: Option<String>,
+    },
     Done {
         gen: u64,
         text: String,
@@ -124,6 +132,7 @@ struct LookState {
     path: String,
     lines: Vec<(Op, String)>,
     scroll: u16,
+    image: bool,
 }
 
 struct App {
@@ -138,6 +147,8 @@ struct App {
     default_rune: RuneKey,
     build_audit_rounds: bool,
     sudo_less_safe: bool,
+    enhance_image: bool,
+    art_dir: String,
     help: bool,
     busy: bool,
     waking: bool,
@@ -152,6 +163,9 @@ struct App {
     compacting: bool,
     sudo_buf: Option<String>,
     sudo_spin: u8,
+    wake_err: Option<String>,
+    wake_retry: Instant,
+    mouth_role: String,
     delete_ask: bool,
     live: String,
     live_think: String,
@@ -176,6 +190,10 @@ struct App {
     file_sel: usize,
     file_hits: Vec<(Rect, usize)>,
     pending_editor: Option<PathBuf>,
+    pending_picker: bool,
+    pending_files: Vec<Attach>,
+    kitty_frame: HashMap<u32, kitty::Place>,
+    kitty_sent: HashMap<u32, (u16, u16)>,
 }
 
 #[derive(Clone, Copy)]
@@ -203,6 +221,8 @@ fn persist_ui(app: &App) {
         rune: app.default_rune,
         build_audit_rounds: app.build_audit_rounds,
         sudo_less_safe: app.sudo_less_safe,
+        enhance_image: app.enhance_image,
+        art_dir: app.art_dir.clone(),
     }) {
         eprintln!("pixie: could not save house preferences: {error}");
     }
@@ -230,7 +250,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
             show_door,
         )
     };
-    let waking = if door { false } else { !llm::llm_up() };
+    let waking = !llm::llm_up();
     let mut app = App {
         chat,
         buf: String::new(),
@@ -243,6 +263,8 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         default_rune: ui.rune,
         build_audit_rounds: ui.build_audit_rounds,
         sudo_less_safe: ui.sudo_less_safe,
+        enhance_image: ui.enhance_image,
+        art_dir: ui.art_dir.clone(),
         help: false,
         busy: false,
         waking,
@@ -257,6 +279,9 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         compacting: false,
         sudo_buf: None,
         sudo_spin: 0,
+        wake_err: None,
+        wake_retry: Instant::now(),
+        mouth_role: "chat".into(),
         delete_ask: false,
         live: String::new(),
         live_think: String::new(),
@@ -281,6 +306,10 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         file_sel: 0,
         file_hits: Vec::new(),
         pending_editor: None,
+        pending_picker: false,
+        pending_files: Vec::new(),
+        kitty_frame: HashMap::new(),
+        kitty_sent: HashMap::new(),
     };
     if app.waking {
         let tx = app.tx.clone();
@@ -315,36 +344,42 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         if app.status.starts_with("sudo setting up") {
             let sp = ["|", "/", "-", "\\"][app.sudo_spin as usize % 4];
             app.sudo_spin = app.sudo_spin.wrapping_add(1);
-            if privilege::is_on() {
-                app.status = "sudo on · less-safe".into();
-            } else {
-                app.status = format!("sudo setting up {}", sp);
-            }
+            app.status = format!("sudo setting up {sp}");
         }
-        if app.splash && !app.waking && app.born.elapsed() >= SPLASH_MIN {
-            app.splash = false;
-            if app.door {
-                open_dashboard(&mut app);
-            }
-        } else if app.splash && app.waking {
-            // Don't dismiss splash while waiting for menagerie; if it's taking long, keep showing it
-            // but ensure we eventually proceed when wake completes or after a grace period
-            if app.born.elapsed() >= Duration::from_secs(30) {
-                // Give up waiting gracefully, let user see status
-                app.splash = false;
-                if app.door {
-                    open_dashboard(&mut app);
-                }
-            }
-        } else if app.splash && app.born.elapsed() >= SPLASH_MIN {
+        if app.splash
+            && app.wake_err.is_some()
+            && !app.waking
+            && app.wake_retry.elapsed() >= Duration::from_secs(10)
+        {
+            retry_wake(&mut app);
+        }
+        if app.splash && app.waking {
+            // star keeps turning until menagerie ensure succeeds
+        } else if app.splash && app.wake_err.is_some() {
+            // loading / error — do not open the dashboard
+        } else if app.splash && !app.waking && app.born.elapsed() >= SPLASH_MIN {
             app.splash = false;
             if app.door {
                 open_dashboard(&mut app);
             }
         }
+        app.kitty_frame.clear();
         term.draw(|f| draw(f, &mut app))?;
+        if kitty::is_terminal() {
+            kitty::sync(&mut io::stdout(), &app.kitty_frame, &mut app.kitty_sent);
+        }
         if let Some(path) = app.pending_editor.take() {
+            if kitty::is_terminal() {
+                kitty::clear(&mut io::stdout(), &mut app.kitty_sent);
+            }
             suspend_editor(&mut term, &path)?;
+        }
+        if app.pending_picker {
+            app.pending_picker = false;
+            if kitty::is_terminal() {
+                kitty::clear(&mut io::stdout(), &mut app.kitty_sent);
+            }
+            suspend_picker(&mut term, &mut app)?;
         }
         let timeout = Duration::from_millis(50).saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -387,45 +422,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
                                     && row < rect.y.saturating_add(rect.height)
                                 {
                                     app.opt_idx = i;
-                                    // toggle/cycle on click
-                                    if i <= 2 {
-                                        apply_mouth_async(&mut app);
-                                    } else if i == 3 {
-                                        open_persona(&mut app);
-                                    } else if i == 4 {
-                                        app.sparkle = !app.sparkle;
-                                        persist_ui(&mut app);
-                                    } else if i == 5 {
-                                        app.verbose = !app.verbose;
-                                        persist_ui(&mut app);
-                                    } else if i == 6 {
-                                        app.default_rune = app.default_rune.next();
-                                        if app.door {
-                                            app.rune_idx = runes::idx_of(app.default_rune);
-                                        }
-                                        persist_ui(&mut app);
-                                    } else if i == 7 {
-                                        app.status =
-                                            "eye is sleeping — no vision GGUF on disk".into();
-                                    } else if i == 8 {
-                                        app.status = "Imp hops the GPU; park Pixie first".into();
-                                    } else if i == 9 {
-                                        app.build_audit_rounds = !app.build_audit_rounds;
-                                        persist_ui(&mut app);
-                                        app.status = format!(
-                                            "build audit rounds: {}",
-                                            if app.build_audit_rounds { "on" } else { "off" }
-                                        );
-                                    } else if i == 10 {
-                                        app.sudo_less_safe = !app.sudo_less_safe;
-                                        persist_ui(&mut app);
-                                        app.status = format!(
-                                            "sudo less-safe: {}",
-                                            if app.sudo_less_safe { "on" } else { "off" }
-                                        );
-                                    } else if i == 11 {
-                                        toggle_sudo(&mut app);
-                                    }
+                                    activate_option(&mut app);
                                     break;
                                 }
                             }
@@ -448,7 +445,13 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
                         && !app.options
                         && !app.session_menu
                     {
-                        insert_text(&mut app.buf, &mut app.cursor, &sanitize_input(&s));
+                        if let Some(a) = attach::from_paste(&s) {
+                            let name = pretty_path(&a.path);
+                            app.status = format!("clipped {name}");
+                            app.pending_files.push(a);
+                        } else {
+                            insert_text(&mut app.buf, &mut app.cursor, &sanitize_input(&s));
+                        }
                     } else if let Some(buf) = app.rename.as_mut() {
                         buf.push_str(&sanitize_input(&s));
                     }
@@ -458,6 +461,9 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
             }
         }
         last_tick = Instant::now();
+    }
+    if kitty::is_terminal() {
+        kitty::clear(&mut io::stdout(), &mut app.kitty_sent);
     }
     disable_raw_mode()?;
     execute!(
@@ -504,6 +510,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
             file,
             name,
             think,
+            ok,
         } => {
             if file.is_some() {
                 let n = file_card_count(app) + 1;
@@ -522,17 +529,30 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                 body,
                 file,
                 think,
+                ok,
             });
             app.live.clear();
         }
         UiMsg::Wake { err } => {
             app.waking = false;
             if let Some(e) = err {
+                app.wake_err = Some(e.clone());
+                app.wake_retry = Instant::now();
                 app.status = format!("pixie: {e}");
+                app.splash = true;
+            } else {
+                app.wake_err = None;
+                if !app.buf.is_empty() && !app.busy && !app.door && !app.options && !app.splash {
+                    let t = std::mem::take(&mut app.buf);
+                    send(app, &t);
+                }
             }
-            if !app.buf.is_empty() && !app.busy && !app.door && !app.options {
-                let t = std::mem::take(&mut app.buf);
-                send(app, &t);
+        }
+        UiMsg::SudoReady { err } => {
+            if let Some(e) = err {
+                app.status = format!("sudo still off · {e}");
+            } else {
+                app.status = format!("sudo on · {}", privilege::status_label());
             }
         }
         UiMsg::Titled { session, name } => {
@@ -879,6 +899,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 None,
             );
             app.status = format!("switched {from_name} → {to_name}");
+            hop_role_for_rune(app);
         }
         return Ok(KeyOut::Continue);
     }
@@ -906,6 +927,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 None,
             );
             app.status = format!("switched {from_name} → {to_name}");
+            hop_role_for_rune(app);
         }
         return Ok(KeyOut::Continue);
     }
@@ -926,6 +948,9 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         KeyCode::Esc => {
             if app.help {
                 app.help = false;
+            } else if !app.pending_files.is_empty() && app.buf.is_empty() {
+                app.pending_files.clear();
+                app.status = "clips dropped".into();
             } else if app.buf.is_empty() {
                 if app.busy {
                     app.abort.cancel();
@@ -955,12 +980,15 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         KeyCode::Char('n') if ctrl(k) => cycle_file(app, 1),
         KeyCode::Char('l') if ctrl(k) => open_look(app),
         KeyCode::Char('o') if ctrl(k) => request_open(app),
+        KeyCode::Char('u') if ctrl(k) && !app.busy => {
+            app.pending_picker = true;
+        }
         KeyCode::Enter => {
             if k.modifiers.contains(KeyModifiers::SHIFT) {
                 insert_text(&mut app.buf, &mut app.cursor, "\n");
             } else {
                 let text = app.buf.trim().to_string();
-                if !text.is_empty() {
+                if !text.is_empty() || !app.pending_files.is_empty() {
                     app.buf.clear();
                     app.cursor = 0;
                     send(app, &text);
@@ -968,7 +996,13 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             }
         }
         KeyCode::Backspace => {
-            delete_before(&mut app.buf, &mut app.cursor);
+            if app.buf.is_empty() && !app.pending_files.is_empty() {
+                if let Some(a) = app.pending_files.pop() {
+                    app.status = format!("dropped {}", pretty_path(&a.path));
+                }
+            } else {
+                delete_before(&mut app.buf, &mut app.cursor);
+            }
         }
         KeyCode::Delete => {
             delete_at(&mut app.buf, &mut app.cursor);
@@ -1106,8 +1140,17 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
                 } else {
                     app.status = "sudo setting up |".into();
                     app.sudo_spin = 0;
+                    let less = app.sudo_less_safe;
+                    let tx = app.tx.clone();
                     std::thread::spawn(move || {
-                        let _ = privilege::enable_less_safe(pw);
+                        let r = if less {
+                            privilege::enable_less_safe(pw)
+                        } else {
+                            privilege::enable_sitting(pw)
+                        };
+                        let _ = tx.send(UiMsg::SudoReady {
+                            err: r.err().map(|e| e.to_string()),
+                        });
                     });
                 }
             }
@@ -1130,7 +1173,7 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 }
 
 fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
-    const N: usize = 12;
+    const N: usize = 15;
     match k.code {
         KeyCode::Esc => {
             app.options = false;
@@ -1144,45 +1187,7 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
         KeyCode::Char('o') if ctrl(k) => open_persona(app),
         KeyCode::Left => cycle_option(app, -1),
         KeyCode::Right => cycle_option(app, 1),
-        KeyCode::Enter => match app.opt_idx {
-            0..=2 => apply_mouth_async(app),
-            3 => open_persona(app),
-            4 => {
-                app.sparkle = !app.sparkle;
-                persist_ui(app);
-            }
-            5 => {
-                app.verbose = !app.verbose;
-                persist_ui(app);
-            }
-            6 => {
-                app.default_rune = app.default_rune.next();
-                if app.door {
-                    app.rune_idx = runes::idx_of(app.default_rune);
-                }
-                persist_ui(app);
-            }
-            7 => app.status = "eye is sleeping — no vision GGUF on disk".into(),
-            8 => app.status = "Imp hops the GPU; park Pixie first".into(),
-            9 => {
-                app.build_audit_rounds = !app.build_audit_rounds;
-                persist_ui(app);
-                app.status = format!(
-                    "build audit rounds: {}",
-                    if app.build_audit_rounds { "on" } else { "off" }
-                );
-            }
-            10 => {
-                app.sudo_less_safe = !app.sudo_less_safe;
-                persist_ui(app);
-                app.status = format!(
-                    "sudo less-safe: {}",
-                    if app.sudo_less_safe { "on" } else { "off" }
-                );
-            }
-            11 => toggle_sudo(app),
-            _ => {}
-        },
+        KeyCode::Enter => activate_option(app),
         _ => {}
     }
     Ok(KeyOut::Continue)
@@ -1191,6 +1196,12 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 fn cycle_option(app: &mut App, dir: i32) {
     match app.opt_idx {
         0 => {
+            const ROLES: [&str; 3] = ["chat", "code", "vision"];
+            let i = ROLES.iter().position(|r| *r == app.mouth_role).unwrap_or(0) as i32;
+            let j = (i + dir).rem_euclid(3) as usize;
+            app.mouth_role = ROLES[j].to_string();
+        }
+        1 => {
             let names = prefs::chat_model_names();
             if names.is_empty() {
                 return;
@@ -1203,42 +1214,126 @@ fn cycle_option(app: &mut App, dir: i32) {
             let j = (i as i32 + dir).rem_euclid(n) as usize;
             app.mouth.model = names[j].clone();
         }
-        1 => {
+        2 => {
             app.mouth.backend = if app.mouth.backend == "gpu" {
                 "cpu".into()
             } else {
                 "gpu".into()
             };
         }
-        2 => {
+        3 => {
             app.mouth.ctx = if app.mouth.ctx >= 16384 { 8192 } else { 16384 };
         }
-        4 => {
+        5 => {
             app.sparkle = !app.sparkle;
             persist_ui(app);
         }
-        5 => {
+        6 => {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        6 => {
+        7 => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        9 => {
+        10 => {
+            app.enhance_image = !app.enhance_image;
+            persist_ui(app);
+        }
+        11 => cycle_art_dir(app, dir),
+        12 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
         }
-        10 => {
+        13 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
         }
-        11 => toggle_sudo(app),
+        14 => toggle_sudo(app),
         _ => {}
     }
+}
+
+fn activate_option(app: &mut App) {
+    match app.opt_idx {
+        0..=3 => apply_mouth_async(app),
+        4 => open_persona(app),
+        5 => {
+            app.sparkle = !app.sparkle;
+            persist_ui(app);
+        }
+        6 => {
+            app.verbose = !app.verbose;
+            persist_ui(app);
+        }
+        7 => {
+            app.default_rune = app.default_rune.next();
+            if app.door {
+                app.rune_idx = runes::idx_of(app.default_rune);
+            }
+            persist_ui(app);
+        }
+        8 => {
+            app.status = if prefs::eye_asleep() {
+                "eye is sleeping — no mmproj on disk".into()
+            } else {
+                "look hops the GPU (park 8B, VL 7B, restore Chat)".into()
+            };
+        }
+        9 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
+        10 => {
+            app.enhance_image = !app.enhance_image;
+            persist_ui(app);
+            app.status = format!(
+                "enhance wish: {}",
+                if app.enhance_image { "on" } else { "off" }
+            );
+        }
+        11 => {
+            cycle_art_dir(app, 1);
+            app.status = format!("art folder: {}", app.art_dir);
+        }
+        12 => {
+            app.build_audit_rounds = !app.build_audit_rounds;
+            persist_ui(app);
+            app.status = format!(
+                "build audit rounds: {}",
+                if app.build_audit_rounds { "on" } else { "off" }
+            );
+        }
+        13 => {
+            app.sudo_less_safe = !app.sudo_less_safe;
+            persist_ui(app);
+            app.status = format!(
+                "sudo less-safe: {}",
+                if app.sudo_less_safe { "on" } else { "off" }
+            );
+        }
+        14 => toggle_sudo(app),
+        _ => {}
+    }
+}
+
+fn cycle_art_dir(app: &mut App, dir: i32) {
+    let mut choices = vec![
+        "~/pixie_art".to_string(),
+        "~/Pictures".to_string(),
+        "~/imp".to_string(),
+    ];
+    if !choices.iter().any(|c| c == &app.art_dir) {
+        choices.insert(0, app.art_dir.clone());
+    }
+    let i = choices
+        .iter()
+        .position(|c| c == &app.art_dir)
+        .unwrap_or(0) as i32;
+    let n = choices.len() as i32;
+    let j = (i + dir).rem_euclid(n) as usize;
+    app.art_dir = choices[j].clone();
+    persist_ui(app);
 }
 
 fn toggle_sudo(app: &mut App) {
@@ -1270,6 +1365,19 @@ fn open_persona(app: &mut App) {
     app.pending_editor = Some(p);
 }
 
+fn hop_role_for_rune(app: &mut App) {
+    let want = if app.rune_key() == RuneKey::Build {
+        "code"
+    } else {
+        "chat"
+    };
+    if app.mouth_role == want {
+        return;
+    }
+    app.mouth_role = want.to_string();
+    apply_mouth_async(app);
+}
+
 fn apply_mouth_async(app: &mut App) {
     if app.mouth_busy || app.busy {
         app.status = "pixie: mouth is busy".into();
@@ -1278,13 +1386,14 @@ fn apply_mouth_async(app: &mut App) {
     app.mouth_busy = true;
     app.status = "applying mouth…".into();
     let draft = app.mouth.clone();
+    let slot = app.mouth_role.clone();
     let old = prefs::pixie_mouth();
     let tx = app.tx.clone();
     std::thread::spawn(move || {
-        let err = match prefs::apply_mouth(&draft.model, &draft.backend, draft.ctx) {
+        let err = match prefs::apply_mouth_slot(&slot, &draft.model, &draft.backend, draft.ctx) {
             Ok(()) => None,
             Err(e) => {
-                let _ = prefs::apply_mouth(&old.model, &old.backend, old.ctx);
+                let _ = prefs::apply_mouth_slot("chat", &old.model, &old.backend, old.ctx);
                 Some(e)
             }
         };
@@ -1378,7 +1487,16 @@ fn wake_if_needed(app: &mut App) {
     if app.waking || llm::port().is_some_and(llm::mouth_up) {
         return;
     }
+    retry_wake(app);
+}
+
+fn retry_wake(app: &mut App) {
+    if app.waking {
+        return;
+    }
     app.waking = true;
+    app.splash = true;
+    app.wake_retry = Instant::now();
     let tx = app.tx.clone();
     std::thread::spawn(move || {
         let ok = llm::ensure_llm_up();
@@ -1463,7 +1581,18 @@ fn send(app: &mut App, text: &str) {
     app.gen += 1;
     let gen = app.gen;
     app.abort = Abort::new();
-    app.chat.push(ChatEntry::User(text.to_string()));
+    let files = std::mem::take(&mut app.pending_files);
+    let args = if files.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "files": files.iter().map(|a| a.to_json()).collect::<Vec<_>>()
+        }))
+    };
+    app.chat.push(ChatEntry::User {
+        text: text.to_string(),
+        files,
+    });
     mind::append_session(
         &app.session_id,
         &SessionRec {
@@ -1472,7 +1601,7 @@ fn send(app: &mut App, text: &str) {
             rune: app.rune_key().as_str().into(),
             text: text.to_string(),
             tool: String::new(),
-            args: None,
+            args,
             result: None,
             raw: String::new(),
             think: String::new(),
@@ -1533,6 +1662,7 @@ fn send(app: &mut App, text: &str) {
                     file,
                     name,
                     think,
+                    ok,
                     ..
                 } => {
                     let _ = tx.send(UiMsg::Tool {
@@ -1541,6 +1671,7 @@ fn send(app: &mut App, text: &str) {
                         file,
                         name,
                         think,
+                        ok,
                     });
                 }
                 Event::ToolStart { name, .. } => {
@@ -1564,29 +1695,32 @@ fn send(app: &mut App, text: &str) {
 }
 
 fn file_card_count(app: &App) -> usize {
-    app.chat
-        .iter()
-        .filter(|e| matches!(e, ChatEntry::Tool { file: Some(_), .. }))
-        .count()
+    file_cards(app).len()
 }
 
-fn file_cards(app: &App) -> Vec<&FileTouch> {
-    app.chat
-        .iter()
-        .filter_map(|e| match e {
-            ChatEntry::Tool { file: Some(f), .. } => Some(f),
-            _ => None,
-        })
-        .collect()
+fn file_cards(app: &App) -> Vec<FileTouch> {
+    let mut out = Vec::new();
+    for e in &app.chat {
+        match e {
+            ChatEntry::User { files, .. } => {
+                for a in files {
+                    out.push(a.as_touch());
+                }
+            }
+            ChatEntry::Tool { file: Some(f), .. } => out.push(f.clone()),
+            _ => {}
+        }
+    }
+    out
 }
 
-fn current_touch(app: &App) -> Option<&FileTouch> {
-    let n = file_card_count(app);
-    if n == 0 {
+fn current_touch(app: &App) -> Option<FileTouch> {
+    let cards = file_cards(app);
+    if cards.is_empty() {
         return None;
     }
-    let want = app.file_sel.min(n - 1);
-    file_cards(app).into_iter().nth(want)
+    let want = app.file_sel.min(cards.len() - 1);
+    cards.into_iter().nth(want)
 }
 
 fn cycle_file(app: &mut App, delta: i32) {
@@ -1605,15 +1739,20 @@ fn open_look(app: &mut App) {
         return;
     };
     let path = touch.path.clone();
-    let lines = look_lines(touch);
+    let image = touch.kind == diff::FileKind::Image;
+    let lines = look_lines(&touch);
     app.look = Some(LookState {
         path,
         lines,
         scroll: 0,
+        image,
     });
 }
 
 fn look_lines(touch: &FileTouch) -> Vec<(Op, String)> {
+    if touch.kind == diff::FileKind::Image {
+        return vec![(Op::Eq, format!("picture · {}", pretty_path(&touch.path)))];
+    }
     if touch.binary {
         return vec![(Op::Eq, "not a text file".into())];
     }
@@ -1649,7 +1788,7 @@ fn suspend_editor<B: ratatui::backend::Backend>(
         event::DisableBracketedPaste
     )?;
     let _ = term.show_cursor();
-    let argv = editor_argv();
+    let argv = open_argv(path);
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).arg(path);
     let _ = cmd.status();
@@ -1664,11 +1803,99 @@ fn suspend_editor<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+fn suspend_picker<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        event::DisableMouseCapture,
+        event::DisableBracketedPaste
+    )?;
+    let _ = term.show_cursor();
+    let out = std::env::temp_dir().join(format!("pixie-pick-{}.path", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let start = attach::pick_start(&app.pending_files);
+    let spellbook = attach::spellbook_bin();
+    let status = std::process::Command::new(&spellbook)
+        .arg("--pick")
+        .arg("--output")
+        .arg(&out)
+        .arg(&start)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+    enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
+    )?;
+    term.clear()?;
+    match status {
+        Ok(s) if s.success() || out.is_file() => {
+            if let Ok(t) = std::fs::read_to_string(&out) {
+                let p = PathBuf::from(t.trim());
+                match Attach::from_path(&p) {
+                    Ok(a) => {
+                        app.status = format!("clipped {}", pretty_path(&a.path));
+                        app.pending_files.push(a);
+                    }
+                    Err(e) => app.status = format!("pixie: {e}"),
+                }
+            }
+        }
+        Ok(_) => app.status = "clip cancelled".into(),
+        Err(e) => {
+            app.status = format!("pixie: spellbook pick failed ({e})");
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    Ok(())
+}
+
 fn editor_argv() -> Vec<String> {
     let raw = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "nano".into());
     mind::split_argv(&raw).unwrap_or_else(|_| vec![raw])
+}
+
+fn is_picture(path: &Path) -> bool {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        Some(ext) => matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif"),
+        None => false,
+    }
+}
+
+fn first_on_path(names: &[&str]) -> Option<String> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    for name in names {
+        for dir in path.split(':') {
+            let p = Path::new(dir).join(name);
+            if p.is_file() {
+                return Some((*name).to_string());
+            }
+        }
+    }
+    None
+}
+
+fn open_argv(path: &Path) -> Vec<String> {
+    if is_picture(path) {
+        if let Some(bin) = first_on_path(&["imv", "imv-x11", "feh", "xdg-open"]) {
+            return vec![bin];
+        }
+    }
+    editor_argv()
 }
 
 fn pretty_path(p: &str) -> String {
@@ -1689,7 +1916,25 @@ fn prompt_text(app: &App, rune_desc: &str) -> (String, bool) {
     };
     let wait = glyph::wait_line(app.born);
     if let Some((name, args)) = app.confirm.peek() {
-        return (format!("{spin}  approve {name}? {args}  [y/N]"), false);
+        return (
+            format!("{spin}  {}", tools::confirm_line(&name, &args)),
+            false,
+        );
+    }
+    if !app.pending_files.is_empty() && !app.busy {
+        let chips: String = app
+            .pending_files
+            .iter()
+            .map(|a| format!("[{} {}]", a.kind.as_str(), pretty_path(&a.path)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if app.buf.is_empty() {
+            return (
+                format!("{chips}\n✦  enter send · C-u more · backspace drops"),
+                true,
+            );
+        }
+        return (format!("{chips}\n✦ {}", app.buf), true);
     }
     if !app.buf.is_empty() {
         return (format!("✦ {}", app.buf), true);
@@ -1731,6 +1976,9 @@ fn prompt_text(app: &App, rune_desc: &str) -> (String, bool) {
         );
     }
     if app.busy {
+        if let Some(p) = crate::forge::phase_status(spin) {
+            return (format!("{p}  (type + enter barge-in)"), false);
+        }
         let phase = if app.phase.is_empty() {
             wait.to_string()
         } else {
@@ -1867,6 +2115,7 @@ struct Bubble {
     max_frac: u16,
     border: Color,
     file_i: Option<usize>,
+    place: Option<kitty::Place>,
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
@@ -1890,8 +2139,8 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     if app.splash {
         draw_splash(f, chunks[0], app);
-    } else if let Some(look) = app.look.as_ref() {
-        draw_look(f, chunks[0], look);
+    } else if app.look.is_some() {
+        draw_look(f, chunks[0], app);
     } else if app.options {
         draw_options_card(f, chunks[0], app);
     } else if app.session_menu {
@@ -1907,7 +2156,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.help {
         let help = Paragraph::new(
             "enter send · esc clear/cancel · C-q quit · tab / shift-tab runes · C-v verbose · C-h help\n\
-             C-s sessions · C-l look · C-o open editor · C-p / C-n files · esc home · C-q quit",
+             C-s sessions · C-u clip · C-l look · C-o open editor · C-p / C-n files · esc home · C-q quit",
         )
         .style(Style::default().fg(SILVER))
         .block(
@@ -1924,8 +2173,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let rows = chrome::wrap(&prompt_inner, inner_w);
     let inner_h = chunks[2].height.saturating_sub(2).max(1) as usize;
     let (crow, ccol) = if editing {
-        let prefix = "✦ ".chars().count();
-        let vis = prefix + app.cursor.min(app.buf.chars().count());
+        let prefix_chars = prompt_inner
+            .rfind('✦')
+            .map(|i| prompt_inner[..i].chars().count() + "✦ ".chars().count())
+            .unwrap_or_else(|| "✦ ".chars().count());
+        let vis = prefix_chars + app.cursor.min(app.buf.chars().count());
         chrome::wrap_cursor(&prompt_inner, inner_w, vis)
     } else {
         (0, 0)
@@ -2162,7 +2414,9 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
     let ctx_s = app.mouth.ctx.to_string();
     let audit = if app.build_audit_rounds { "on" } else { "off" };
     let less_safe = if app.sudo_less_safe { "on" } else { "off" };
+    let enhance = if app.enhance_image { "on" } else { "off" };
     let rows = [
+        ("Role", app.mouth_role.as_str()),
         ("Model", app.mouth.model.as_str()),
         ("Backend", app.mouth.backend.as_str()),
         ("Context", ctx_s.as_str()),
@@ -2172,6 +2426,8 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         ("Rune", app.default_rune.as_str()),
         ("Eye", eye),
         ("Imp", "hop · one GPU tenant"),
+        ("Enhance", enhance),
+        ("Art", app.art_dir.as_str()),
         ("Audit", audit),
         ("LessSafe", less_safe),
         ("Sudo", privilege::status_label()),
@@ -2193,7 +2449,7 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         x: block_area.x + 1,
         y: block_area.y + 3,
         width: block_area.width.saturating_sub(2),
-        height: 12,
+        height: rows.len() as u16,
     };
     for i in 0..rows.len() {
         let y = inner.y + i as u16;
@@ -2299,8 +2555,15 @@ fn compact_on_quit(app: &App) {
     let mut lines = Vec::new();
     for e in &app.chat {
         match e {
-            ChatEntry::User(t) if !t.trim().is_empty() => {
-                lines.push(("you".into(), t.clone()));
+            ChatEntry::User { text: t, files } if !t.trim().is_empty() || !files.is_empty() => {
+                let mut s = t.clone();
+                for a in files {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(&a.path);
+                }
+                lines.push(("you".into(), s));
             }
             ChatEntry::Assistant { text, .. } if !text.trim().is_empty() => {
                 lines.push(("pixie".into(), text.clone()));
@@ -2379,7 +2642,15 @@ fn draw_splash(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(Paragraph::new(*line).style(Style::default().fg(PINK)), row);
     }
-    let wait = glyph::wait_line(app.born);
+    let wait = if let Some(err) = app.wake_err.as_deref() {
+        if err.len() > 48 {
+            "menagerie did not wake — retrying"
+        } else {
+            err
+        }
+    } else {
+        glyph::wait_line(app.born)
+    };
     let wy = y.saturating_add(gh).saturating_add(1);
     if wy < area.y + area.height {
         let w = (wait.chars().count() as u16).min(area.width);
@@ -2396,13 +2667,42 @@ fn draw_splash(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_look(f: &mut Frame, area: Rect, look: &LookState) {
-    let title = format!(" look · {} ", pretty_path(&look.path));
+fn draw_look(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some((path, image, look_lines, scroll)) = app.look.as_ref().map(|look| {
+        (
+            look.path.clone(),
+            look.image,
+            look.lines.clone(),
+            look.scroll,
+        )
+    }) else {
+        return;
+    };
+    let title = format!(" look · {} ", pretty_path(&path));
     let inner_w = area.width.saturating_sub(2).max(8) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for (op, text) in &look.lines {
-        for chunk in chrome::wrap(text, inner_w.saturating_sub(2)) {
-            lines.push(diff_line(*op, &chunk));
+    if image && Path::new(&path).is_file() {
+        let max_cols = area.width.saturating_sub(4).clamp(8, 72);
+        let max_rows = area.height.saturating_sub(4).clamp(4, 24);
+        if kitty::is_terminal() {
+            let place = kitty::fit_path(Path::new(&path), max_cols, max_rows);
+            lines.extend(kitty::placeholder_lines(place.id, place.cols, place.rows));
+            app.kitty_frame.insert(place.id, place);
+        } else {
+            lines.extend(crate::forge::png_halfblocks(
+                Path::new(&path),
+                max_cols,
+                max_rows,
+            ));
+        }
+        for (op, text) in &look_lines {
+            lines.push(diff_line(*op, text));
+        }
+    } else {
+        for (op, text) in &look_lines {
+            for chunk in chrome::wrap(text, inner_w.saturating_sub(2)) {
+                lines.push(diff_line(*op, &chunk));
+            }
         }
     }
     if lines.is_empty() {
@@ -2420,7 +2720,7 @@ fn draw_look(f: &mut Frame, area: Rect, look: &LookState) {
                 .border_set(chrome::border_set()),
         )
         .wrap(Wrap { trim: false })
-        .scroll((look.scroll, 0));
+        .scroll((scroll, 0));
     f.render_widget(para, area);
 }
 
@@ -2497,6 +2797,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App, rune_name: &str) {
         if let Some(fi) = b.file_i {
             app.file_hits.push((r, fi));
         }
+        if skip == 0 {
+            if let Some(place) = &b.place {
+                app.kitty_frame.insert(place.id, place.clone());
+            }
+        }
     }
 }
 
@@ -2507,15 +2812,23 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
     let mut tool_n = 0usize;
     for e in &app.chat {
         match e {
-            ChatEntry::User(t) => {
-                out.push(Bubble {
-                    right: true,
-                    title: " you ".into(),
-                    lines: wrap_plain(t),
-                    max_frac: 70,
-                    border: BLUSH,
-                    file_i: None,
-                });
+            ChatEntry::User { text: t, files } => {
+                if !t.trim().is_empty() {
+                    out.push(Bubble {
+                        right: true,
+                        title: " you ".into(),
+                        lines: wrap_plain(t),
+                        max_frac: 70,
+                        border: BLUSH,
+                        file_i: None,
+                        place: None,
+                    });
+                }
+                for a in files {
+                    let sel = file_i == app.file_sel;
+                    out.push(clip_bubble(a, sel, file_i));
+                    file_i += 1;
+                }
             }
             ChatEntry::Assistant {
                 text,
@@ -2532,6 +2845,7 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
                     max_frac: 80,
                     border: PINK,
                     file_i: None,
+                    place: None,
                 });
             }
             ChatEntry::Compact { .. } => {}
@@ -2541,10 +2855,12 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
                 body,
                 file,
                 think,
-                ..
+                ok,
             } => {
                 push_think_bubble(&mut out, app.verbose, think, &mut think_n);
                 tool_n += 1;
+                let label = tools::tool_label(name);
+                let border = if *ok { GREEN } else { RED };
                 if let Some(ft) = file {
                     let sel = file_i == app.file_sel;
                     out.push(file_bubble(
@@ -2555,21 +2871,22 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
                         file_i,
                         tool_n,
                         name,
+                        *ok,
                     ));
                     file_i += 1;
                 } else {
-                    let label = if name.is_empty() {
-                        title.as_str()
-                    } else {
-                        name.as_str()
-                    };
                     out.push(Bubble {
                         right: false,
-                        title: format!(" tool {tool_n} · {label} "),
-                        lines: wrap_plain(if app.verbose { body } else { label }),
+                        title: if app.verbose {
+                            format!(" tool {tool_n} · {title} ")
+                        } else {
+                            format!(" {label} ")
+                        },
+                        lines: wrap_plain(body),
                         max_frac: 90,
-                        border: SILVER,
+                        border,
                         file_i: None,
+                        place: None,
                     });
                 }
             }
@@ -2587,6 +2904,7 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
                 max_frac: 80,
                 border: PINK,
                 file_i: None,
+                place: None,
             });
         } else {
             out.push(Bubble {
@@ -2596,6 +2914,7 @@ fn collect_bubbles(app: &App, _width: u16) -> Vec<Bubble> {
                 max_frac: 50,
                 border: SILVER,
                 file_i: None,
+                place: None,
             });
         }
     }
@@ -2614,6 +2933,7 @@ fn push_think_bubble(out: &mut Vec<Bubble>, verbose: bool, think: &str, think_n:
         max_frac: 80,
         border: DIM,
         file_i: None,
+        place: None,
     });
 }
 
@@ -2624,7 +2944,7 @@ fn entry_titles(chat: &[ChatEntry], verbose: bool) -> Vec<String> {
     let mut tool_n = 0usize;
     for e in chat {
         match e {
-            ChatEntry::User(_) => titles.push("you".into()),
+            ChatEntry::User { .. } => titles.push("you".into()),
             ChatEntry::Compact { .. } => {}
             ChatEntry::Assistant { think, .. } => {
                 if verbose && !think.trim().is_empty() {
@@ -2639,7 +2959,7 @@ fn entry_titles(chat: &[ChatEntry], verbose: bool) -> Vec<String> {
                     titles.push(format!("think {think_n}"));
                 }
                 tool_n += 1;
-                titles.push(format!("tool {tool_n} · {name}"));
+                titles.push(format!("tool {tool_n} · {}", tools::tool_label(name)));
             }
         }
     }
@@ -2654,13 +2974,15 @@ fn file_bubble(
     file_i: usize,
     tool_n: usize,
     name: &str,
+    ok: bool,
 ) -> Bubble {
     let sum = ft.summary();
     let mark = if sel { "▸ " } else { "" };
+    let label = tools::tool_label(name);
     let tool = if name.is_empty() {
         format!("tool {tool_n}")
     } else {
-        format!("tool {tool_n} · {name}")
+        format!("tool {tool_n} · {label}")
     };
     let title = if sum.is_empty() {
         format!(
@@ -2676,7 +2998,18 @@ fn file_bubble(
         )
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
-    if ft.kind == diff::FileKind::Search && !ft.extra_paths.is_empty() {
+    let mut place = None;
+    if ft.kind == diff::FileKind::Image {
+        let (img_lines, p) = picture_lines(Path::new(&ft.path), 72, 24);
+        lines.extend(img_lines);
+        place = p;
+        if !body.is_empty() {
+            lines.push(Line::from(Span::styled(
+                body.to_string(),
+                Style::default().fg(SILVER),
+            )));
+        }
+    } else if ft.kind == diff::FileKind::Search && !ft.extra_paths.is_empty() {
         for p in ft.extra_paths.iter().take(12) {
             lines.push(Line::from(Span::styled(
                 pretty_path(p),
@@ -2703,7 +3036,7 @@ fn file_bubble(
         "C-o open  ·  C-l look  ·  C-p / C-n files",
         Style::default().fg(DIM),
     )));
-    if verbose && !body.is_empty() {
+    if verbose && !body.is_empty() && ft.kind != diff::FileKind::Image {
         for chunk in chrome::wrap(body, 80) {
             lines.push(Line::from(Span::styled(
                 chunk,
@@ -2716,8 +3049,83 @@ fn file_bubble(
         title,
         lines,
         max_frac: 90,
-        border: if sel { PINK } else { DIM },
+        border: if sel {
+            PINK
+        } else if ok {
+            GREEN
+        } else {
+            RED
+        },
         file_i: Some(file_i),
+        place,
+    }
+}
+
+fn picture_lines(path: &Path, max_cols: u16, max_rows: u16) -> (Vec<Line<'static>>, Option<kitty::Place>) {
+    if !path.is_file() {
+        return (
+            vec![Line::from(Span::styled(
+                "picture gone",
+                Style::default().fg(DIM),
+            ))],
+            None,
+        );
+    }
+    if kitty::is_terminal() {
+        let place = kitty::fit_path(path, max_cols, max_rows);
+        let lines = kitty::placeholder_lines(place.id, place.cols, place.rows);
+        (lines, Some(place))
+    } else {
+        (
+            crate::forge::png_halfblocks(path, max_cols, max_rows.max(8)),
+            None,
+        )
+    }
+}
+
+fn clip_bubble(a: &Attach, sel: bool, file_i: usize) -> Bubble {
+    let mark = if sel { "▸ " } else { "" };
+    let name = pretty_path(&a.path);
+    match a.kind {
+        attach::Kind::Image => {
+            let (mut lines, place) = picture_lines(Path::new(&a.path), 56, 20);
+            if let Some(c) = &a.caption {
+                lines.push(Line::from(Span::styled(
+                    c.clone(),
+                    Style::default().fg(SILVER),
+                )));
+            }
+            Bubble {
+                right: true,
+                title: format!(" {mark}you · picture · {name} "),
+                lines,
+                max_frac: 70,
+                border: if sel { PINK } else { BLUSH },
+                file_i: Some(file_i),
+                place,
+            }
+        }
+        attach::Kind::Text => Bubble {
+            right: true,
+            title: format!(" {mark}you · text · {name} "),
+            lines: wrap_plain(
+                &a.excerpt(400)
+                    .unwrap_or_else(|| "(empty)".into()),
+            ),
+            max_frac: 70,
+            border: if sel { PINK } else { BLUSH },
+            file_i: Some(file_i),
+            place: None,
+        },
+        attach::Kind::Other => Bubble {
+            right: true,
+            title: format!(" {mark}you · file · {name} "),
+            lines: wrap_plain("pixie cannot see this kind yet"),
+            max_frac: 50,
+            border: if sel { PINK } else { DIM },
+            file_i: Some(file_i),
+            place: None,
+        },
     }
 }
 
@@ -2761,6 +3169,10 @@ fn wrapped_height(lines: &[Line<'static>], inner_w: usize) -> u16 {
     let mut n = 0u16;
     for line in lines {
         let t = line.to_string();
+        if t.contains(kitty::PLACEHOLDER) {
+            n = n.saturating_add(1);
+            continue;
+        }
         let chunks = chrome::wrap(&t, inner_w.max(1));
         n = n.saturating_add(chunks.len().max(1) as u16);
     }
@@ -2773,6 +3185,9 @@ fn render_bubble(f: &mut Frame, rect: Rect, b: &Bubble, file_sel: usize, skip: u
     } else {
         b.border
     };
+    let wrap = Wrap {
+        trim: false,
+    };
     let para = Paragraph::new(b.lines.clone())
         .block(
             Block::default()
@@ -2781,7 +3196,7 @@ fn render_bubble(f: &mut Frame, rect: Rect, b: &Bubble, file_sel: usize, skip: u
                 .border_style(Style::default().fg(border))
                 .border_set(chrome::border_set()),
         )
-        .wrap(Wrap { trim: false })
+        .wrap(wrap)
         .scroll((skip, 0));
     f.render_widget(para, rect);
 }
@@ -2828,6 +3243,7 @@ mod tests {
             src.contains("C-o open  ·  C-l look  ·  C-p / C-n files"),
             "file card must teach Ctrl keys"
         );
+        assert!(src.contains("C-u clip"), "help must teach C-u clip");
         assert!(
             src.contains("  · C-v verbose"),
             "footer must label C-v as verbose"
@@ -2858,13 +3274,14 @@ mod tests {
     #[test]
     fn think_and_tool_are_enumerated_both() {
         let chat = vec![
-            ChatEntry::User("hi".into()),
+            ChatEntry::you("hi"),
             ChatEntry::Tool {
                 name: "execute_bash".into(),
                 title: "execute_bash · 0.2s".into(),
                 body: "ok".into(),
                 file: None,
                 think: "I should run ls".into(),
+                ok: true,
             },
             ChatEntry::Assistant {
                 text: "done".into(),
@@ -2878,7 +3295,7 @@ mod tests {
             vec![
                 "you".to_string(),
                 "think 1".into(),
-                "tool 1 · execute_bash".into(),
+                "tool 1 · shell".into(),
                 "think 2".into(),
                 "pixie".into(),
             ]
@@ -2887,7 +3304,7 @@ mod tests {
             entry_titles(&chat, false),
             vec![
                 "you".to_string(),
-                "tool 1 · execute_bash".into(),
+                "tool 1 · shell".into(),
                 "pixie".into(),
             ]
         );
@@ -2902,7 +3319,7 @@ mod tests {
             entry_titles(&with_compact, false),
             vec![
                 "you".to_string(),
-                "tool 1 · execute_bash".into(),
+                "tool 1 · shell".into(),
                 "pixie".into(),
             ]
         );

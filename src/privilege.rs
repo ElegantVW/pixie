@@ -99,7 +99,16 @@ pub fn enable_ticket() {
     }
 }
 
-pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
+pub fn enable_sitting(pw: String) -> std::io::Result<()> {
+    enable_askpass(pw, SudoMode::Sitting)
+}
+
+pub fn enable_less_safe(pw: String) -> std::io::Result<()> {
+    enable_askpass(pw, SudoMode::LessSafe)
+}
+
+/// One lock. Spawn the askpass server after the guard is dropped.
+fn enable_askpass(mut pw: String, mode: SudoMode) -> std::io::Result<()> {
     disable();
     let mut secret = pw.trim_end_matches(['\n', '\r']).to_string();
     wipe(&mut pw);
@@ -109,66 +118,43 @@ pub fn enable_less_safe(mut pw: String) -> std::io::Result<()> {
             "password is empty",
         ));
     }
+    if !matches!(mode, SudoMode::Sitting | SudoMode::LessSafe) {
+        wipe(&mut secret);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "askpass mode must be sitting or less-safe",
+        ));
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let setup = (|| -> std::io::Result<()> {
         write_wrapper()?;
         let listener = bind_server()?;
-        let mut s = seat().lock().unwrap_or_else(|p| p.into_inner());
-        s.mode = SudoMode::Off;
-        s.secret = Some(secret.clone());
-        s.last = Instant::now();
-        s.stop = stop.clone();
+        {
+            let mut s = seat().lock().unwrap_or_else(|p| p.into_inner());
+            s.mode = mode;
+            s.secret = Some(secret.clone());
+            s.last = Instant::now();
+            s.stop = stop.clone();
+        }
         let server_stop = stop.clone();
-        let rt = paths::runtime_dir();
         thread::spawn(move || {
             let _ =
                 std::fs::set_permissions(&wrapper_path(), std::fs::Permissions::from_mode(0o700));
-            loop {
-                if server_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                match listener.accept() {
-                    Ok((mut st, _)) => {
-                        let _ = st.set_nonblocking(true);
-                        let _ = st.set_read_timeout(Some(Duration::from_millis(500)));
-                        let mut buf = [0u8; 64];
-                        let _ = std::io::Read::read(&mut st, &mut buf);
-                        let secret_copy = seat()
-                            .lock()
-                            .ok()
-                            .and_then(|s| if s.mode == SudoMode::LessSafe { s.secret.clone() } else { None });
-                        if let Some(sec) = secret_copy {
-                            let mut out = sec.as_bytes().to_vec();
-                            out.push(b'\n');
-                            let _ = std::io::Write::write_all(&mut st, &out);
-                            let _ = std::io::Write::flush(&mut st);
-                            drop(st);
-                            continue;
-                        }
-                        let _ = std::io::Write::write_all(&mut st, b"\n");
-                        let _ = std::io::Write::flush(&mut st);
-                        drop(st);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => break,
-                }
-            }
+            serve(listener, server_stop);
             let _ = std::fs::remove_file(sock_path());
             let _ = std::fs::remove_file(wrapper_path());
         });
-        {
-            let mut s2 = seat().lock().unwrap_or_else(|p| p.into_inner());
-            s2.mode = SudoMode::LessSafe;
-            s2.last = Instant::now();
-        }
-        let _ = std::fs::write(rt.join("sudo-mode"), "less-safe\n");
+        let label = match mode {
+            SudoMode::LessSafe => "less-safe",
+            _ => "sitting",
+        };
+        let _ = std::fs::write(paths::runtime_dir().join("sudo-mode"), format!("{label}\n"));
         Ok(())
     })();
     if let Err(e) = setup {
         disable();
+        wipe(&mut secret);
         return Err(e);
     }
     wipe(&mut secret);
@@ -192,7 +178,9 @@ pub fn idle_tick() {
     let stale = seat()
         .lock()
         .ok()
-        .map(|s| s.mode == SudoMode::Sitting && s.last.elapsed() >= IDLE)
+        .map(|s| {
+            matches!(s.mode, SudoMode::Sitting | SudoMode::LessSafe) && s.last.elapsed() >= IDLE
+        })
         .unwrap_or(false);
     if stale {
         disable();
@@ -305,8 +293,14 @@ pub fn askpass_client() -> i32 {
 mod tests {
     use super::*;
 
+    fn gate() -> std::sync::MutexGuard<'static, ()> {
+        static G: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        G.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn default_off() {
+        let _g = gate();
         disable();
         assert!(!is_on());
         assert_eq!(status_label(), "off");
@@ -319,5 +313,28 @@ mod tests {
         assert!(src.contains("XDG_RUNTIME_DIR") || src.contains("runtime_dir"));
         assert!(src.contains("--askpass"));
         assert!(src.contains("SUDO_ASKPASS"));
+        assert!(src.contains("enable_sitting"));
+        assert!(src.contains("enable_askpass"));
+    }
+
+    #[test]
+    fn sitting_enable_does_not_deadlock() {
+        let _g = gate();
+        disable();
+        enable_sitting("house-test-secret".into()).expect("sitting");
+        assert_eq!(mode(), SudoMode::Sitting);
+        assert!(is_on());
+        assert!(wrapper_path().is_file());
+        disable();
+        assert!(!is_on());
+        assert_eq!(status_label(), "off");
+    }
+
+    #[test]
+    fn empty_password_stays_off() {
+        let _g = gate();
+        disable();
+        assert!(enable_sitting(String::new()).is_err());
+        assert!(!is_on());
     }
 }

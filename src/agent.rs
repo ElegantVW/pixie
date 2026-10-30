@@ -1,3 +1,4 @@
+use crate::attach::{self, Attach};
 use crate::diff::FileTouch;
 use crate::host;
 use crate::llm::{self, Abort};
@@ -7,11 +8,14 @@ use crate::think;
 use crate::tools;
 use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub enum ChatEntry {
-    User(String),
+    User {
+        text: String,
+        files: Vec<Attach>,
+    },
     Assistant {
         text: String,
         clock: String,
@@ -24,11 +28,21 @@ pub enum ChatEntry {
         body: String,
         file: Option<FileTouch>,
         think: String,
+        ok: bool,
     },
     /// Prompt-only recap. TUI skips it; jsonl keeps it.
     Compact {
         text: String,
     },
+}
+
+impl ChatEntry {
+    pub fn you(text: impl Into<String>) -> Self {
+        ChatEntry::User {
+            text: text.into(),
+            files: Vec::new(),
+        }
+    }
 }
 
 pub struct TurnOut {
@@ -112,10 +126,84 @@ pub const HISTORY_CHAR_BUDGET: usize = 24_000;
 
 fn entry_prompt_chars(e: &ChatEntry) -> usize {
     match e {
-        ChatEntry::User(t) => t.len(),
+        ChatEntry::User { text, files } => text.len() + user_files_chars(files),
         ChatEntry::Assistant { text, .. } => text.len(),
         ChatEntry::Tool { name, body, .. } => wrap_tool_result(name, body).len(),
         ChatEntry::Compact { text } => text.len(),
+    }
+}
+
+fn user_files_chars(files: &[Attach]) -> usize {
+    files
+        .iter()
+        .map(|a| {
+            a.path.len()
+                + a.caption.as_ref().map(|c| c.len()).unwrap_or(0)
+                + a.excerpt(attach::TEXT_CAP).map(|e| e.len()).unwrap_or(0)
+        })
+        .sum()
+}
+
+fn user_prompt_text(text: &str, files: &[Attach]) -> String {
+    if files.is_empty() {
+        return text.to_string();
+    }
+    let mut s = text.to_string();
+    s.push_str("\n\n<attached>");
+    for a in files {
+        match a.kind {
+            attach::Kind::Image => {
+                s.push_str("\nimage: ");
+                s.push_str(&a.path);
+                if let Some(c) = &a.caption {
+                    s.push_str("\neye: ");
+                    s.push_str(c);
+                }
+            }
+            attach::Kind::Text => {
+                s.push_str("\ntext file: ");
+                s.push_str(&a.path);
+                s.push('\n');
+                if let Some(ex) = a.excerpt(attach::TEXT_CAP) {
+                    s.push_str(&ex);
+                }
+            }
+            attach::Kind::Other => {
+                s.push_str("\nfile: ");
+                s.push_str(&a.path);
+                s.push_str(" (pixie cannot see this kind yet)");
+            }
+        }
+    }
+    s.push_str("\n</attached>");
+    s
+}
+
+/// Hop the eye for attached pictures once, before the 8B speaks. Tests never hop.
+fn fill_user_clips(chat: &mut [ChatEntry], cancel: &AtomicBool) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(ChatEntry::User { files, .. }) = chat.last_mut() else {
+        return;
+    };
+    let paths: Vec<String> = files
+        .iter()
+        .filter(|a| a.kind == attach::Kind::Image && a.caption.is_none() && !a.gone())
+        .map(|a| a.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    let results = tools::look_images(&paths, Some(cancel));
+    for a in files.iter_mut() {
+        if let Some((_, r)) = results.iter().find(|(p, _)| p == &a.path) {
+            if let Some(t) = r.get("text").and_then(|x| x.as_str()) {
+                if !t.is_empty() {
+                    a.caption = Some(t.to_string());
+                }
+            }
+        }
     }
 }
 
@@ -151,8 +239,8 @@ pub fn compact_seed_text(chat: &[ChatEntry]) -> String {
     for e in window {
         match e {
             ChatEntry::Compact { .. } => {}
-            ChatEntry::User(t) => {
-                if t.trim().is_empty() {
+            ChatEntry::User { text: t, files } => {
+                if t.trim().is_empty() && files.is_empty() {
                     continue;
                 }
                 if !s.is_empty() {
@@ -160,6 +248,10 @@ pub fn compact_seed_text(chat: &[ChatEntry]) -> String {
                 }
                 s.push_str("you: ");
                 s.extend(t.chars().take(400));
+                for a in files {
+                    s.push(' ');
+                    s.push_str(&a.path);
+                }
             }
             ChatEntry::Assistant { text, .. } => {
                 if text.trim().is_empty() {
@@ -278,7 +370,7 @@ pub fn chat_messages(chat: &[ChatEntry], rune: &Rune, session_id: &str) -> Vec<V
         }
     }
     let history = history_slice(&chat[after..], HISTORY_CHAR_BUDGET);
-    let last_is_human = matches!(history.last(), Some(ChatEntry::User(_)));
+    let last_is_human = matches!(history.last(), Some(ChatEntry::User { .. }));
     let n = history.len();
     for (i, entry) in history.iter().enumerate() {
         match entry {
@@ -286,8 +378,8 @@ pub fn chat_messages(chat: &[ChatEntry], rune: &Rune, session_id: &str) -> Vec<V
             ChatEntry::Tool { name, body, .. } => {
                 msgs.push(json!({"role": "user", "content": wrap_tool_result(name, body)}));
             }
-            ChatEntry::User(text) => {
-                let mut content = text.clone();
+            ChatEntry::User { text, files } => {
+                let mut content = user_prompt_text(text, files);
                 if last_is_human && i + 1 == n {
                     content.push_str(
                         "\n\n(If you need a tool, your reply must be EXACTLY one JSON object {\"name\": \"one of the available tools above\", \"arguments\": {...}} — nothing else. Otherwise answer the human. Do not open with cute filler — a smaller model adds that.)",
@@ -308,10 +400,12 @@ pub fn run_turn(
     rune: &Rune,
     session_id: &str,
     abort: &Abort,
-    verbose: bool,
+    _verbose: bool,
     confirm: Option<&dyn Fn(&str, &Value) -> bool>,
     mut on_event: impl FnMut(Event),
 ) -> TurnOut {
+    let cancel_flag: &AtomicBool = &abort.flag;
+    fill_user_clips(chat, cancel_flag);
     let mut msgs = chat_messages(chat, rune, session_id);
     let round_cap = LOOP_GUARD;
     let mut rounds = 0usize;
@@ -327,7 +421,8 @@ pub fn run_turn(
     let mut wrote_plan = false;
     let mut listdir_n = 0usize;
     let mut listdir_home = 0usize;
-    let cancel_flag: &AtomicBool = &abort.flag;
+    let mut had_tools = false;
+    let mut post_tool_empty = 0u8;
 
     loop {
         on_event(Event::Round {
@@ -383,6 +478,17 @@ pub fn run_turn(
         for c in mind::extract_tool_calls(&first, 8) {
             tool_calls.push(json!({"name": c.name, "arguments": c.arguments}));
         }
+        if tool_calls.is_empty() && first.trim().is_empty() && had_tools && post_tool_empty < 3 {
+            post_tool_empty += 1;
+            if post_tool_empty == 2 {
+                msgs.push(json!({
+                    "role": "user",
+                    "content": "<harness>The tool is done. Answer the human in your own voice. No JSON. This line is not the human.</harness>"
+                }));
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            continue;
+        }
 
         if tool_calls.is_empty()
             && rune.key == RuneKey::Deep
@@ -419,6 +525,7 @@ pub fn run_turn(
         }
 
         if !tool_calls.is_empty() && rounds < round_cap {
+            had_tools = true;
             let mut results = Vec::new();
             let mut think_once = think_txt.clone();
             for obj in tool_calls.iter().take(4) {
@@ -492,16 +599,22 @@ pub fn run_turn(
                     },
                     None,
                 );
-                let body = tools::tool_body(fname, &fargs, &result, verbose);
-                let title = format!("{fname} · {:.2}s", t1.elapsed().as_secs_f32());
+                let body = tools::display_body(fname, &fargs, &result);
+                let title = format!(
+                    "{} · {:.2}s",
+                    tools::tool_label(fname),
+                    t1.elapsed().as_secs_f32()
+                );
                 let file = tools::take_touch();
                 let round_think = std::mem::take(&mut think_once);
+                let ok = tools::tool_ok(&result);
                 chat.push(ChatEntry::Tool {
                     name: fname.into(),
                     title: title.clone(),
                     body: body.clone(),
                     file: file.clone(),
                     think: round_think.clone(),
+                    ok,
                 });
                 on_event(Event::ToolEnd {
                     title,
@@ -510,6 +623,7 @@ pub fn run_turn(
                     result: result.clone(),
                     file,
                     think: round_think,
+                    ok,
                 });
                 if abort.is_cancelled() {
                     return TurnOut {
@@ -573,6 +687,7 @@ pub enum Event {
         result: Value,
         file: Option<FileTouch>,
         think: String,
+        ok: bool,
     },
 }
 
@@ -617,12 +732,20 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
             "transition" => {
                 continue;
             }
-            "user" => chat.push(ChatEntry::User(
-                rec.get("text")
+            "user" => {
+                let text = rec
+                    .get("text")
                     .and_then(|x| x.as_str())
                     .unwrap_or("")
-                    .into(),
-            )),
+                    .to_string();
+                let files = rec
+                    .get("args")
+                    .and_then(|a| a.get("files"))
+                    .and_then(|f| f.as_array())
+                    .map(|arr| arr.iter().filter_map(Attach::from_json).collect())
+                    .unwrap_or_default();
+                chat.push(ChatEntry::User { text, files });
+            }
             "assistant" => chat.push(ChatEntry::Assistant {
                 text: rec
                     .get("text")
@@ -669,10 +792,11 @@ pub fn from_session(id: &str) -> (Vec<ChatEntry>, RuneKey) {
                 }
                 chat.push(ChatEntry::Tool {
                     name: name.into(),
-                    title: name.to_string(),
-                    body: tools::tool_body(name, &args, &result, true),
+                    title: tools::tool_label(name).to_string(),
+                    body: tools::display_body(name, &args, &result),
                     file: tools::touch_from_rec(name, &args, &result),
                     think,
+                    ok: tools::tool_ok(&result),
                 });
             }
             _ => {}
@@ -690,13 +814,14 @@ mod tests {
     fn chat_messages_keeps_every_tool() {
         let rune = runes::by_key(RuneKey::Chat);
         let chat = vec![
-            ChatEntry::User("hi".into()),
+            ChatEntry::you("hi"),
             ChatEntry::Tool {
                 name: "list_dir".into(),
                 title: "t1".into(),
                 body: "first-tool-body".into(),
                 file: None,
                 think: String::new(),
+                ok: true,
             },
             ChatEntry::Tool {
                 name: "grep_files".into(),
@@ -704,6 +829,7 @@ mod tests {
                 body: "second-tool-body".into(),
                 file: None,
                 think: String::new(),
+                ok: true,
             },
         ];
         let msgs = chat_messages(&chat, &rune, "test");
@@ -711,6 +837,25 @@ mod tests {
         assert!(blob.contains("first-tool-body"), "{blob}");
         assert!(blob.contains("second-tool-body"), "{blob}");
         assert!(blob.contains("<tool_result"), "{blob}");
+    }
+
+    #[test]
+    fn attached_files_join_the_user_prompt() {
+        let rune = runes::by_key(RuneKey::Chat);
+        let chat = vec![ChatEntry::User {
+            text: "what is this".into(),
+            files: vec![Attach {
+                path: "/home/evenweaker/pixie_art/x.png".into(),
+                kind: attach::Kind::Image,
+                bytes: 12,
+                caption: Some("a pink fairy".into()),
+            }],
+        }];
+        let msgs = chat_messages(&chat, &rune, "test");
+        let blob = format!("{msgs:?}");
+        assert!(blob.contains("<attached>"), "{blob}");
+        assert!(blob.contains("a pink fairy"), "{blob}");
+        assert!(blob.contains("image:"), "{blob}");
         let roles: Vec<&str> = msgs
             .iter()
             .filter_map(|m| m.get("role").and_then(|r| r.as_str()))
@@ -726,6 +871,7 @@ mod tests {
             body: "ok".into(),
             file: None,
             think: "I should list the crate".into(),
+            ok: true,
         };
         match e {
             ChatEntry::Tool { think, name, .. } => {
@@ -746,18 +892,19 @@ mod tests {
                 body: "x".repeat(3000),
                 file: None,
                 think: String::new(),
+                ok: true,
             });
             let _ = i;
         }
-        chat.push(ChatEntry::User("keep me".into()));
+        chat.push(ChatEntry::you("keep me"));
         let w = history_slice(&chat, 8_000);
-        assert!(matches!(w.last(), Some(ChatEntry::User(t)) if t == "keep me"));
+        assert!(matches!(w.last(), Some(ChatEntry::User { text, .. }) if text == "keep me"));
         assert!(w.len() < chat.len(), "old tools must drop, got {}", w.len());
     }
 
     #[test]
     fn compact_trigger_on_heavy_window() {
-        let mut chat = vec![ChatEntry::User("go".into())];
+        let mut chat = vec![ChatEntry::you("go")];
         for _ in 0..20 {
             chat.push(ChatEntry::Tool {
                 name: "execute_bash".into(),
@@ -765,6 +912,7 @@ mod tests {
                 body: "y".repeat(2000),
                 file: None,
                 think: String::new(),
+                ok: true,
             });
         }
         assert!(should_compact(&chat));
@@ -773,7 +921,7 @@ mod tests {
         chat.push(ChatEntry::Compact {
             text: "earlier work summarized".into(),
         });
-        chat.push(ChatEntry::User("and then".into()));
+        chat.push(ChatEntry::you("and then"));
         assert!(!should_compact(&chat));
         let after = compact_seed_text(&chat);
         assert!(after.contains("you: and then"), "{after}");

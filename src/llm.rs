@@ -89,7 +89,11 @@ pub fn llm_up() -> bool {
         return false;
     }
 
-    buf.contains("200") || buf.contains("503")
+    health_line_ok(&buf)
+}
+
+pub fn health_line_ok(line: &str) -> bool {
+    line.contains("200") && !line.contains("503")
 }
 
 pub fn ensure_llm_up() -> bool {
@@ -326,7 +330,7 @@ pub fn complete_on(
     timeout_s: u64,
 ) -> Option<String> {
     wake_kur(port);
-    complete_on_raw(port, messages, max_tokens, timeout_s)
+    complete_on_raw(port, messages, max_tokens, timeout_s, 0.85)
 }
 
 /// Same as complete_on but never wakes menagerie. Skip if the mouth is down.
@@ -339,7 +343,21 @@ pub fn complete_on_if_up(
     if !mouth_up(port) {
         return None;
     }
-    complete_on_raw(port, messages, max_tokens, timeout_s)
+    complete_on_raw(port, messages, max_tokens, timeout_s, 0.85)
+}
+
+/// Non-stream completion with an explicit temperature. Skip if the mouth is down.
+pub fn complete_on_if_up_temp(
+    port: u16,
+    messages: &[Value],
+    max_tokens: u32,
+    timeout_s: u64,
+    temperature: f64,
+) -> Option<String> {
+    if !mouth_up(port) {
+        return None;
+    }
+    complete_on_raw(port, messages, max_tokens, timeout_s, temperature)
 }
 
 fn complete_on_raw(
@@ -347,12 +365,13 @@ fn complete_on_raw(
     messages: &[Value],
     max_tokens: u32,
     timeout_s: u64,
+    temperature: f64,
 ) -> Option<String> {
     let addr = format!("127.0.0.1:{port}");
     let sock: std::net::SocketAddr = addr.parse().ok()?;
     let payload = json!({
         "messages": messages,
-        "temperature": 0.85,
+        "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": false,
     })
@@ -404,6 +423,13 @@ pub fn synth_tool_calls(calls: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_200_is_ready_503_is_not() {
+        assert!(health_line_ok("HTTP/1.1 200 OK"));
+        assert!(!health_line_ok("HTTP/1.1 503 Service Unavailable"));
+        assert!(!health_line_ok("HTTP/1.1 404 Not Found"));
+    }
 
     #[test]
     fn invalid_endpoint_never_falls_back_to_default() {

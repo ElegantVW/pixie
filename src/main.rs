@@ -1,9 +1,12 @@
 mod agent;
+mod attach;
 mod chrome;
 mod diff;
+mod forge;
 mod glyph;
 mod grove_keys;
 mod host;
+mod kitty;
 mod llm;
 mod mind;
 mod paths;
@@ -140,7 +143,7 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
         },
         None,
     );
-    let mut chat = vec![ChatEntry::User(prompt.into())];
+    let mut chat = vec![ChatEntry::you(prompt)];
     let abort = Abort::new();
     let t0 = std::time::Instant::now();
     let out = agent::run_turn(&mut chat, &rune, &sid, &abort, verbose, None, |_| {});

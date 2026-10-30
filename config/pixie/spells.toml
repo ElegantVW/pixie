@@ -31,6 +31,11 @@ confirm = false
 bin = "goblin"
 confirm = false
 
+[spells.wacli]
+bin = "wacli"
+confirm = false
+note = "WhatsApp local store. Pixie uses check_whatsapp. Never sync --follow."
+
 [spells.menagerie]
 bin = "menagerie"
 args = ["status"]

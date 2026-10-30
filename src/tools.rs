@@ -1,10 +1,15 @@
+use crate::attach::{self, Kind};
 use crate::diff::{self, DiffLine, FileKind, FileTouch, Op};
+use crate::kitty;
+use crate::llm;
 use crate::mind;
 use crate::paths;
+use crate::prefs;
 use crate::runes::RuneKey;
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -55,6 +60,9 @@ pub fn alias(name: &str) -> &str {
         "check_email" | "mail" | "email" | "get_mail" | "list_mail" | "read_mail" | "inbox" => {
             "check_mail"
         }
+        "whatsapp" | "wa" | "wacli" | "check_wa" => "check_whatsapp",
+        "imagine" | "draw" | "imp_paint" | "generate_art" => "generate_image",
+        "see" | "describe" | "vision" | "eye" => "look",
         "cast" | "spell" | "run_spell" | "invoke" => "house",
         "memory" | "note" | "memorize" | "save_memory" => "remember",
         other => other,
@@ -112,12 +120,43 @@ pub fn norm_args(fname: &str, fargs: &Value) -> Value {
         }),
         "check_mail" => {
             let b = first_str(m, &["box", "folder", "mailbox"]);
+            let a = first_str(m, &["action", "op", "cmd"]);
             json!({
-                "sync": m.get("sync").or_else(|| m.get("sync_mail")).or_else(|| m.get("pull")).and_then(|x| x.as_bool()).unwrap_or(true),
+                "action": if a.is_empty() { "list".to_string() } else { a },
+                "sync": m.get("sync").or_else(|| m.get("sync_mail")).or_else(|| m.get("pull")).and_then(|x| x.as_bool()).unwrap_or(false),
                 "box": if b.is_empty() { "unread".to_string() } else { b },
+                "query": first_str(m, &["query", "q", "search"]),
+                "id": first_str(m, &["id", "file", "uid", "name"]),
+                "to": first_str(m, &["to", "recipient"]),
+                "subject": first_str(m, &["subject", "title"]),
+                "body": first_str(m, &["body", "text", "message"]),
                 "max_messages": m.get("max_messages").or_else(|| m.get("limit")).and_then(|x| x.as_i64()).unwrap_or(20),
             })
         }
+        "check_whatsapp" => {
+            let a = first_str(m, &["action", "op", "cmd"]);
+            let q = first_str(m, &["query", "q", "search"]);
+            json!({
+                "action": if a.is_empty() {
+                    if q.is_empty() { "list".to_string() } else { "search".to_string() }
+                } else { a },
+                "query": q,
+                "chat": first_str(m, &["chat", "jid", "name"]),
+                "id": first_str(m, &["id", "msgid", "message_id"]),
+                "to": first_str(m, &["to", "recipient"]),
+                "text": first_str(m, &["text", "message", "body"]),
+                "after": first_str(m, &["after", "since"]),
+                "before": first_str(m, &["before", "until"]),
+                "limit": m.get("limit").or_else(|| m.get("max")).and_then(|x| x.as_i64()).unwrap_or(20),
+            })
+        }
+        "look" => json!({
+            "path": first_str(m, &["path", "file", "image", "target", "file_path", "filepath"]),
+            "query": first_str(m, &["query", "question", "prompt", "q"]),
+        }),
+        "generate_image" => json!({
+            "wish": first_str(m, &["wish", "prompt", "text", "query"]),
+        }),
         "house" => {
             let mut spell = first_str(m, &["spell", "name", "command", "bin"]);
             let mut args: Vec<String> = match m
@@ -183,6 +222,8 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
             "read_local_file",
             "manage_systemd_service",
             "check_mail",
+            "check_whatsapp",
+            "generate_image",
             "look",
         ],
         RuneKey::Deep => &[
@@ -204,6 +245,7 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
             "read_local_file",
             "edit_local_file",
             "write_local_file",
+            "generate_image",
             "look",
         ],
         RuneKey::Plan => &[
@@ -219,9 +261,30 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
     }
 }
 
+#[allow(dead_code)]
 pub fn needs_confirm(fname: &str, rune: RuneKey) -> bool {
+    needs_confirm_args(fname, rune, &json!({}))
+}
+
+pub fn needs_confirm_args(fname: &str, rune: RuneKey, fargs: &Value) -> bool {
     match fname {
         "execute_bash" if rune != RuneKey::Plan => true,
+        "generate_image" => true,
+        "check_mail" => {
+            let a = fargs
+                .get("action")
+                .and_then(|x| x.as_str())
+                .unwrap_or("list");
+            matches!(a, "sync" | "steal" | "keep" | "trash" | "send")
+                || fargs.get("sync").and_then(|x| x.as_bool()).unwrap_or(false)
+        }
+        "check_whatsapp" => {
+            let a = fargs
+                .get("action")
+                .and_then(|x| x.as_str())
+                .unwrap_or("list");
+            matches!(a, "send" | "sync" | "mark_read")
+        }
         _ => false,
     }
 }
@@ -367,12 +430,6 @@ pub fn run_tool(
 ) -> Value {
     let fname = alias(fname).to_string();
     let allowed = known_for(rune);
-    if fname == "look" {
-        return json!({
-            "error": "pixie: the eye is still sleeping",
-            "next": "vision is Pass 2 — bind a VL model as pixie-eye"
-        });
-    }
     if !allowed.contains(&fname.as_str()) {
         return json!({
             "error": format!("Unknown tool '{fname}' in {} mode. Valid tools: {}", rune.as_str(), allowed.join(", "))
@@ -380,7 +437,7 @@ pub fn run_tool(
     }
     let _ = take_touch();
     let fargs = norm_args(&fname, fargs);
-    if needs_confirm(&fname, rune) {
+    if needs_confirm_args(&fname, rune, &fargs) {
         match confirm {
             None => {
                 return json!({"error": format!("'{fname}' needs approval and none is available here; run `pixie` (interactive chat) to review and approve actions.")});
@@ -888,79 +945,940 @@ pub fn run_tool(
                 "stderr": r.get("stderr").cloned().unwrap_or(json!("")),
             })
         }
-        "check_mail" => check_mail(
-            fargs.get("sync").and_then(|x| x.as_bool()).unwrap_or(true),
-            fargs
-                .get("box")
-                .and_then(|x| x.as_str())
-                .unwrap_or("unread"),
-            fargs
-                .get("max_messages")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(20),
+        "check_mail" => check_mail(&fargs),
+        "check_whatsapp" => check_whatsapp(&fargs),
+        "generate_image" => generate_image(
+            fargs.get("wish").and_then(|x| x.as_str()).unwrap_or(""),
+            cancel,
+            confirm,
+        ),
+        "look" => look(
+            fargs.get("path").and_then(|x| x.as_str()).unwrap_or(""),
+            fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
+            cancel,
         ),
         _ => json!({"error": format!("Unknown function mapping: {fname}")}),
     }
 }
 
-fn check_mail(sync: bool, box_: &str, max_messages: i64) -> Value {
-    let box_ = box_.trim().to_lowercase();
+fn goblin_bin() -> std::path::PathBuf {
+    let p = paths::home().join("bin/goblin");
+    if p.is_file() {
+        p
+    } else {
+        std::path::PathBuf::from("goblin")
+    }
+}
+
+fn run_cmd(bin: &Path, args: &[&str], timeout: Duration) -> Value {
+    let mut argv = vec![bin.display().to_string()];
+    argv.extend(args.iter().map(|s| s.to_string()));
+    mind::run_argv(&argv, timeout)
+}
+
+fn cmd_text(v: &Value) -> String {
+    let out = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
+    let err = v.get("stderr").and_then(|x| x.as_str()).unwrap_or("");
+    let code = v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(0);
+    let mut s = out.trim().to_string();
+    if !err.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(err.trim());
+    }
+    if code != 0 {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&format!("(exit {code})"));
+    }
+    if s.is_empty() {
+        "(no output)".into()
+    } else {
+        s
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn parse_to_unix(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let o = Command::new("date").args(["-d", s, "+%s"]).output().ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+fn age_phrase(date: &str) -> String {
+    let Some(t) = parse_to_unix(date) else {
+        return "?".into();
+    };
+    let d = unix_now().saturating_sub(t);
+    if d < 90 {
+        format!("{d}s")
+    } else if d < 3600 {
+        format!("{}m", d / 60)
+    } else if d < 86400 {
+        format!("{}h", d / 3600)
+    } else {
+        format!("{}d", d / 86400)
+    }
+}
+
+fn kv_line(line: &str) -> std::collections::HashMap<String, String> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    let mut m = std::collections::HashMap::new();
+    let mut i = 0;
+    if fields.first().is_some_and(|s| !s.contains('=')) {
+        if fields.get(1).is_some_and(|s| !s.contains('=')) {
+            m.insert("box".into(), fields[0].to_string());
+            m.insert("id".into(), fields[1].to_string());
+            i = 2;
+        } else {
+            m.insert("id".into(), fields[0].to_string());
+            i = 1;
+        }
+    }
+    for p in fields.iter().skip(i) {
+        if let Some((k, v)) = p.split_once('=') {
+            m.insert(k.to_string(), v.to_string());
+        }
+    }
+    m
+}
+
+fn check_mail(fargs: &Value) -> Value {
+    let mut action = fargs
+        .get("action")
+        .and_then(|x| x.as_str())
+        .unwrap_or("list")
+        .trim()
+        .to_lowercase();
+    if fargs.get("sync").and_then(|x| x.as_bool()).unwrap_or(false) && action == "list" {
+        action = "sync".into();
+    }
+    let box_ = fargs
+        .get("box")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unread")
+        .trim()
+        .to_lowercase();
     if !matches!(box_.as_str(), "unread" | "read" | "trash") {
         return json!({"error": "box must be unread, read, or trash"});
     }
-    let goblin = paths::home().join("bin/goblin");
-    let run = |args: &[&str], _timeout: u64| -> String {
-        if !goblin.is_file() {
-            return format!("error: goblin not found at {}", goblin.display());
+    let goblin = goblin_bin();
+    if action == "sync" {
+        action = "steal".into();
+    }
+    match action.as_str() {
+        "list" => {
+            let listing = run_cmd(
+                &goblin,
+                &["peek", &box_, "--plain"],
+                Duration::from_secs(30),
+            );
+            let text = cmd_text(&listing);
+            let limit = fargs
+                .get("max_messages")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(20)
+                .clamp(1, 20) as usize;
+            let mut rows = Vec::new();
+            for line in text.lines().take(limit) {
+                if line.starts_with('(') || line.is_empty() {
+                    continue;
+                }
+                let kv = kv_line(line);
+                let date = kv.get("date").cloned().unwrap_or_default();
+                rows.push(json!({
+                    "id": kv.get("id").cloned().unwrap_or_default(),
+                    "from": kv.get("from").cloned().unwrap_or_default(),
+                    "date": date,
+                    "age": age_phrase(&date),
+                    "subject": kv.get("subject").cloned().unwrap_or_default(),
+                }));
+            }
+            json!({"action": "list", "box": box_, "count": rows.len(), "rows": rows})
         }
-        let mut cmd = Command::new(&goblin);
-        cmd.args(args);
-        cmd.env("PATH", paths::house_path());
-        match cmd.output() {
-            Err(e) => format!("error: could not run goblin: {e}"),
-            Ok(o) => {
-                let mut parts = Vec::new();
-                let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                if !out.is_empty() {
-                    parts.push(out);
+        "hunt" => {
+            let q = fargs.get("query").and_then(|x| x.as_str()).unwrap_or("");
+            if q.trim().is_empty() {
+                return json!({"error": "hunt needs query", "next": "pass query"});
+            }
+            let listing = run_cmd(&goblin, &["hunt", q, "--plain"], Duration::from_secs(30));
+            let text = cmd_text(&listing);
+            let mut rows = Vec::new();
+            for line in text.lines().take(20) {
+                if line.starts_with('(') || line.is_empty() {
+                    continue;
                 }
-                if !err.is_empty() {
-                    parts.push(format!("[log]\n{err}"));
-                }
-                if !o.status.success() {
-                    parts.push(format!("(exit {})", o.status.code().unwrap_or(-1)));
-                }
-                if parts.is_empty() {
-                    "(no output)".into()
+                let kv = kv_line(line);
+                let date = kv.get("date").cloned().unwrap_or_default();
+                rows.push(json!({
+                    "id": kv.get("id").cloned().unwrap_or_default(),
+                    "from": kv.get("from").cloned().unwrap_or_default(),
+                    "date": date,
+                    "age": age_phrase(&date),
+                    "subject": kv.get("subject").cloned().unwrap_or_default(),
+                }));
+            }
+            json!({"action": "hunt", "query": q, "count": rows.len(), "rows": rows})
+        }
+        "read" => {
+            let id = fargs.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.trim().is_empty() {
+                return json!({"error": "read needs id", "next": "list first, then read that file id"});
+            }
+            let got = run_cmd(&goblin, &["read", id], Duration::from_secs(20));
+            let mut body = cmd_text(&got);
+            if body.len() > 800 {
+                body.truncate(800);
+                body.push('…');
+            }
+            json!({"action": "read", "id": id, "body": body})
+        }
+        "steal" => {
+            let got = run_cmd(&goblin, &["steal"], Duration::from_secs(120));
+            json!({"action": "sync", "result": cmd_text(&got)})
+        }
+        "keep" | "trash" => {
+            let id = fargs.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.trim().is_empty() {
+                return json!({"error": format!("{action} needs id")});
+            }
+            let got = run_cmd(&goblin, &[&action, id], Duration::from_secs(30));
+            json!({"action": action, "id": id, "result": cmd_text(&got)})
+        }
+        "send" => {
+            let to = fargs.get("to").and_then(|x| x.as_str()).unwrap_or("");
+            let subject = fargs.get("subject").and_then(|x| x.as_str()).unwrap_or("");
+            let body = fargs.get("body").and_then(|x| x.as_str()).unwrap_or("");
+            if to.trim().is_empty() || subject.trim().is_empty() {
+                return json!({"error": "send needs to and subject"});
+            }
+            let tmp = paths::runtime_dir().join(format!("mail-body-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(paths::runtime_dir());
+            if std::fs::write(&tmp, body).is_err() {
+                return json!({"error": "could not write mail body temp"});
+            }
+            let got = run_cmd(
+                &goblin,
+                &[
+                    "send",
+                    "--to",
+                    to,
+                    "--subject",
+                    subject,
+                    "--body-file",
+                    &tmp.display().to_string(),
+                ],
+                Duration::from_secs(60),
+            );
+            let _ = std::fs::remove_file(&tmp);
+            json!({"action": "send", "to": to, "subject": subject, "result": cmd_text(&got)})
+        }
+        other => json!({"error": format!("unknown mail action {other}")}),
+    }
+}
+
+fn wacli_bin() -> std::path::PathBuf {
+    let p = Path::new("/usr/bin/wacli");
+    if p.is_file() {
+        p.to_path_buf()
+    } else {
+        std::path::PathBuf::from("wacli")
+    }
+}
+
+fn wacli_run(extra: &[&str], read_only: bool) -> Value {
+    let bin = wacli_bin();
+    let mut args: Vec<&str> = vec!["--json", "--lock-wait", "2s"];
+    if read_only {
+        args.push("--read-only");
+    }
+    args.extend_from_slice(extra);
+    if extra.iter().any(|a| *a == "--follow") {
+        return json!({"error": "wacli --follow is forbidden from Pixie"});
+    }
+    run_cmd(&bin, &args, Duration::from_secs(45))
+}
+
+fn wa_rows_from_json(v: &Value, limit: usize) -> Vec<Value> {
+    let stdout = v.get("stdout").and_then(|x| x.as_str()).unwrap_or("");
+    let parsed: Value = serde_json::from_str(stdout).unwrap_or(json!({}));
+    let msgs = parsed
+        .pointer("/data/messages")
+        .or_else(|| parsed.get("messages"))
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::new();
+    for m in msgs.into_iter().take(limit) {
+        let date = m
+            .get("Timestamp")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let snippet = m
+            .get("Snippet")
+            .or_else(|| m.get("Text"))
+            .or_else(|| m.get("DisplayText"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let snippet: String = snippet.chars().take(160).collect();
+        rows.push(json!({
+            "id": m.get("MsgID").and_then(|x| x.as_str()).unwrap_or(""),
+            "chat": m.get("ChatName").and_then(|x| x.as_str()).unwrap_or(""),
+            "from": m.get("SenderName").and_then(|x| x.as_str()).unwrap_or(""),
+            "date": date,
+            "age": age_phrase(&date),
+            "snippet": snippet,
+        }));
+    }
+    rows
+}
+
+fn check_whatsapp(fargs: &Value) -> Value {
+    let action = fargs
+        .get("action")
+        .and_then(|x| x.as_str())
+        .unwrap_or("list")
+        .trim()
+        .to_lowercase();
+    let limit = fargs
+        .get("limit")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 20) as usize;
+    let limit_s = limit.to_string();
+    match action.as_str() {
+        "list" => {
+            let mut extra = vec!["messages", "list", "--limit", limit_s.as_str()];
+            let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
+            let after = fargs.get("after").and_then(|x| x.as_str()).unwrap_or("");
+            let before = fargs.get("before").and_then(|x| x.as_str()).unwrap_or("");
+            if !chat.is_empty() {
+                extra.extend(["--chat", chat]);
+            }
+            if !after.is_empty() {
+                extra.extend(["--after", after]);
+            }
+            if !before.is_empty() {
+                extra.extend(["--before", before]);
+            }
+            let raw = wacli_run(&extra, true);
+            if extra.contains(&"--follow") {
+                return json!({"error": "follow forbidden"});
+            }
+            let rows = wa_rows_from_json(&raw, limit);
+            json!({"action": "list", "count": rows.len(), "rows": rows})
+        }
+        "search" => {
+            let q = fargs.get("query").and_then(|x| x.as_str()).unwrap_or("");
+            if q.trim().is_empty() {
+                return json!({"error": "search needs query"});
+            }
+            let extra = ["messages", "search", q, "--limit", limit_s.as_str()];
+            let raw = wacli_run(&extra, true);
+            let rows = wa_rows_from_json(&raw, limit);
+            json!({"action": "search", "query": q, "count": rows.len(), "rows": rows})
+        }
+        "show" => {
+            let id = fargs.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if id.trim().is_empty() {
+                return json!({"error": "show needs id"});
+            }
+            let extra = ["messages", "show", "--id", id];
+            let raw = wacli_run(&extra, true);
+            let rows = wa_rows_from_json(&raw, 1);
+            json!({"action": "show", "id": id, "rows": rows, "raw": cmd_text(&raw).chars().take(800).collect::<String>()})
+        }
+        "chats" => {
+            let extra = ["chats", "list", "--limit", limit_s.as_str()];
+            let raw = wacli_run(&extra, true);
+            json!({"action": "chats", "result": cmd_text(&raw).chars().take(1200).collect::<String>()})
+        }
+        "sync" => {
+            let extra = ["sync", "--once"];
+            let raw = wacli_run(&extra, false);
+            json!({"action": "sync", "result": cmd_text(&raw).chars().take(400).collect::<String>()})
+        }
+        "send" => {
+            let to = fargs.get("to").and_then(|x| x.as_str()).unwrap_or("");
+            let text = fargs.get("text").and_then(|x| x.as_str()).unwrap_or("");
+            if to.trim().is_empty() || text.trim().is_empty() {
+                return json!({"error": "send needs to and text"});
+            }
+            let extra = ["send", "text", "--to", to, "--message", text];
+            let raw = wacli_run(&extra, false);
+            json!({"action": "send", "to": to, "result": cmd_text(&raw).chars().take(400).collect::<String>()})
+        }
+        "mark_read" => {
+            let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
+            if chat.trim().is_empty() {
+                return json!({"error": "mark_read needs chat"});
+            }
+            let extra = ["chats", "mark-read", "--chat", chat];
+            let raw = wacli_run(&extra, false);
+            json!({"action": "mark_read", "chat": chat, "result": cmd_text(&raw).chars().take(400).collect::<String>()})
+        }
+        other => json!({"error": format!("unknown whatsapp action {other}")}),
+    }
+}
+
+fn menagerie_bin() -> std::path::PathBuf {
+    let p = paths::home().join("bin/menagerie");
+    if p.is_file() {
+        p
+    } else {
+        std::path::PathBuf::from("menagerie")
+    }
+}
+
+fn hop_pixie(work: impl FnOnce() -> Value) -> Value {
+    let men = menagerie_bin();
+    crate::forge::set_phase("parking the 8B");
+    let _ = Command::new(&men).args(["stop", "pixie"]).output();
+    let result = work();
+    crate::forge::set_phase("waking Pixie");
+    let restore = Command::new(&men).args(["ensure", "pixie"]).output();
+    let up = crate::forge::wait_mouth(Duration::from_secs(60));
+    crate::forge::clear_phase();
+    let restore_err = match restore {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Some(format!(
+                "the picture may be done but Pixie did not wake: {}",
+                err.trim()
+            ))
+        }
+        Err(e) => Some(format!("the picture may be done but Pixie did not wake: {e}")),
+    };
+    if restore_err.is_none() && !up {
+        json!({
+            "error": "the picture may be done but Pixie did not wake: mouth still dark",
+            "result": result,
+        })
+    } else if let Some(err) = restore_err {
+        json!({
+            "error": err,
+            "result": result,
+        })
+    } else {
+        result
+    }
+}
+
+fn hop_eye(work: impl FnOnce() -> Value) -> Value {
+    let men = menagerie_bin();
+    crate::forge::set_phase("parking the 8B");
+    let _ = Command::new(&men).args(["stop", "pixie"]).output();
+    crate::forge::set_phase("opening the eye");
+    let eye = Command::new(&men)
+        .args(["ensure", "pixie", "--slot", "vision"])
+        .output();
+    let eye_err = match &eye {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Some(format!("the eye did not open: {}", err.trim()))
+        }
+        Err(e) => Some(format!("the eye did not open: {e}")),
+    };
+    let up = eye_err.is_none() && crate::forge::wait_mouth(Duration::from_secs(60));
+    let result = if let Some(err) = eye_err {
+        json!({"error": err})
+    } else if !up {
+        json!({"error": "the eye did not open: mouth still dark"})
+    } else {
+        crate::forge::set_phase("looking");
+        work()
+    };
+    crate::forge::set_phase("waking Pixie");
+    let restore = Command::new(&men)
+        .args(["ensure", "pixie", "--slot", "chat"])
+        .output();
+    let woke = crate::forge::wait_mouth(Duration::from_secs(60));
+    crate::forge::clear_phase();
+    let restore_err = match restore {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Some(format!(
+                "the eye spoke but Pixie did not wake: {}",
+                err.trim()
+            ))
+        }
+        Err(e) => Some(format!("the eye spoke but Pixie did not wake: {e}")),
+    };
+    if restore_err.is_none() && !woke {
+        json!({
+            "error": "the eye spoke but Pixie did not wake: mouth still dark",
+            "result": result,
+        })
+    } else if let Some(err) = restore_err {
+        json!({
+            "error": err,
+            "result": result,
+        })
+    } else {
+        result
+    }
+}
+
+fn look(path: &str, query: &str, cancel: Option<&AtomicBool>) -> Value {
+    let path = path.trim();
+    if path.is_empty() {
+        return json!({"error": "need a file to look at", "next": "C-u clips a file, or pass path"});
+    }
+    let low = path.to_ascii_lowercase();
+    if matches!(low.as_str(), "screen" | "display" | "desktop") {
+        return json!({
+            "error": "pixie cannot see the screen yet",
+            "next": "clip a file with C-u"
+        });
+    }
+    let p = match paths::assert_allowed(path) {
+        Ok(p) => p,
+        Err(e) => return json!({"error": e.to_string()}),
+    };
+    if !p.is_file() {
+        return json!({"error": format!("not a file: {}", p.display())});
+    }
+    match attach::classify(&p) {
+        Kind::Other => json!({
+            "error": "pixie cannot see this kind yet",
+            "path": p.display().to_string(),
+            "next": "images and UTF-8 text this cut; PDF later"
+        }),
+        Kind::Text => {
+            let a = match attach::Attach::from_path(&p) {
+                Ok(a) => a,
+                Err(e) => return json!({"error": e}),
+            };
+            json!({
+                "path": a.path,
+                "kind": "text",
+                "text": a.excerpt(attach::TEXT_CAP).unwrap_or_default(),
+            })
+        }
+        Kind::Image => {
+            let q = query.trim();
+            let results = look_images_with(
+                &[p.display().to_string()],
+                if q.is_empty() {
+                    "Describe this image clearly. Name objects, text, colors, and layout. Facts only."
                 } else {
-                    parts.join("\n")
-                }
+                    q
+                },
+                cancel,
+            );
+            results
+                .into_iter()
+                .next()
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| json!({"error": "the eye was quiet"}))
+        }
+    }
+}
+
+/// One GPU hop for many pictures. Tests never hop.
+pub fn look_images(paths: &[String], cancel: Option<&AtomicBool>) -> Vec<(String, Value)> {
+    look_images_with(
+        paths,
+        "Describe this image clearly. Name objects, text, colors, and layout. Facts only.",
+        cancel,
+    )
+}
+
+fn look_images_with(
+    paths: &[String],
+    prompt: &str,
+    cancel: Option<&AtomicBool>,
+) -> Vec<(String, Value)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    if cfg!(test) {
+        return paths
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    json!({"path": p, "text": "test-skip-hop", "skipped": true}),
+                )
+            })
+            .collect();
+    }
+    if !prefs::mmproj_ready() {
+        return paths
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    json!({
+                        "path": p,
+                        "error": "pixie: the eye is still sleeping",
+                        "next": "place Qwen2.5-VL mmproj-f16 next to the VL GGUF"
+                    }),
+                )
+            })
+            .collect();
+    }
+    let packed: Vec<(String, Option<Vec<Value>>)> = paths
+        .iter()
+        .map(|p| (p.clone(), look_payload(p, prompt)))
+        .collect();
+    let hop = hop_eye(|| {
+        let mut out = Vec::new();
+        for (p, payload) in &packed {
+            if cancelled(cancel) {
+                out.push(json!({"path": p, "error": "cancelled"}));
+                continue;
+            }
+            let Some(msgs) = payload else {
+                out.push(json!({"path": p, "error": "could not read the picture"}));
+                continue;
+            };
+            let Some(port) = llm::port() else {
+                out.push(json!({"path": p, "error": "no mouth port"}));
+                continue;
+            };
+            match llm::complete_on_if_up_temp(port, msgs, 400, 90, 0.2) {
+                Some(text) => out.push(json!({"path": p, "text": text, "kind": "image"})),
+                None => out.push(json!({"path": p, "error": "the eye was quiet"})),
             }
         }
-    };
-    let mut result = json!({"box": box_});
-    if sync {
-        result["sync"] = json!(run(&["sync"], 180));
-    }
-    let listing = run(&["list", &box_, "--plain"], 60);
-    result["listing"] = json!(listing);
-    let mut subjects = Vec::new();
-    for line in listing.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() >= 4 && fields[3].starts_with("subject=") {
-            subjects.push(fields[3][8..].to_string());
+        json!({"batch": out})
+    });
+    let batch = hop
+        .get("batch")
+        .cloned()
+        .or_else(|| hop.get("result").and_then(|r| r.get("batch")).cloned())
+        .unwrap_or_else(|| json!([hop]));
+    let mut out = Vec::new();
+    if let Some(arr) = batch.as_array() {
+        for (i, p) in paths.iter().enumerate() {
+            let v = arr.get(i).cloned().unwrap_or_else(|| json!({"error": "the eye was quiet"}));
+            out.push((p.clone(), v));
+        }
+    } else {
+        for p in paths {
+            out.push((p.clone(), hop.clone()));
         }
     }
-    result["count"] = json!(subjects.len());
-    result["subjects"] = json!(subjects);
-    if box_ == "unread" {
-        let limit = max_messages.clamp(1, 50);
-        result["digest"] = json!(run(&["bundle", "--limit", &limit.to_string()], 60));
-    } else {
-        result["digest"] = json!("(no digest for read/trash — use the listing)");
+    out
+}
+
+pub(crate) fn look_payload(path: &str, prompt: &str) -> Option<Vec<Value>> {
+    let url = image_data_url(Path::new(path))?;
+    Some(vec![
+        json!({
+            "role": "system",
+            "content": "You are Pixie's eye. Describe what you see. Facts only. No secrets."
+        }),
+        json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": url}}
+            ]
+        }),
+    ])
+}
+
+fn image_data_url(path: &Path) -> Option<String> {
+    let img = image::open(path).ok()?;
+    let thumb = img.thumbnail(1024, 1024);
+    let mut png = Vec::new();
+    thumb
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(format!(
+        "data:image/png;base64,{}",
+        kitty::b64_encode(&png)
+    ))
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel
+        .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+fn generate_image(
+    wish: &str,
+    cancel: Option<&AtomicBool>,
+    confirm: Option<&dyn Fn(&str, &Value) -> bool>,
+) -> Value {
+    let wish = wish.trim();
+    if wish.is_empty() {
+        return json!({"error": "need a wish to paint", "next": "say what to draw"});
     }
-    result
+    crate::forge::set_phase("braiding the wish");
+    let mut prompt = crate::forge::enhance_prompt(wish);
+    if prompt != wish {
+        crate::forge::clear_phase();
+        let braid_args = json!({"wish": wish, "prompt": prompt});
+        match confirm {
+            Some(c) if !c("generate_image", &braid_args) => {
+                prompt = wish.to_string();
+            }
+            None => {}
+            _ => {}
+        }
+        crate::forge::set_phase("braiding the wish");
+    }
+    if cancelled(cancel) {
+        crate::forge::clear_phase();
+        return json!({"error": "cancelled"});
+    }
+    let dir = crate::forge::art_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        crate::forge::clear_phase();
+        return json!({"error": format!("could not open the art folder: {e}")});
+    }
+    let out = crate::forge::stamp_png();
+    let hand = match crate::forge::best_hand() {
+        Ok(h) => h,
+        Err(e) => {
+            crate::forge::clear_phase();
+            return json!({"error": e, "next": "place SDXL or sd-turbo weights in the models dir"});
+        }
+    };
+    let argv = match crate::forge::sd_argv(&hand, &prompt, &out) {
+        Ok(a) => a,
+        Err(e) => {
+            crate::forge::clear_phase();
+            return json!({"error": e});
+        }
+    };
+    let timeout = if hand.kind == "sd-turbo" {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(480)
+    };
+    let hop = hop_pixie(|| {
+        crate::forge::set_phase(&format!(
+            "forging {} {}×{} · {} steps",
+            hand.kind, hand.width, hand.height, hand.steps
+        ));
+        match cancel {
+            Some(c) => mind::run_argv_cancel(&argv, timeout, c),
+            None => mind::run_argv(&argv, timeout),
+        }
+    });
+    let wake_err = hop
+        .get("error")
+        .and_then(|x| x.as_str())
+        .filter(|s| s.contains("did not wake"))
+        .map(|s| s.to_string());
+    if !out.is_file() {
+        let log = cmd_text(&hop);
+        return json!({
+            "error": if cancelled(cancel) {
+                "cancelled"
+            } else {
+                "the forge wrote no picture"
+            },
+            "detail": log.chars().take(400).collect::<String>(),
+            "wish": wish,
+            "prompt": prompt,
+        });
+    }
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    crate::forge::write_sidecar(&out, wish, &prompt);
+    set_touch(FileTouch {
+        path: out.display().to_string(),
+        kind: FileKind::Image,
+        added: 0,
+        deleted: 0,
+        lines: Vec::new(),
+        binary: true,
+        extra_paths: Vec::new(),
+        collapsed: false,
+    });
+    let log = cmd_text(&hop);
+    let mut rec = json!({
+        "path": out.display().to_string(),
+        "wish": wish,
+        "prompt": prompt,
+        "bytes": bytes,
+        "hand": hand.kind,
+        "size": format!("{}x{}", hand.width, hand.height),
+        "steps": hand.steps,
+        "log": log.chars().take(400).collect::<String>(),
+    });
+    if crate::forge::png_is_blank(&out) {
+        rec["error"] = json!("the forge painted a blank canvas");
+        rec["next"] = json!("sd-cli argv should match Imp: model, prompt, size, steps, cfg, seed");
+    }
+    if let Some(e) = wake_err {
+        rec["error"] = json!(e);
+        rec["next"] = json!("menagerie ensure pixie");
+    }
+    rec
+}
+
+pub fn tool_ok(result: &Value) -> bool {
+    result.get("error").is_none()
+}
+
+pub fn tool_label(name: &str) -> &str {
+    match name {
+        "check_mail" => "mail",
+        "check_whatsapp" => "whatsapp",
+        "generate_image" => "forge",
+        "look" => "eye",
+        "execute_bash" => "shell",
+        "house" => "spell",
+        "search_house" => "search",
+        "wiki" => "wiki",
+        "list_dir" => "looking",
+        "grep_files" => "seeking",
+        "read_local_file" => "reading",
+        "edit_local_file" => "mending",
+        "write_local_file" => "writing",
+        "remember" => "remembering",
+        "manage_systemd_service" => "service",
+        "web_research" => "research",
+        "fetch_web_page" => "fetch",
+        "write_plan" => "plan",
+        _ => name,
+    }
+}
+
+pub fn confirm_line(name: &str, args: &Value) -> String {
+    match name {
+        "generate_image" => {
+            let w = args
+                .get("wish")
+                .and_then(|x| x.as_str())
+                .unwrap_or("this wish");
+            if let Some(p) = args.get("prompt").and_then(|x| x.as_str()) {
+                if p != w {
+                    let clip: String = p.chars().take(80).collect();
+                    return format!("paint this?  {clip}  [y/N]");
+                }
+            }
+            let w: String = w.chars().take(60).collect();
+            let dir = pretty_home(&crate::prefs::art_dir().display().to_string());
+            if crate::prefs::enhance_image() {
+                format!("forge this wish (I'll braid it, hop the GPU, save {dir})?  {w}  [y/N]")
+            } else {
+                format!("forge this wish (hops the GPU, saves {dir})?  {w}  [y/N]")
+            }
+        }
+        "check_whatsapp" => {
+            let a = args.get("action").and_then(|x| x.as_str()).unwrap_or("write");
+            format!("let the pocket radio {a}?  [y/N]")
+        }
+        "check_mail" => {
+            let a = args.get("action").and_then(|x| x.as_str()).unwrap_or("write");
+            format!("let goblin {a}?  [y/N]")
+        }
+        "execute_bash" => {
+            let c = args.get("command").and_then(|x| x.as_str()).unwrap_or("a command");
+            let clip: String = c.chars().take(80).collect();
+            format!("run shell?  {clip}  [y/N]")
+        }
+        _ => format!("approve {}?  [y/N]", tool_label(name)),
+    }
+}
+
+pub fn tool_story(name: &str, _args: &Value, result: &Value) -> String {
+    if let Some(e) = result.get("error") {
+        let e = e.as_str().map(|s| s.to_string()).unwrap_or_else(|| e.to_string());
+        return format!("that didn't take: {}", e.chars().take(180).collect::<String>());
+    }
+    match name {
+        "look" => result
+            .get("text")
+            .and_then(|x| x.as_str())
+            .unwrap_or("the eye was quiet")
+            .chars()
+            .take(400)
+            .collect(),
+        "generate_image" => {
+            let path = result.get("path").and_then(|x| x.as_str()).unwrap_or("");
+            let size = result.get("size").and_then(|x| x.as_str()).unwrap_or("");
+            let hand = result.get("hand").and_then(|x| x.as_str()).unwrap_or("");
+            let wish = result.get("wish").and_then(|x| x.as_str()).unwrap_or("");
+            let prompt = result.get("prompt").and_then(|x| x.as_str()).unwrap_or("");
+            let mut line = format!(
+                "a picture, {} · {} · saved {}",
+                hand,
+                size,
+                pretty_home(path)
+            );
+            if !prompt.is_empty() && prompt != wish {
+                line.push('\n');
+                line.push_str(prompt);
+            }
+            line
+        }
+        "check_mail" | "check_whatsapp" => {
+            if let Some(rows) = result.get("rows").and_then(|x| x.as_array()) {
+                if rows.is_empty() {
+                    return "the nest is quiet.".into();
+                }
+                let mut lines = Vec::new();
+                for r in rows.iter().take(12) {
+                    let age = r.get("age").and_then(|x| x.as_str()).unwrap_or("?");
+                    let who = r
+                        .get("from")
+                        .or_else(|| r.get("chat"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("?");
+                    let what = r
+                        .get("subject")
+                        .or_else(|| r.get("snippet"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("");
+                    lines.push(format!("{age:<5}  {who}  {what}"));
+                }
+                return lines.join("\n");
+            }
+            result
+                .get("result")
+                .and_then(|x| x.as_str())
+                .unwrap_or("done")
+                .chars()
+                .take(240)
+                .collect()
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn display_body(name: &str, args: &Value, result: &Value) -> String {
+    let story = tool_story(name, args, result);
+    if !story.is_empty() {
+        story
+    } else {
+        tool_body(name, args, result, false)
+    }
+}
+
+fn pretty_home(p: &str) -> String {
+    let h = paths::home();
+    let hs = h.to_string_lossy();
+    if let Some(rest) = p.strip_prefix(hs.as_ref()) {
+        format!("~{rest}")
+    } else {
+        p.to_string()
+    }
 }
 
 fn hit_paths(result: &Value) -> Vec<String> {
@@ -979,6 +1897,19 @@ fn hit_paths(result: &Value) -> Vec<String> {
 
 /// Resume a file card from jsonl without storing the hunk (look re-reads the path).
 pub fn touch_from_rec(name: &str, args: &Value, result: &Value) -> Option<FileTouch> {
+    if alias(name) == "generate_image" {
+        let path = result.get("path").and_then(|x| x.as_str())?;
+        return Some(FileTouch {
+            path: path.into(),
+            kind: FileKind::Image,
+            added: 0,
+            deleted: 0,
+            lines: Vec::new(),
+            binary: true,
+            extra_paths: Vec::new(),
+            collapsed: false,
+        });
+    }
     if result.get("error").is_some() {
         return None;
     }
@@ -1078,12 +2009,39 @@ pub fn tool_body(fname: &str, fargs: &Value, result: &Value, verbose: bool) -> S
     if !verbose {
         if let Some(e) = result.get("error") {
             return format!(
-                "{routing}\nerror: {}",
+                "error: {}",
                 e.to_string().chars().take(180).collect::<String>()
             );
         }
+        if let Some(rows) = result.get("rows").and_then(|x| x.as_array()) {
+            if rows.is_empty() {
+                return "(none)".into();
+            }
+            let mut lines = Vec::new();
+            for r in rows.iter().take(12) {
+                let age = r.get("age").and_then(|x| x.as_str()).unwrap_or("?");
+                let date = r.get("date").and_then(|x| x.as_str()).unwrap_or("");
+                let when = if age == "?" && !date.is_empty() {
+                    date.chars().take(17).collect::<String>()
+                } else {
+                    age.to_string()
+                };
+                let who = r
+                    .get("from")
+                    .or_else(|| r.get("chat"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("?");
+                let what = r
+                    .get("subject")
+                    .or_else(|| r.get("snippet"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                lines.push(format!("{when:<5}  {who}  {what}"));
+            }
+            return lines.join("\n");
+        }
         if let Some(s) = result.get("stdout").and_then(|x| x.as_str()) {
-            return format!("{routing}\n{}", s.chars().take(120).collect::<String>());
+            return s.chars().take(240).collect::<String>();
         }
         if result
             .get("written")
@@ -1120,6 +2078,60 @@ mod tests {
         assert_eq!(alias("str_replace"), "edit_local_file");
         assert_eq!(alias("listdir"), "list_dir");
         assert_eq!(alias("grep"), "grep_files");
+        assert_eq!(alias("whatsapp"), "check_whatsapp");
+        assert_eq!(alias("wacli"), "check_whatsapp");
+        assert_eq!(alias("inbox"), "check_mail");
+        assert_eq!(alias("draw"), "generate_image");
+    }
+
+    #[test]
+    fn mail_default_is_local_list() {
+        let n = norm_args("check_mail", &json!({}));
+        assert_eq!(n["action"], "list");
+        assert_eq!(n["sync"], false);
+        assert!(!needs_confirm_args("check_mail", RuneKey::Chat, &n));
+        assert!(needs_confirm_args(
+            "check_mail",
+            RuneKey::Chat,
+            &json!({"action": "send"})
+        ));
+        assert!(needs_confirm_args(
+            "check_whatsapp",
+            RuneKey::Chat,
+            &json!({"action": "sync"})
+        ));
+        assert!(!needs_confirm_args(
+            "check_whatsapp",
+            RuneKey::Chat,
+            &json!({"action": "list"})
+        ));
+        assert!(known_for(RuneKey::Chat).contains(&"check_whatsapp"));
+        assert!(!known_for(RuneKey::Deep).contains(&"check_whatsapp"));
+        assert!(!known_for(RuneKey::Plan).contains(&"check_whatsapp"));
+    }
+
+    #[test]
+    fn quiet_mail_rows_are_human() {
+        let body = tool_body(
+            "check_mail",
+            &json!({}),
+            &json!({
+                "count": 1,
+                "rows": [{"age": "2h", "from": "Ada", "subject": "hello", "date": "2026-10-29"}]
+            }),
+            false,
+        );
+        assert!(body.contains("Ada"), "{body}");
+        assert!(body.contains("hello"), "{body}");
+        assert!(!body.contains("Routing:"), "{body}");
+    }
+
+    #[test]
+    fn wacli_source_forbids_follow() {
+        let src = include_str!("tools.rs");
+        assert!(src.contains("--follow") && src.contains("forbidden"));
+        assert!(src.contains("--read-only"));
+        assert!(src.contains("--once"));
     }
 
     #[test]
@@ -1276,8 +2288,8 @@ mod tests {
     }
 
     #[test]
-    fn look_stub() {
-        let r = run_tool(
+    fn look_skips_hop_in_tests() {
+        let screen = run_tool(
             "look",
             &json!({"target": "screen"}),
             RuneKey::Chat,
@@ -1285,7 +2297,42 @@ mod tests {
             None,
             None,
         );
-        assert!(r["error"].as_str().unwrap().contains("sleeping"));
+        assert!(
+            screen["error"].as_str().unwrap().contains("screen"),
+            "{screen}"
+        );
+        let missing = paths::cache_dir().join("no-such-pixie-eye.png");
+        let r = run_tool(
+            "look",
+            &json!({"path": missing.display().to_string()}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
+        let err = r["error"].as_str().unwrap_or("");
+        assert!(err.contains("not a file") || err.contains("sleeping"), "{r}");
+    }
+
+    #[test]
+    fn look_payload_has_image_url() {
+        let dir = paths::cache_dir().join(format!("look-payload-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("tiny.png");
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            4,
+            4,
+            image::Rgb([0xe8, 0x79, 0xa0]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .unwrap();
+        fs::write(&p, &bytes).unwrap();
+        let msgs = look_payload(&p.display().to_string(), "what is this").expect("payload");
+        let blob = format!("{msgs:?}");
+        assert!(blob.contains("image_url"), "{blob}");
+        assert!(blob.contains("data:image/png;base64,"), "{blob}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1353,6 +2400,52 @@ mod tests {
             None,
         );
         assert_eq!(r.get("exit_code"), Some(&json!(0)), "{r}");
+    }
+
+    #[test]
+    fn forge_cards_are_human() {
+        assert_eq!(tool_label("generate_image"), "forge");
+        assert_eq!(tool_label("check_whatsapp"), "whatsapp");
+        assert_eq!(tool_label("execute_bash"), "shell");
+        let line = confirm_line(
+            "generate_image",
+            &json!({"wish": "a dragon"}),
+        );
+        assert!(line.contains("braid"), "{line}");
+        assert!(line.contains("hop"), "{line}");
+        assert!(line.contains("save"), "{line}");
+        assert!(line.contains("a dragon"), "{line}");
+        let paint = confirm_line(
+            "generate_image",
+            &json!({
+                "wish": "a dragon",
+                "prompt": "a huge crimson dragon, moonlight, oil painting"
+            }),
+        );
+        assert!(paint.starts_with("paint this?"), "{paint}");
+        assert!(paint.contains("crimson dragon"), "{paint}");
+        let story = tool_story(
+            "generate_image",
+            &json!({"wish": "a dragon"}),
+            &json!({
+                "path": "/home/evenweaker/pixie_art/pixie-1.png",
+                "hand": "sdxl",
+                "size": "1024x1024"
+            }),
+        );
+        assert!(story.contains("picture"), "{story}");
+        assert!(story.contains("sdxl"), "{story}");
+        assert!(!story.contains("check_whatsapp"), "{story}");
+        let touch = touch_from_rec(
+            "generate_image",
+            &json!({"wish": "a dragon"}),
+            &json!({"path": "/home/evenweaker/pixie_art/pixie-1.png"}),
+        )
+        .expect("image card");
+        assert_eq!(touch.kind, FileKind::Image);
+        assert!(touch.binary);
+        assert!(!tool_ok(&json!({"error": "nope"})));
+        assert!(tool_ok(&json!({"path": "x.png"})));
     }
 
     #[test]

@@ -1,5 +1,45 @@
 # Pixie changelog
 
+## v0.3.8 real pictures, clips, eye (2026-10-30)
+
+- Image bubbles paint the real PNG through kitty's graphics protocol (unicode placeholders, Magpie's framing). TTY fallback is unlabeled half-blocks.
+- **C-u** suspends Pixie and opens Spellbook `--pick` to clip a file. Paste of a home path or `file://` URI clips too. Images land on the you-bubble; UTF-8 text is excerpted (24k); other kinds say they cannot be seen yet.
+- `look` hops the GPU: park the 8B, `menagerie ensure pixie --slot vision` with `--mmproj`, OpenAI `image_url`, restore `--slot chat`. Attached pictures are looked once before the 8B speaks. Tests never hop. Missing mmproj stays an honest sleep.
+
+## v0.3.7 sharper picture, speak after hop (2026-10-30)
+
+- Image bubble is 72×32 half-blocks with Lanczos, not 56×18 Triangle.
+- `/health` 503 (llama still loading) is no longer treated as ready. Hop waits up to 60s for 200. Empty post-tool rounds retry, then nudge her to speak.
+
+## v0.3.6 forge matches Imp (2026-10-30)
+
+- White canvases were extra sd-cli flags, not Red vs Rust. Imp's working command is `LD_LIBRARY_PATH=$HOME/.local/lib/sd sd-cli -m GGUF -p PROMPT -W -H --steps --cfg-scale --seed -1 -o`. Pixie had been passing `--rng cpu`, `--offload-to-cpu`, `--backend te=cpu,vae=cpu`, `dpm++2m`, and sidecar CLIP/VAE files. Imp uses CUDA RNG and `euler_a` defaults, GGUF only, SDXL 1024 / 20 / cfg 7.
+- Imp's art path is still Red + sd-cli. The launcher uses a few lines of Python only to read menagerie.json.
+
+## v0.3.5 forge RNG, ask the braid (2026-10-30)
+
+- sd-cli on this AMD card uses `--rng cpu` / `--sampler-rng cpu`. Default CUDA RNG painted a 1024 white canvas.
+- First confirm says she will braid the wish. After the 8B expands it, a second confirm shows the prompt (`paint this?`). `n` keeps your words.
+- Hop waits until the mouth answers again so the Pixie bubble can follow the picture. Blank PNGs are an error. Image cards stay human even with verbose on.
+
+## v0.3.4 forge, human cards, fairy voice (2026-10-30)
+
+- `generate_image` forges a PNG with sd-cli after hopping the GPU. Best hand on this 8 GB card is SDXL Q8 at 1024, 28 steps, cfg 7, dpm++2m; turbo (512/4/euler) only if SDXL is missing.
+- Confirm names the hop and the save folder. Options **Enhance** and **Art** (default `~/pixie_art`). The 8B braids a richer prompt after you approve, while she is still on the card.
+- Chat paints the picture as half-block pixels, then Pixie's reply. C-o opens a viewer. Busy prompt shows phase + timer (`braiding` / `parking` / `forging` / `waking`).
+- Tool cards use human titles (`mail`, `whatsapp`, `forge`, `shell`) with green/red borders. Quiet body is the story, not the tool name twice.
+- PERSONA lets the 8B answer in her own voice. Tool turns stay exact JSON.
+
+## v0.3.3 kitchen, time, hop (2026-10-29)
+
+- Splash holds the star until `menagerie ensure pixie` succeeds. Failure stays on a loading line and retries; it does not open the dashboard.
+- Options Sudo sitting no longer deadlocks after password (one seat lock; `enable_sitting`; `SudoReady`).
+- Host card carries local `now:` and the resident mouth. Mail and WhatsApp rows carry `date` + `age`.
+- Chat `check_whatsapp` (wacli JSON, never `--follow`) and a full `check_mail` kitchen. Quiet bubbles are human lines. Writes confirm-gated.
+- `generate_image` hops the GPU: park Pixie, Imp image hand, restore Pixie.
+- Build inspects the named house tree; 32 rounds. Options Role chat/code/vision.
+- House pack cap 4000. Wacli in the context pack.
+
 ## v0.3.2 safer house boundaries (2026-10-26)
 
 - File tools resolve existing path ancestors before checking the home boundary, including new descendants beneath symlinks; missing or relative `HOME` is rejected instead of widening access.

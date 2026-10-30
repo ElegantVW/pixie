@@ -20,6 +20,7 @@ pub enum FileKind {
     Write,
     Search,
     Plan,
+    Image,
 }
 
 impl FileKind {
@@ -30,6 +31,7 @@ impl FileKind {
             FileKind::Write => "write",
             FileKind::Search => "search",
             FileKind::Plan => "plan",
+            FileKind::Image => "image",
         }
     }
 }
@@ -48,7 +50,9 @@ pub struct FileTouch {
 
 impl FileTouch {
     pub fn summary(&self) -> String {
-        if self.binary {
+        if self.kind == FileKind::Image {
+            "picture".into()
+        } else if self.binary {
             "binary".into()
         } else if self.added > 0 || self.deleted > 0 {
             format!("+{} -{}", self.added, self.deleted)

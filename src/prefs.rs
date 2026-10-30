@@ -13,6 +13,8 @@ pub struct UiPrefs {
     pub rune: RuneKey,
     pub build_audit_rounds: bool,
     pub sudo_less_safe: bool,
+    pub enhance_image: bool,
+    pub art_dir: String,
 }
 
 impl Default for UiPrefs {
@@ -23,6 +25,8 @@ impl Default for UiPrefs {
             rune: RuneKey::Chat,
             build_audit_rounds: true,
             sudo_less_safe: false,
+            enhance_image: true,
+            art_dir: "~/pixie_art".into(),
         }
     }
 }
@@ -56,6 +60,15 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
             .get("sudo_less_safe")
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
+        enhance_image: v
+            .get("enhance_image")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
+        art_dir: v
+            .get("art_dir")
+            .and_then(|x| x.as_str())
+            .unwrap_or("~/pixie_art")
+            .to_string(),
     })
 }
 
@@ -70,10 +83,31 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
         "rune": p.rune.as_str(),
         "build_audit_rounds": p.build_audit_rounds,
         "sudo_less_safe": p.sudo_less_safe,
+        "enhance_image": p.enhance_image,
+        "art_dir": p.art_dir,
     })
     .to_string();
     paths::write_atomic(&path, contents.as_bytes())
         .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))
+}
+
+pub fn enhance_image() -> bool {
+    load_ui().map(|p| p.enhance_image).unwrap_or(true)
+}
+
+pub fn art_dir() -> std::path::PathBuf {
+    let raw = load_ui()
+        .map(|p| p.art_dir)
+        .unwrap_or_else(|_| "~/pixie_art".into());
+    let home = paths::home();
+    let p = if let Some(rest) = raw.strip_prefix("~/") {
+        home.join(rest)
+    } else if raw == "~" {
+        home.join("pixie_art")
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    paths::assert_allowed(&p.display().to_string()).unwrap_or_else(|_| home.join("pixie_art"))
 }
 
 pub fn persona_text() -> Option<String> {
@@ -147,11 +181,21 @@ pub fn set_pixie_ctx(ctx: u32) {
     write_reg(&v);
 }
 
+#[allow(dead_code)]
 pub fn apply_mouth(model: &str, backend: &str, ctx: u32) -> Result<(), String> {
+    apply_mouth_slot("chat", model, backend, ctx)
+}
+
+pub fn apply_mouth_slot(slot: &str, model: &str, backend: &str, ctx: u32) -> Result<(), String> {
+    if slot == "vision" && !mmproj_ready() {
+        return Err("eye is sleeping — no mmproj on disk".into());
+    }
     set_pixie_ctx(ctx);
     let men = menagerie_bin();
     if !model.is_empty() {
-        run_men(&men, &["set", "pixie", model])?;
+        if run_men(&men, &["set", "pixie", slot, model]).is_err() {
+            run_men(&men, &["set", "pixie", model])?;
+        }
     }
     if backend == "gpu" || backend == "cpu" {
         run_men(&men, &["backend", "pixie", backend])?;
@@ -206,8 +250,39 @@ fn write_reg(v: &Value) {
     );
 }
 
+pub fn models_dir() -> std::path::PathBuf {
+    paths::data_dir().join("models")
+}
+
+pub fn mmproj_file() -> Option<std::path::PathBuf> {
+    let dir = models_dir();
+    let rd = fs::read_dir(&dir).ok()?;
+    let mut hits: Vec<std::path::PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        if n.contains("mmproj") && n.ends_with(".gguf") && e.path().is_file() {
+            if e.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000 {
+                hits.push(e.path());
+            }
+        }
+    }
+    hits.sort_by_key(|p| {
+        let n = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        (!n.contains("f16"), n)
+    });
+    hits.into_iter().next()
+}
+
+pub fn mmproj_ready() -> bool {
+    mmproj_file().is_some()
+}
+
 pub fn eye_asleep() -> bool {
-    true
+    !mmproj_ready()
 }
 
 #[cfg(test)]
@@ -218,6 +293,8 @@ mod tests {
     fn default_prefs_sparkle_on() {
         let p = UiPrefs::default();
         assert!(p.sparkle);
+        assert!(p.enhance_image);
+        assert_eq!(p.art_dir, "~/pixie_art");
         assert_eq!(p.rune, RuneKey::Chat);
     }
 

@@ -197,9 +197,41 @@ pub fn probe() -> String {
     let session = std::env::var("XDG_SESSION_TYPE")
         .or_else(|_| std::env::var("DESKTOP_SESSION"))
         .unwrap_or_else(|_| "?".into());
-    card_text(
+    let mut s = card_text(
         &os, &kernel, &hostname, pkg, &shell, ram_kb, &cpu, cores, &gpu, &term, &session,
-    )
+    );
+    s.push('\n');
+    s.push_str(&now_line());
+    s.push('\n');
+    s.push_str(&mouth_line());
+    s
+}
+
+pub fn now_line() -> String {
+    Command::new("date")
+        .args(["+%Y-%m-%d %A %H:%M:%S %Z"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|t| format!("now: {}", t.trim()))
+        .filter(|t| t.len() > 6)
+        .unwrap_or_else(|| "now: unknown".into())
+}
+
+fn mouth_line() -> String {
+    let p = crate::paths::menagerie_path();
+    let Ok(t) = fs::read_to_string(p) else {
+        return "mouth: pixie (unregistered)".into();
+    };
+    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or(serde_json::json!({}));
+    let app = v
+        .pointer("/apps/pixie")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    let model = app.get("model").and_then(|x| x.as_str()).unwrap_or("?");
+    let backend = app.get("backend").and_then(|x| x.as_str()).unwrap_or("?");
+    let ctx = app.get("ctx").and_then(|x| x.as_u64()).unwrap_or(0);
+    format!("mouth: pixie/chat {model} {backend} ctx={ctx}")
 }
 
 fn uname(args: &[&str]) -> String {
@@ -344,5 +376,12 @@ VERSION_ID="12"
         assert!(card.contains("apt-get"), "{card}");
         assert!(card.contains("never pacman"), "{card}");
         assert!(!card.contains("alchemy"), "{card}");
+    }
+
+    #[test]
+    fn now_line_has_a_date() {
+        let n = now_line();
+        assert!(n.starts_with("now: "), "{n}");
+        assert!(n.chars().any(|c| c.is_ascii_digit()), "{n}");
     }
 }

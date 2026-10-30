@@ -49,9 +49,9 @@ pub struct Rune {
     pub prompt: &'static str,
 }
 
-pub const PERSONA: &str = r#"You are Pixie, the faeOS familiar. Competent first. A smaller model adds the cute sparkle — you do not.
+pub const PERSONA: &str = r#"You are Pixie, the faeOS familiar. Competent first, then a little fairy. All-ages. Cute after you have the facts.
 When you need a tool, reply with EXACTLY one JSON object {"name":"...","arguments":{...}} and nothing else. No greeting, no markdown fence, no plan-in-prose.
-When the human's request is done, answer with the facts only. Do not invent USB pads from /dev/input/event*. Do not list $HOME unless they asked. If the topic is Pixie/Plan/Build, inspect ~/pixie (search_house, list_dir ~/pixie/src)."#;
+When the human's request is done, answer in your own voice with the facts intact. Do not invent USB pads from /dev/input/event*. Do not list $HOME unless they asked. If the topic is Pixie/Plan/Build, inspect ~/pixie (search_house, list_dir ~/pixie/src)."#;
 
 pub fn next_idx(i: usize) -> usize {
     let n = all().len();
@@ -92,13 +92,20 @@ pub fn all() -> Vec<Rune> {
                 ("execute_bash", r#"{"command": "string"}"#),
                 ("read_local_file", r#"{"path": "string", "start_line": "int", "end_line": "int"}"#),
                 ("manage_systemd_service", r#"{"service_name": "string", "action": "string"}"#),
-                ("check_mail", r#"{"sync": "bool", "box": "string", "max_messages": "int"}"#),
+                ("check_mail", r#"{"action": "string", "box": "string", "query": "string", "id": "string", "to": "string", "subject": "string", "body": "string", "sync": "bool", "max_messages": "int"}"#),
+                ("check_whatsapp", r#"{"action": "string", "query": "string", "chat": "string", "id": "string", "to": "string", "text": "string", "after": "string", "before": "string", "limit": "int"}"#),
+                ("generate_image", r#"{"wish": "string"}"#),
+                ("look", r#"{"path": "string", "query": "string"}"#),
             ],
             prompt: concat!(
                 "You are in Chat mode: house familiar. Concise. One clarifying question only if the request is ambiguous.\n",
                 "list_dir / grep_files / search_house for files. execute_bash for date, tests, systemctl — it is a real zsh-capable shell (&& works).\n",
                 "USB/gamepads: read /proc/bus/input/devices or list_dir /dev/input/by-id. event0..eventN are not pads.\n",
                 "Prefer the house tool for faeOS launchers. remember for durable house facts — never secrets.\n",
+                "Mail: check_mail (list/hunt/read local; sync/keep/trash/send need approval). Rows have date and age — use those; the host card is now.\n",
+                "WhatsApp: check_whatsapp (list/search/show/chats local; send/sync/mark_read need approval). Never invent a bash wacli. Never --follow.\n",
+                "Images: generate_image hops the GPU (parks Pixie, SDXL forge, restores Pixie). Confirm names the save folder.\n",
+                "Seeing: look hops to the VL eye for a picture; attached files already include an eye caption. C-u clips a file.\n",
                 "World facts: search_house then wiki. No live web in Chat (that is Deep).\n",
                 "If a tool returns empty or an error, say you do not know. Never invent sizes, torque, URLs, or quotes.\n",
                 r#"Example: {"name": "house", "arguments": {"spell": "menagerie"}}"#,
@@ -119,6 +126,7 @@ pub fn all() -> Vec<Rune> {
                 ("read_local_file", r#"{"path": "string"}"#),
                 ("list_dir", r#"{"path": "string", "max": "int"}"#),
                 ("grep_files", r#"{"path": "string", "pattern": "string", "glob": "string", "max": "int"}"#),
+                ("look", r#"{"path": "string", "query": "string"}"#),
             ],
             prompt: concat!(
                 "You are in Deep Research mode. Investigate thoroughly, like the best research assistant:\n",
@@ -136,7 +144,7 @@ pub fn all() -> Vec<Rune> {
             key: RuneKey::Build,
             name: "Build",
             desc: "implement and verify code",
-            rounds: 20,
+            rounds: 32,
             tools: vec![
                 ("house", r#"{"spell": "string", "args": ["string"]}"#),
                 ("search_house", r#"{"query": "string"}"#),
@@ -146,12 +154,14 @@ pub fn all() -> Vec<Rune> {
                 ("read_local_file", r#"{"path": "string", "start_line": "int", "end_line": "int"}"#),
                 ("edit_local_file", r#"{"path": "string", "old_string": "string", "new_string": "string"}"#),
                 ("write_local_file", r#"{"path": "string", "content": "string"}"#),
+                ("generate_image", r#"{"wish": "string"}"#),
+                ("look", r#"{"path": "string", "query": "string"}"#),
             ],
             prompt: concat!(
-                "You are in Build mode. Implement the ask in the named tree (Pixie → ~/pixie). Never list $HOME as a first step.\n",
-                "1. Inspect: search_house, list_dir ~/pixie/src, grep_files, read_local_file. Do not bash ls/grep.\n",
+                "You are in Build mode. Implement the ask in the named house tree (~/pixie, ~/goblin, ~/menagerie, ~/faeOS, ~/imp, …). Never list $HOME as a first step.\n",
+                "1. Inspect that crate's src/ and docs: search_house, list_dir, grep_files, read_local_file. Do not bash ls/grep.\n",
                 "2. edit_local_file for a few lines (old_string unique). write_local_file for new files or a full rewrite.\n",
-                "3. Verify with execute_bash (cargo test, real shell so && works).\n",
+                "3. Verify with execute_bash (cargo test --offline when a Cargo.toml exists; real shell so && works).\n",
                 "4. Report: files changed, how verified. Do not write ~/.config/plan or overwrite unrelated house markdown.\n",
                 "5. Self-audit rounds (default on): analysis → testing/diagnosis → docs/update notes → commit (if requested/clean) → push. Do each round explicitly, report findings, and make each round optional per user preference.\n",
                 "If an active plan is in the system prompt, follow it.\n",
@@ -171,6 +181,7 @@ pub fn all() -> Vec<Rune> {
                 ("search_house", r#"{"query": "string"}"#),
                 ("wiki", r#"{"query": "string", "max_results": "int"}"#),
                 ("write_plan", r#"{"goal": "string", "steps": ["string"], "files": ["string"], "risks": ["string"], "verify": "string"}"#),
+                ("look", r#"{"path": "string", "query": "string"}"#),
             ],
             prompt: concat!(
                 "You are in Plan mode. Design a change; do not implement it.\n",
@@ -213,6 +224,8 @@ fn required_for(name: &str) -> &'static [&'static str] {
         "grep_files" => &["path", "pattern"],
         "write_plan" => &["goal"],
         "fetch_web_page" => &["url"],
+        "generate_image" => &["wish"],
+        "look" => &["path"],
         _ => &[],
     }
 }
@@ -287,7 +300,21 @@ mod tests {
         assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"grep_files"));
         assert!(names.contains(&"search_house"));
-        assert_eq!(b.rounds, 20);
+        assert_eq!(b.rounds, 32);
+        assert!(b.prompt.contains("named house tree"), "{}", b.prompt);
+    }
+
+    #[test]
+    fn chat_has_mail_and_whatsapp() {
+        let chat = by_key(RuneKey::Chat);
+        let names: Vec<_> = chat.tools.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"check_mail"));
+        assert!(names.contains(&"check_whatsapp"));
+        assert!(names.contains(&"generate_image"));
+        assert!(names.contains(&"look"));
+        let deep = by_key(RuneKey::Deep);
+        let d: Vec<_> = deep.tools.iter().map(|(n, _)| *n).collect();
+        assert!(!d.contains(&"check_whatsapp"));
     }
 
     #[test]
@@ -304,6 +331,14 @@ mod tests {
             "house args should be an array: {h}"
         );
         assert!(!h.contains("web_research"), "{h}");
+    }
+
+    #[test]
+    fn persona_lets_the_8b_speak() {
+        assert!(PERSONA.contains("little fairy"), "{PERSONA}");
+        assert!(PERSONA.contains("own voice"), "{PERSONA}");
+        assert!(!PERSONA.contains("you do not"), "{PERSONA}");
+        assert!(PERSONA.contains("EXACTLY one JSON object"), "{PERSONA}");
     }
 
     #[test]
