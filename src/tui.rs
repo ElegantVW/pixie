@@ -148,6 +148,7 @@ struct App {
     verbose: bool,
     sparkle: bool,
     speak_on: bool,
+    tongue: crate::speak::Tongue,
     default_rune: RuneKey,
     build_audit_rounds: bool,
     sudo_less_safe: bool,
@@ -222,23 +223,58 @@ fn toggle_speak(app: &mut App) {
     app.speak_on = !app.speak_on;
     persist_ui(app);
     if app.speak_on {
-        if !crate::speak::ready() {
-            app.status = crate::speak::sleeping_reason();
-        } else {
-            app.status = format!("tongue: {}", crate::speak::SPEAKER);
-            warm_tongue(app);
-        }
+        apply_tongue(app);
     } else {
         crate::speak::stop_sidecar();
         app.status = "tongue off".into();
     }
 }
 
+fn cycle_voice(app: &mut App, dir: i32) {
+    let i = if !app.speak_on {
+        0
+    } else if app.tongue == crate::speak::Tongue::Vivian {
+        1
+    } else {
+        2
+    };
+    match (i + dir).rem_euclid(3) {
+        0 => {
+            app.speak_on = false;
+            persist_ui(app);
+            crate::speak::stop_sidecar();
+            app.status = "tongue off".into();
+        }
+        1 => {
+            app.speak_on = true;
+            app.tongue = crate::speak::Tongue::Vivian;
+            persist_ui(app);
+            apply_tongue(app);
+        }
+        _ => {
+            app.speak_on = true;
+            app.tongue = crate::speak::Tongue::Design;
+            persist_ui(app);
+            apply_tongue(app);
+        }
+    }
+}
+
+fn apply_tongue(app: &mut App) {
+    if !crate::speak::ready_tongue(app.tongue) {
+        app.status = crate::speak::sleeping_reason_tongue(app.tongue);
+    } else {
+        app.status = format!("tongue: {}", app.tongue.as_str());
+        warm_tongue(app);
+    }
+}
+
 fn warm_tongue(app: &App) {
     let tx = app.tx.clone();
+    let tongue = app.tongue;
     std::thread::spawn(move || {
         crate::forge::set_phase("warming tongue");
-        let err = crate::speak::ensure_sidecar().err();
+        let err = crate::speak::ensure_tongue(tongue).err();
         crate::forge::clear_phase();
         let _ = tx.send(UiMsg::Spoke { err });
     });
@@ -246,9 +282,10 @@ fn warm_tongue(app: &App) {
 
 fn spawn_say(app: &App, text: String) {
     let tx = app.tx.clone();
+    let tongue = app.tongue;
     std::thread::spawn(move || {
         crate::forge::set_phase("speaking");
-        let err = crate::speak::say(&text).err();
+        let err = crate::speak::say_tongue(tongue, &text).err();
         crate::forge::clear_phase();
         let _ = tx.send(UiMsg::Spoke { err });
     });
@@ -259,6 +296,7 @@ fn persist_ui(app: &App) {
         verbose: app.verbose,
         sparkle: app.sparkle,
         speak_on: app.speak_on,
+        speak_kind: app.tongue.as_str().into(),
         rune: app.default_rune,
         build_audit_rounds: app.build_audit_rounds,
         sudo_less_safe: app.sudo_less_safe,
@@ -302,6 +340,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         verbose: verbose || ui.verbose,
         sparkle: ui.sparkle,
         speak_on: ui.speak_on,
+        tongue: crate::speak::Tongue::from_str(&ui.speak_kind),
         default_rune: ui.rune,
         build_audit_rounds: ui.build_audit_rounds,
         sudo_less_safe: ui.sudo_less_safe,
@@ -1021,7 +1060,10 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        KeyCode::Char('v') if !ctrl(k) && app.buf.is_empty() => {
+        KeyCode::Char('v')
+            if k.modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
             toggle_speak(app);
         }
         KeyCode::Char('h') if ctrl(k) => app.help = !app.help,
@@ -1290,7 +1332,7 @@ fn cycle_option(app: &mut App, dir: i32) {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        7 => toggle_speak(app),
+        7 => cycle_voice(app, dir),
         8 => {
             app.default_rune = app.default_rune.next();
             if app.door {
@@ -1328,7 +1370,7 @@ fn activate_option(app: &mut App) {
             app.verbose = !app.verbose;
             persist_ui(app);
         }
-        7 => toggle_speak(app),
+        7 => cycle_voice(app, 1),
         8 => {
             app.default_rune = app.default_rune.next();
             if app.door {
@@ -1514,8 +1556,14 @@ fn refresh_mouth_note(app: &mut App) {
     } else {
         "eye"
     };
-    let tongue = if crate::speak::ready() {
+    let tongue = if crate::speak::ready_tongue(crate::speak::Tongue::Design)
+        && crate::speak::ready_tongue(crate::speak::Tongue::Vivian)
+    {
+        "tongue vivian+design"
+    } else if crate::speak::ready_tongue(crate::speak::Tongue::Vivian) {
         "tongue vivian"
+    } else if crate::speak::ready_tongue(crate::speak::Tongue::Design) {
+        "tongue design"
     } else {
         "tongue asleep"
     };
@@ -2224,7 +2272,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.help {
         let help = Paragraph::new(
             "enter send · esc clear/cancel · C-q quit · tab / shift-tab runes · C-v verbose · C-h help\n\
-             C-s sessions · C-u clip · C-l look · C-o open editor · C-p / C-n files · empty v speak · esc home · C-q quit",
+             C-s sessions · C-u clip · C-l look · C-o open editor · C-p / C-n files · A-v speak · esc home · C-q quit",
         )
         .style(Style::default().fg(SILVER))
         .block(
@@ -2312,7 +2360,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         },
     ));
     footer.push(Span::styled(
-        if app.speak_on { "  · v speak" } else { "  · v" },
+        if app.speak_on {
+            "  · A-v speak"
+        } else {
+            "  · A-v"
+        },
         if app.speak_on {
             Style::default().fg(PINK)
         } else {
@@ -2484,10 +2536,10 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
     let verbose = if app.verbose { "on" } else { "off" };
     let voice = if !app.speak_on {
         "off".to_string()
-    } else if crate::speak::ready() {
-        format!("on · {}", crate::speak::SPEAKER)
+    } else if crate::speak::ready_tongue(app.tongue) {
+        format!("on · {}", app.tongue.as_str())
     } else {
-        "on · sleeping".into()
+        format!("on · {} sleeping", app.tongue.as_str())
     };
     let eye = if prefs::eye_asleep() {
         "asleep  (no VL GGUF)"
@@ -3333,8 +3385,12 @@ mod tests {
             "footer must label C-v as verbose"
         );
         assert!(
-            src.contains("empty v speak"),
-            "help must teach empty-prompt v as speak"
+            src.contains("A-v speak"),
+            "help must teach Alt-v as speak"
+        );
+        assert!(
+            src.contains("KeyModifiers::ALT | KeyModifiers::SUPER"),
+            "speak toggle is Alt/Super+v"
         );
         assert!(src.contains("C-s sessions"), "help must teach C-s sessions");
         assert!(src.contains("n new"), "dashboard must offer New");

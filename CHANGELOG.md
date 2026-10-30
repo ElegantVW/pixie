@@ -1,5 +1,12 @@
 # Pixie changelog
 
+## v0.3.10 two tongues, faster vivian (2026-10-30)
+
+- vivian stays the default. Options Voice cycles off → vivian → design. **A-v** (Alt+v) toggles speak on/off and keeps the last tongue. Super+v is i3 split-v and never reaches the TUI. Bare `v` types. `C-v` stays verbose.
+- CPU sidecar uses physical cores minus two (`-t 14` on this 3950X) plus matching OpenBLAS/OMP. Short oneshot clips use fewer threads. Same CrispASR guest, no GPU hop.
+- VoiceDesign 1.7B is the second tongue (`design`). Missing GGUF sleeps honestly. Switching tongue restarts `:8084`.
+- Chat `check_whatsapp` `send_file` / `send_voice` (confirm, `$HOME` path). PNG and last speech WAV go through `wacli send file`.
+
 ## v0.3.9 spoken tongue (2026-10-30)
 
 - Options **Voice** (default off) and empty-prompt `v` speak the final Pixie reply. `C-v` stays verbose. Bare letters still type.

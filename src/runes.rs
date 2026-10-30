@@ -93,7 +93,7 @@ pub fn all() -> Vec<Rune> {
                 ("read_local_file", r#"{"path": "string", "start_line": "int", "end_line": "int"}"#),
                 ("manage_systemd_service", r#"{"service_name": "string", "action": "string"}"#),
                 ("check_mail", r#"{"action": "string", "box": "string", "query": "string", "id": "string", "to": "string", "subject": "string", "body": "string", "sync": "bool", "max_messages": "int"}"#),
-                ("check_whatsapp", r#"{"action": "string", "query": "string", "chat": "string", "id": "string", "to": "string", "text": "string", "after": "string", "before": "string", "limit": "int"}"#),
+                ("check_whatsapp", r#"{"action": "string", "query": "string", "chat": "string", "id": "string", "to": "string", "text": "string", "path": "string", "caption": "string", "after": "string", "before": "string", "limit": "int"}"#),
                 ("generate_image", r#"{"wish": "string"}"#),
                 ("look", r#"{"path": "string", "query": "string"}"#),
             ],
@@ -103,7 +103,7 @@ pub fn all() -> Vec<Rune> {
                 "USB/gamepads: read /proc/bus/input/devices or list_dir /dev/input/by-id. event0..eventN are not pads.\n",
                 "Prefer the house tool for faeOS launchers. remember for durable house facts — never secrets.\n",
                 "Mail: check_mail (list/hunt/read local; sync/keep/trash/send need approval). Rows have date and age — use those; the host card is now.\n",
-                "WhatsApp: check_whatsapp (list/search/show/chats local; send/sync/mark_read need approval). Never invent a bash wacli. Never --follow.\n",
+                "WhatsApp: check_whatsapp (list/search/show/chats local; send/send_file/send_voice/sync/mark_read need approval). send_file takes to+path (pixie_art PNG or last speech wav). send_voice is a voice note for ogg/opus. Never invent a bash wacli. Never --follow.\n",
                 "Images: generate_image hops the GPU (parks Pixie, SDXL forge, restores Pixie). Confirm names the save folder.\n",
                 "Seeing: look hops to the VL eye for a picture; attached files already include an eye caption. C-u clips a file.\n",
                 "World facts: search_house then wiki. No live web in Chat (that is Deep).\n",
@@ -312,6 +312,7 @@ mod tests {
         assert!(names.contains(&"check_whatsapp"));
         assert!(names.contains(&"generate_image"));
         assert!(names.contains(&"look"));
+        assert!(chat.prompt.contains("send_file"), "{}", chat.prompt);
         let deep = by_key(RuneKey::Deep);
         let d: Vec<_> = deep.tools.iter().map(|(n, _)| *n).collect();
         assert!(!d.contains(&"check_whatsapp"));

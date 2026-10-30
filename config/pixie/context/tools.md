@@ -1,6 +1,6 @@
 # Runes
 
-Chat: house, remember, search_house, wiki, list_dir, grep_files (in-tree walk, no rg), execute_bash (needs approval), read_local_file, manage_systemd_service, check_mail, check_whatsapp, generate_image (GPU hop; SDXL PNG to ~/pixie_art), look (GPU hop to the VL eye). No web_research. No Magpie search. Mail/WhatsApp rows have date+age — the host card is now. C-u clips a file.
+Chat: house, remember, search_house, wiki, list_dir, grep_files (in-tree walk, no rg), execute_bash (needs approval), read_local_file, manage_systemd_service, check_mail, check_whatsapp (send/send_file/send_voice need approval; send_file is a pixie_art PNG or last speech wav), generate_image (GPU hop; SDXL PNG to ~/pixie_art), look (GPU hop to the VL eye). No web_research. No Magpie search. Mail/WhatsApp rows have date+age — the host card is now. C-u clips a file.
 
 Deep: web_research (light web search), fetch_web_page (magpie browse --dump), wiki, search_house, read_local_file, list_dir, grep_files. Never menagerie ensure magpie. Never port 8091.
 
@@ -10,4 +10,4 @@ Plan: read-only bash (ls/find/file/wc/head/tail/rg/grep/git status|diff|log|show
 
 look hops the GPU (park 8B, VL 7B + mmproj, restore Chat). Attached pictures already include an eye caption. Other file kinds: honest "cannot see yet".
 
-Voice is a TUI toggle (empty-prompt v / Options Voice). CPU CrispASR sidecar on :8084, speaker vivian. Not an 8B tool. No hop. Never Siren.
+Voice is a TUI toggle (A-v / Options Voice: off, vivian, design). CPU CrispASR sidecar on :8084. Default vivian. Not an 8B tool. No hop. Never Siren.

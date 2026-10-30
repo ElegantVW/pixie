@@ -11,6 +11,7 @@ pub struct UiPrefs {
     pub verbose: bool,
     pub sparkle: bool,
     pub speak_on: bool,
+    pub speak_kind: String,
     pub rune: RuneKey,
     pub build_audit_rounds: bool,
     pub sudo_less_safe: bool,
@@ -24,6 +25,7 @@ impl Default for UiPrefs {
             verbose: false,
             sparkle: true,
             speak_on: false,
+            speak_kind: "vivian".into(),
             rune: RuneKey::Chat,
             build_audit_rounds: true,
             sudo_less_safe: false,
@@ -54,6 +56,11 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
         verbose: v.get("verbose").and_then(|x| x.as_bool()).unwrap_or(false),
         sparkle: v.get("sparkle").and_then(|x| x.as_bool()).unwrap_or(true),
         speak_on: v.get("speak_on").and_then(|x| x.as_bool()).unwrap_or(false),
+        speak_kind: v
+            .get("speak_kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("vivian")
+            .to_string(),
         rune,
         build_audit_rounds: v
             .get("build_audit_rounds")
@@ -84,6 +91,7 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
         "verbose": p.verbose,
         "sparkle": p.sparkle,
         "speak_on": p.speak_on,
+        "speak_kind": p.speak_kind,
         "rune": p.rune.as_str(),
         "build_audit_rounds": p.build_audit_rounds,
         "sudo_less_safe": p.sudo_less_safe,
@@ -298,6 +306,7 @@ mod tests {
         let p = UiPrefs::default();
         assert!(p.sparkle);
         assert!(!p.speak_on);
+        assert_eq!(p.speak_kind, "vivian");
         assert!(p.enhance_image);
         assert_eq!(p.art_dir, "~/pixie_art");
         assert_eq!(p.rune, RuneKey::Chat);

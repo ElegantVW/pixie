@@ -237,14 +237,25 @@ fn mouth_line() -> String {
 }
 
 fn tongue_line() -> String {
-    if crate::speak::ready() {
-        format!(
-            "tongue: {} cpu :{}",
-            crate::speak::SPEAKER,
-            crate::speak::PORT
-        )
-    } else {
-        "tongue: sleeping".into()
+    let v = crate::speak::ready_tongue(crate::speak::Tongue::Vivian);
+    let d = crate::speak::ready_tongue(crate::speak::Tongue::Design);
+    match (v, d) {
+        (true, true) => format!(
+            "tongue: vivian+design cpu :{} t={}",
+            crate::speak::PORT,
+            crate::speak::max_threads()
+        ),
+        (true, false) => format!(
+            "tongue: vivian cpu :{} t={}",
+            crate::speak::PORT,
+            crate::speak::max_threads()
+        ),
+        (false, true) => format!(
+            "tongue: design cpu :{} t={}",
+            crate::speak::PORT,
+            crate::speak::max_threads()
+        ),
+        (false, false) => "tongue: sleeping".into(),
     }
 }
 
@@ -397,5 +408,12 @@ VERSION_ID="12"
         let n = now_line();
         assert!(n.starts_with("now: "), "{n}");
         assert!(n.chars().any(|c| c.is_ascii_digit()), "{n}");
+    }
+
+    #[test]
+    fn tongue_line_names_cpu_or_sleep() {
+        let t = tongue_line();
+        assert!(t.starts_with("tongue:"), "{t}");
+        assert!(t.contains("cpu") || t.contains("sleeping"), "{t}");
     }
 }

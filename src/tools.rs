@@ -283,7 +283,7 @@ pub fn needs_confirm_args(fname: &str, rune: RuneKey, fargs: &Value) -> bool {
                 .get("action")
                 .and_then(|x| x.as_str())
                 .unwrap_or("list");
-            matches!(a, "send" | "sync" | "mark_read")
+            matches!(a, "send" | "send_file" | "send_voice" | "sync" | "mark_read")
         }
         _ => false,
     }
@@ -1323,6 +1323,59 @@ fn check_whatsapp(fargs: &Value) -> Value {
             let raw = wacli_run(&extra, false);
             json!({"action": "send", "to": to, "result": cmd_text(&raw).chars().take(400).collect::<String>()})
         }
+        "send_file" | "send_voice" => {
+            let to = fargs
+                .get("to")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let path = fargs
+                .get("path")
+                .or_else(|| fargs.get("file"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let caption = fargs
+                .get("caption")
+                .or_else(|| fargs.get("text"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if to.trim().is_empty() || path.trim().is_empty() {
+                return json!({"error": "send_file needs to and path"});
+            }
+            let p = match paths::assert_allowed(path) {
+                Ok(p) => p,
+                Err(e) => return json!({"error": e.to_string()}),
+            };
+            if !p.is_file() {
+                return json!({"error": format!("send_file missing file {}", p.display())});
+            }
+            let p_s = p.display().to_string();
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut extra = vec!["send", "file", "--to", to.as_str(), "--file", p_s.as_str()];
+            if action == "send_voice" {
+                if ext == "ogg" || ext == "opus" {
+                    extra.push("--ptt");
+                } else {
+                    extra.extend(["--as", "audio"]);
+                }
+            } else if ext == "wav" {
+                extra.extend(["--as", "audio"]);
+            }
+            if !caption.trim().is_empty() {
+                extra.extend(["--caption", caption]);
+            }
+            let raw = wacli_run(&extra, false);
+            json!({
+                "action": action,
+                "to": to,
+                "path": p_s,
+                "result": cmd_text(&raw).chars().take(400).collect::<String>()
+            })
+        }
         "mark_read" => {
             let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
             if chat.trim().is_empty() {
@@ -1782,6 +1835,16 @@ pub fn confirm_line(name: &str, args: &Value) -> String {
         }
         "check_whatsapp" => {
             let a = args.get("action").and_then(|x| x.as_str()).unwrap_or("write");
+            if a == "send_file" || a == "send_voice" {
+                let to = args.get("to").and_then(|x| x.as_str()).unwrap_or("someone");
+                let path = args
+                    .get("path")
+                    .or_else(|| args.get("file"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("a file");
+                let pretty = pretty_home(path);
+                return format!("send this file to {to}?  {pretty}  [y/N]");
+            }
             format!("let the pocket radio {a}?  [y/N]")
         }
         "check_mail" => {
@@ -2105,6 +2168,16 @@ mod tests {
             RuneKey::Chat,
             &json!({"action": "list"})
         ));
+        assert!(needs_confirm_args(
+            "check_whatsapp",
+            RuneKey::Chat,
+            &json!({"action": "send_file"})
+        ));
+        assert!(needs_confirm_args(
+            "check_whatsapp",
+            RuneKey::Chat,
+            &json!({"action": "send_voice"})
+        ));
         assert!(known_for(RuneKey::Chat).contains(&"check_whatsapp"));
         assert!(!known_for(RuneKey::Deep).contains(&"check_whatsapp"));
         assert!(!known_for(RuneKey::Plan).contains(&"check_whatsapp"));
@@ -2132,6 +2205,50 @@ mod tests {
         assert!(src.contains("--follow") && src.contains("forbidden"));
         assert!(src.contains("--read-only"));
         assert!(src.contains("--once"));
+        assert!(src.contains("send_file"));
+        assert!(src.contains("\"send\", \"file\""));
+        assert!(src.contains("--ptt"));
+    }
+
+    #[test]
+    fn send_file_needs_confirm_and_path_gate() {
+        let line = confirm_line(
+            "check_whatsapp",
+            &json!({"action": "send_file", "to": "Ada", "path": "~/pixie_art/x.png"}),
+        );
+        assert!(line.contains("send this file"), "{line}");
+        assert!(line.contains("Ada"), "{line}");
+        let denied = check_whatsapp(&json!({
+            "action": "send_file",
+            "to": "Ada",
+            "path": "~/.ssh/config"
+        }));
+        let err = denied["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("sensitive") || err.contains("refusing"),
+            "{denied}"
+        );
+        let missing_args = check_whatsapp(&json!({"action": "send_file", "to": "Ada"}));
+        assert!(
+            missing_args["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("to and path"),
+            "{missing_args}"
+        );
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into());
+        let missing = check_whatsapp(&json!({
+            "action": "send_file",
+            "to": "Ada",
+            "path": format!("{home}/no-such-pixie-voice.wav")
+        }));
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("missing file"),
+            "{missing}"
+        );
     }
 
     #[test]
