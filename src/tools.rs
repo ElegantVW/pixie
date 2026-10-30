@@ -1323,7 +1323,7 @@ fn check_whatsapp(fargs: &Value) -> Value {
             let raw = wacli_run(&extra, false);
             json!({"action": "send", "to": to, "result": cmd_text(&raw).chars().take(400).collect::<String>()})
         }
-        "send_file" | "send_voice" => {
+        "send_file" => {
             let to = fargs
                 .get("to")
                 .and_then(|x| x.as_str())
@@ -1356,13 +1356,7 @@ fn check_whatsapp(fargs: &Value) -> Value {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             let mut extra = vec!["send", "file", "--to", to.as_str(), "--file", p_s.as_str()];
-            if action == "send_voice" {
-                if ext == "ogg" || ext == "opus" {
-                    extra.push("--ptt");
-                } else {
-                    extra.extend(["--as", "audio"]);
-                }
-            } else if ext == "wav" {
+            if ext == "wav" {
                 extra.extend(["--as", "audio"]);
             }
             if !caption.trim().is_empty() {
@@ -1376,6 +1370,7 @@ fn check_whatsapp(fargs: &Value) -> Value {
                 "result": cmd_text(&raw).chars().take(400).collect::<String>()
             })
         }
+        "send_voice" => send_voice_note(fargs),
         "mark_read" => {
             let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
             if chat.trim().is_empty() {
@@ -1387,6 +1382,130 @@ fn check_whatsapp(fargs: &Value) -> Value {
         }
         other => json!({"error": format!("unknown whatsapp action {other}")}),
     }
+}
+
+fn send_voice_note(fargs: &Value) -> Value {
+    let to = fargs
+        .get("to")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if to.trim().is_empty() {
+        return json!({"error": "send_voice needs to"});
+    }
+    let path = fargs
+        .get("path")
+        .or_else(|| fargs.get("file"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let caption = fargs
+        .get("caption")
+        .or_else(|| fargs.get("text"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if !path.trim().is_empty() {
+        if let Err(e) = paths::assert_allowed(path) {
+            return json!({"error": e.to_string()});
+        }
+    }
+    if cfg!(test) {
+        return json!({
+            "action": "send_voice",
+            "to": to,
+            "source": if !path.trim().is_empty() { "path" } else if !caption.trim().is_empty() { "caption" } else { "last" },
+            "result": "test skip send"
+        });
+    }
+    let wav = match resolve_voice_wav(path, caption) {
+        Ok(p) => p,
+        Err(e) => return json!({"error": e}),
+    };
+    let note = match wav_to_voice_note(&wav) {
+        Ok(p) => p,
+        Err(e) => return json!({"error": e}),
+    };
+    let note_s = note.display().to_string();
+    let mut extra = vec![
+        "send",
+        "file",
+        "--to",
+        to.as_str(),
+        "--file",
+        note_s.as_str(),
+        "--ptt",
+    ];
+    if !caption.trim().is_empty() {
+        extra.extend(["--caption", caption]);
+    }
+    let raw = wacli_run(&extra, false);
+    json!({
+        "action": "send_voice",
+        "to": to,
+        "path": note_s,
+        "result": cmd_text(&raw).chars().take(400).collect::<String>()
+    })
+}
+
+fn resolve_voice_wav(path: &str, caption: &str) -> Result<std::path::PathBuf, String> {
+    if !path.trim().is_empty() {
+        let p = paths::assert_allowed(path).map_err(|e| e.to_string())?;
+        if !p.is_file() {
+            return Err(format!("send_voice missing file {}", p.display()));
+        }
+        return Ok(p);
+    }
+    if !caption.trim().is_empty() {
+        let dest = crate::speak::cache_wav()
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("wa-note.wav");
+        crate::speak::synth_to(crate::speak::Tongue::Design, caption, &dest)?;
+        if dest.is_file() {
+            return Ok(dest);
+        }
+        return Err("send_voice could not speak the caption".into());
+    }
+    let last = crate::speak::cache_wav();
+    if last.is_file() {
+        return Ok(last);
+    }
+    Err("send_voice needs caption, last speech, or path".into())
+}
+
+fn wav_to_voice_note(wav: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let ext = wav
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "ogg" || ext == "opus" {
+        return Ok(wav.to_path_buf());
+    }
+    let dest = wav.with_extension("ogg");
+    let st = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            &wav.display().to_string(),
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "24k",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            &dest.display().to_string(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("pixie: ffmpeg: {e}"))?;
+    if !st.success() || !dest.is_file() {
+        return Err("pixie: could not wrap the clip as an opus voice note".into());
+    }
+    Ok(dest)
 }
 
 fn menagerie_bin() -> std::path::PathBuf {
@@ -1841,8 +1960,15 @@ pub fn confirm_line(name: &str, args: &Value) -> String {
                     .get("path")
                     .or_else(|| args.get("file"))
                     .and_then(|x| x.as_str())
-                    .unwrap_or("a file");
-                let pretty = pretty_home(path);
+                    .unwrap_or("");
+                if a == "send_voice" && path.trim().is_empty() {
+                    return format!("send a voice note to {to}?  [y/N]");
+                }
+                let pretty = pretty_home(if path.trim().is_empty() {
+                    "~/.cache/pixie/speak/last.wav"
+                } else {
+                    path
+                });
                 return format!("send this file to {to}?  {pretty}  [y/N]");
             }
             format!("let the pocket radio {a}?  [y/N]")
@@ -2208,6 +2334,8 @@ mod tests {
         assert!(src.contains("send_file"));
         assert!(src.contains("\"send\", \"file\""));
         assert!(src.contains("--ptt"));
+        assert!(src.contains("libopus"));
+        assert!(src.contains("wa-note.wav"));
     }
 
     #[test]
@@ -2235,6 +2363,28 @@ mod tests {
                 .unwrap_or("")
                 .contains("to and path"),
             "{missing_args}"
+        );
+        let voice = check_whatsapp(&json!({
+            "action": "send_voice",
+            "to": "Ada",
+            "caption": "hello from pixie"
+        }));
+        assert_eq!(voice["result"], "test skip send", "{voice}");
+        assert_eq!(voice["source"], "caption", "{voice}");
+        let voice_line = confirm_line(
+            "check_whatsapp",
+            &json!({"action": "send_voice", "to": "Ada"}),
+        );
+        assert!(voice_line.contains("voice note"), "{voice_line}");
+        let voice_denied = check_whatsapp(&json!({
+            "action": "send_voice",
+            "to": "Ada",
+            "path": "~/.ssh/config"
+        }));
+        let verr = voice_denied["error"].as_str().unwrap_or("");
+        assert!(
+            verr.contains("sensitive") || verr.contains("refusing"),
+            "{voice_denied}"
         );
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home/evenweaker".into());
         let missing = check_whatsapp(&json!({

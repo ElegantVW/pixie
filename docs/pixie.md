@@ -2,7 +2,7 @@
 
 **Role:** Local AI familiar with tools (files, shell, house spells), fully offline. `pixie` / `pixie "…"`; llama-server on `127.0.0.1:8080` via `menagerie`.
 
-**Status:** Rust engine (v0.3.10). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
+**Status:** Rust engine (v0.3.11). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
 
 ## Current
 
@@ -25,8 +25,8 @@
 - Tool results are tagged `<tool_result>` (not llama `role: tool`). Kur `:8081` titles the first 10 user lines and adds the cute sparkle; the 8B does JSON, facts, and mid-thread compact. Sparkle is an Options toggle.
 - You/Pixie sit in content-sized bubbles (right blush / left pink). House star splash on launch; wait spinner is the star’s own rows (`*` `\|/` `---*---` `/|\`), not a generic ticker. Prompt box grows with wrapped text (same wrap for height, paint, and cursor).
 - File cards: green `+` / red `−` on writes; **C-u** clip · **C-l** look · **C-o** open · **C-p / C-n** cycle. **C-h** help · **C-v** verbose · **A-v** speak · **C-s** sessions · **C-q** quit. Bare letters always type.
-- **Voice** speaks the final assistant reply through a CPU CrispASR sidecar (`127.0.0.1:8084`). Default off. Options cycles **off / vivian / design**. **A-v** toggles on/off. vivian is Qwen3-TTS 0.6B CustomVoice; design is VoiceDesign 1.7B when the GGUF is parked. No GPU hop. Missing guest/codec: tongue sleeps. Never Siren.
-- Chat WhatsApp can `send_file` a `~/pixie_art` PNG or last speech WAV (confirm, home path).
+- **Voice** speaks through a CPU CrispASR sidecar (`127.0.0.1:8084`). Default off, default tongue **design**. Options cycles **off / vivian / design**. **A-v** toggles on/off. Sentences play as they land (next synth overlaps). No GPU hop. Missing guest/codec: tongue sleeps. Never Siren.
+- Chat WhatsApp `send_voice` takes `to` (path optional): caption/text is spoken to an opus voice note, else last speech wav. Confirm, home path.
 - Host card every turn (OS, zsh, CPU, GPU, RAM, term, session). House pack in `config/pixie/context/`.
 - Barge-in: type + Enter aborts the in-flight reply. Quiet hides `<think>` but jsonl stores it.
 - `look` hops like Imp: park the 8B, bind pixie vision (Qwen2.5-VL-7B IQ4_XS + mmproj-f16, ctx 4096), describe the picture, restore Chat. One GPU tenant. Missing mmproj keeps the eye asleep.

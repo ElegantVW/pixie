@@ -1,5 +1,11 @@
 # Pixie changelog
 
+## v0.3.11 hear design while she talks (2026-10-30)
+
+- Default tongue is **design**. A-v still toggles. Options still cycles off / vivian / design.
+- Streaming conductor: sentences play as they land; the next sentence synths while the last one plays. `last.wav` is the concat of the turn. Tests never start CrispASR or play.
+- `send_voice` with `to` and no path speaks `caption`/`text` (else last speech) to opus and sends `wacli send file --ptt`. Confirm still gates it.
+
 ## v0.3.10 two tongues, faster vivian (2026-10-30)
 
 - vivian stays the default. Options Voice cycles off → vivian → design. **A-v** (Alt+v) toggles speak on/off and keeps the last tongue. Super+v is i3 split-v and never reaches the TUI. Bare `v` types. `C-v` stays verbose.

@@ -582,8 +582,12 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
             app.live.push_str(&s);
             let sp = crate::think::split(&app.live);
             app.live_think = sp.think;
+            if app.speak_on {
+                crate::speak::push_live(app.tongue, &sp.visible);
+            }
         }
         UiMsg::Calling(name) => {
+            crate::speak::drop_partial();
             app.live = format!("calling {name}…");
         }
         UiMsg::Round { n, cap } => {
@@ -616,6 +620,7 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                 think,
                 ok,
             });
+            crate::speak::drop_partial();
             app.live.clear();
         }
         UiMsg::Wake { err } => {
@@ -762,7 +767,10 @@ fn handle_msg(app: &mut App, msg: UiMsg) {
                     None,
                 );
                 if app.speak_on {
-                    spawn_say(app, speak_text);
+                    crate::speak::flush_remainder(app.tongue);
+                    if !crate::speak::emitted_this_turn() {
+                        spawn_say(app, speak_text);
+                    }
                 }
             }
             app.live.clear();
@@ -1740,6 +1748,9 @@ fn send(app: &mut App, text: &str) {
     app.busy = true;
     app.live.clear();
     app.live_think.clear();
+    if app.speak_on {
+        crate::speak::begin_turn();
+    }
     app.scroll = 0;
     let rune = runes::all()[app.rune_idx].clone();
     let session = app.session_id.clone();

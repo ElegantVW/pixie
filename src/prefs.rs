@@ -25,7 +25,7 @@ impl Default for UiPrefs {
             verbose: false,
             sparkle: true,
             speak_on: false,
-            speak_kind: "vivian".into(),
+            speak_kind: "design".into(),
             rune: RuneKey::Chat,
             build_audit_rounds: true,
             sudo_less_safe: false,
@@ -59,7 +59,7 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
         speak_kind: v
             .get("speak_kind")
             .and_then(|x| x.as_str())
-            .unwrap_or("vivian")
+            .unwrap_or("design")
             .to_string(),
         rune,
         build_audit_rounds: v
@@ -306,7 +306,7 @@ mod tests {
         let p = UiPrefs::default();
         assert!(p.sparkle);
         assert!(!p.speak_on);
-        assert_eq!(p.speak_kind, "vivian");
+        assert_eq!(p.speak_kind, "design");
         assert!(p.enhance_image);
         assert_eq!(p.art_dir, "~/pixie_art");
         assert_eq!(p.rune, RuneKey::Chat);

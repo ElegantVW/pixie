@@ -55,8 +55,8 @@ pub enum Tongue {
 impl Tongue {
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
-            "design" | "voicedesign" | "pixie" => Tongue::Design,
-            _ => Tongue::Vivian,
+            "vivian" | "custom" | "customvoice" => Tongue::Vivian,
+            _ => Tongue::Design,
         }
     }
 
@@ -144,6 +144,283 @@ pub fn cache_wav() -> PathBuf {
 
 fn sidecar_log() -> PathBuf {
     paths::cache_dir().join("speak").join("sidecar.log")
+}
+
+const SENTENCE_FLOOR: usize = 12;
+const WAV_RATE: u32 = 24_000;
+
+/// Pull complete sentences off `buf`. Remainder has no terminal `.?!` yet, or is under the floor.
+pub fn take_sentences(buf: &str) -> (Vec<String>, String) {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < buf.len() {
+        let ch = match buf[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let n = ch.len_utf8();
+        if matches!(ch, '.' | '!' | '?') {
+            let end = i + n;
+            let piece = buf[start..end].trim();
+            if piece.chars().count() >= SENTENCE_FLOOR {
+                out.push(piece.to_string());
+                start = end;
+            }
+        }
+        i += n;
+    }
+    (out, buf[start..].to_string())
+}
+
+enum Job {
+    Begin { gen: u64 },
+    Line { gen: u64, tongue: Tongue, text: String },
+}
+
+struct Streamer {
+    last_clip: String,
+    remainder: String,
+    emitted: u32,
+    gen: u64,
+}
+
+fn streamer() -> &'static Mutex<Streamer> {
+    static C: OnceLock<Mutex<Streamer>> = OnceLock::new();
+    C.get_or_init(|| {
+        Mutex::new(Streamer {
+            last_clip: String::new(),
+            remainder: String::new(),
+            emitted: 0,
+            gen: 0,
+        })
+    })
+}
+
+fn jobs() -> Option<std::sync::mpsc::Sender<Job>> {
+    if cfg!(test) {
+        return None;
+    }
+    static TX: OnceLock<std::sync::mpsc::Sender<Job>> = OnceLock::new();
+    Some(
+        TX.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (play_tx, play_rx) = std::sync::mpsc::channel::<PathBuf>();
+            let _ = std::thread::Builder::new()
+                .name("pixie-tongue-play".into())
+                .spawn(move || play_worker(play_rx));
+            let _ = std::thread::Builder::new()
+                .name("pixie-tongue-synth".into())
+                .spawn(move || synth_worker(rx, play_tx));
+            tx
+        })
+        .clone(),
+    )
+}
+
+fn synth_worker(rx: std::sync::mpsc::Receiver<Job>, play_tx: std::sync::mpsc::Sender<PathBuf>) {
+    let mut n = 0u32;
+    let mut gen = 0u64;
+    while let Ok(job) = rx.recv() {
+        match job {
+            Job::Begin { gen: g } => {
+                gen = g;
+                n = 0;
+                let _ = play_tx.send(PathBuf::new());
+            }
+            Job::Line {
+                gen: g,
+                tongue,
+                text,
+            } => {
+                if g != gen {
+                    continue;
+                }
+                let clip = spoken_clip(&text);
+                if clip.is_empty() {
+                    continue;
+                }
+                n = n.saturating_add(1);
+                let dest = paths::cache_dir()
+                    .join("speak")
+                    .join(format!("part-{n:03}.wav"));
+                let _ = fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")));
+                if synth_to(tongue, &clip, &dest).is_ok() {
+                    let _ = play_tx.send(dest);
+                }
+            }
+        }
+    }
+}
+
+fn play_worker(rx: std::sync::mpsc::Receiver<PathBuf>) {
+    let mut pcm = Vec::new();
+    while let Ok(path) = rx.recv() {
+        if path.as_os_str().is_empty() {
+            pcm.clear();
+            continue;
+        }
+        let _ = play_wav(&path);
+        append_wav_pcm(&mut pcm, &path);
+        let _ = write_pcm_wav(&pcm, &cache_wav());
+    }
+}
+
+fn append_wav_pcm(pcm: &mut Vec<u8>, wav: &Path) {
+    let Ok(b) = fs::read(wav) else {
+        return;
+    };
+    if b.len() > 44 && b.starts_with(b"RIFF") {
+        pcm.extend_from_slice(&b[44..]);
+    }
+}
+
+fn write_pcm_wav(pcm: &[u8], dest: &Path) -> Result<(), String> {
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    let data_len = pcm.len() as u32;
+    let riff_len = 36u32 + data_len;
+    let byte_rate = WAV_RATE * 2;
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_len.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&WAV_RATE.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.extend_from_slice(pcm);
+    fs::write(dest, out).map_err(|e| format!("pixie: tongue wav: {e}"))
+}
+
+pub fn begin_turn() {
+    if cfg!(test) {
+        return;
+    }
+    let gen = if let Ok(mut g) = streamer().lock() {
+        g.last_clip.clear();
+        g.remainder.clear();
+        g.emitted = 0;
+        g.gen = g.gen.saturating_add(1);
+        g.gen
+    } else {
+        1
+    };
+    if let Some(tx) = jobs() {
+        let _ = tx.send(Job::Begin { gen });
+    }
+}
+
+pub fn drop_partial() {
+    if cfg!(test) {
+        return;
+    }
+    if let Ok(mut g) = streamer().lock() {
+        g.last_clip.clear();
+        g.remainder.clear();
+    }
+}
+
+pub fn emitted_this_turn() -> bool {
+    streamer()
+        .lock()
+        .map(|g| g.emitted > 0 || !g.remainder.trim().is_empty())
+        .unwrap_or(false)
+}
+
+pub fn push_live(tongue: Tongue, visible: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let clip = spoken_clip(visible);
+    if clip.is_empty() {
+        return;
+    }
+    let mut sents = Vec::new();
+    if let Ok(mut g) = streamer().lock() {
+        let extra = if clip.starts_with(&g.last_clip) {
+            clip[g.last_clip.len()..].to_string()
+        } else if g.last_clip.starts_with(&clip) {
+            String::new()
+        } else {
+            g.remainder.clear();
+            clip.clone()
+        };
+        g.last_clip = clip;
+        if extra.is_empty() {
+            return;
+        }
+        g.remainder.push_str(&extra);
+        let (got, rest) = take_sentences(&g.remainder);
+        g.remainder = rest;
+        g.emitted = g.emitted.saturating_add(got.len() as u32);
+        sents = got;
+    }
+    for s in sents {
+        enqueue(tongue, s);
+    }
+}
+
+pub fn flush_remainder(tongue: Tongue) {
+    if cfg!(test) {
+        return;
+    }
+    let rest = streamer()
+        .lock()
+        .ok()
+        .map(|mut g| {
+            let r = std::mem::take(&mut g.remainder);
+            if !r.trim().is_empty() {
+                g.emitted = g.emitted.saturating_add(1);
+            }
+            r
+        })
+        .unwrap_or_default();
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        enqueue(tongue, rest.to_string());
+    }
+}
+
+fn enqueue(tongue: Tongue, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let gen = streamer().lock().map(|g| g.gen).unwrap_or(0);
+    if let Some(tx) = jobs() {
+        let _ = tx.send(Job::Line { gen, tongue, text });
+    }
+}
+
+/// Synth a clip to `dest` without playing. Tests are no-ops.
+pub fn synth_to(tongue: Tongue, text: &str, dest: &Path) -> Result<(), String> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let clip = spoken_clip(text);
+    if clip.is_empty() {
+        return Ok(());
+    }
+    if !ready_tongue(tongue) {
+        return Err(sleeping_reason_tongue(tongue));
+    }
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("pixie: tongue cache: {e}"))?;
+    }
+    let _ = fs::remove_file(dest);
+    match ensure_tongue(tongue) {
+        Ok(()) => {
+            if synth_http(tongue, &clip, dest).is_err() {
+                synth_oneshot(tongue, &clip, dest)?;
+            }
+        }
+        Err(_) => synth_oneshot(tongue, &clip, dest)?,
+    }
+    Ok(())
 }
 
 fn file_ok(p: &Path, min: u64) -> bool {
@@ -599,9 +876,9 @@ fn play_wav(wav: &Path) -> Result<(), String> {
     Err("pixie: tongue play failed · next: paplay or pw-play".into())
 }
 
-/// Synth + paplay. Tests never start CrispASR or play audio.
+/// Queue spoken sentences (overlap play). Tests never start CrispASR or play audio.
 pub fn say(text: &str) -> Result<(), String> {
-    say_tongue(Tongue::Vivian, text)
+    say_tongue(Tongue::Design, text)
 }
 
 pub fn say_tongue(tongue: Tongue, text: &str) -> Result<(), String> {
@@ -615,19 +892,14 @@ pub fn say_tongue(tongue: Tongue, text: &str) -> Result<(), String> {
     if !ready_tongue(tongue) {
         return Err(sleeping_reason_tongue(tongue));
     }
-    let dir = paths::cache_dir().join("speak");
-    fs::create_dir_all(&dir).map_err(|e| format!("pixie: tongue cache: {e}"))?;
-    let wav = cache_wav();
-    let _ = fs::remove_file(&wav);
-    match ensure_tongue(tongue) {
-        Ok(()) => {
-            if synth_http(tongue, &clip, &wav).is_err() {
-                synth_oneshot(tongue, &clip, &wav)?;
-            }
-        }
-        Err(_) => synth_oneshot(tongue, &clip, &wav)?,
+    let (sents, rest) = take_sentences(&clip);
+    for s in sents {
+        enqueue(tongue, s);
     }
-    play_wav(&wav)
+    if !rest.trim().is_empty() {
+        enqueue(tongue, rest.trim().to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -756,10 +1028,24 @@ mod tests {
     }
 
     #[test]
-    fn tongue_from_str_defaults_vivian() {
+    fn tongue_from_str_defaults_design() {
         assert_eq!(Tongue::from_str("vivian"), Tongue::Vivian);
         assert_eq!(Tongue::from_str("design"), Tongue::Design);
-        assert_eq!(Tongue::from_str(""), Tongue::Vivian);
+        assert_eq!(Tongue::from_str(""), Tongue::Design);
+        assert_eq!(Tongue::from_str("pixie"), Tongue::Design);
+    }
+
+    #[test]
+    fn take_sentences_keeps_a_short_tail() {
+        let (s, rest) = take_sentences("The hearth is warm. I kept the kettle");
+        assert_eq!(s, vec!["The hearth is warm.".to_string()]);
+        assert!(rest.contains("kettle"), "{rest}");
+        let (none, tail) = take_sentences("Hi.");
+        assert!(none.is_empty(), "{none:?}");
+        assert_eq!(tail.trim(), "Hi.");
+        let (all, empty) = take_sentences("Quick and kind. A little sparkle.");
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(empty.trim().is_empty(), "{empty}");
     }
 
     #[test]
