@@ -2,7 +2,7 @@
 
 **Role:** Local AI familiar with tools (files, shell, house spells), fully offline. `pixie` / `pixie "…"`; llama-server on `127.0.0.1:8080` via `menagerie`.
 
-**Status:** Rust engine (v0.3.12). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
+**Status:** Rust engine (v0.3.13). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
 
 ## Current
 
@@ -25,7 +25,7 @@
 - Tool results are tagged `<tool_result>` (not llama `role: tool`). Kur `:8081` titles the first 10 user lines and adds the cute sparkle; the 8B does JSON, facts, and mid-thread compact. Sparkle is an Options toggle.
 - You/Pixie sit in content-sized bubbles (right blush / left pink). House star splash on launch; wait spinner is the star’s own rows (`*` `\|/` `---*---` `/|\`), not a generic ticker. Prompt box grows with wrapped text (same wrap for height, paint, and cursor).
 - File cards: green `+` / red `−` on writes; **C-u** clip · **C-l** look · **C-o** open · **C-p / C-n** cycle. **C-h** help · **C-v** verbose · **A-v** speak · **C-s** sessions · **C-q** quit. Bare letters always type.
-- **Voice** speaks through a CPU CrispASR sidecar (`127.0.0.1:8084`). Default off, default tongue **design**. Options cycles **off / vivian / design**. **A-v** toggles on/off. First clause plays immediately; glass waits until that sentence starts. Emoji and technical junk are stripped from the talker (laughs become words). No GPU hop. Missing guest/codec: tongue sleeps. Never Siren.
+- **Voice** sidecar on `127.0.0.1:8084`. Default off, default tongue **design**. Options cycles **off / vivian / design / vibe**. **A-v** toggles on/off. Design prefers the vulkan CrispASR guest (CPU tarball is fallback). **vibe** is VibeVoice Realtime 0.5B (explicit GGUF, never `-m auto`). First clause plays immediately; glass waits until that sentence starts. Never Siren. No hop to speak.
 - Chat WhatsApp `send_voice` takes `to` (path optional): **caption/text is the intro** spoken to opus. Last speech wav only when they asked to resend. Confirm names the source. Home path.
 - Host card every turn (OS, zsh, CPU, GPU, RAM, term, session). House pack in `config/pixie/context/`.
 - Barge-in: type + Enter aborts the in-flight reply. Quiet hides `<think>` but jsonl stores it.

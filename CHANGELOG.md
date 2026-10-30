@@ -1,5 +1,11 @@
 # Pixie changelog
 
+## v0.3.13 design on Vulkan, vibe as the fast tongue (2026-10-30)
+
+- Park CrispASR 0.8.48 **vulkan** at `~/.local/lib/crispasr-vulkan/`. CPU tarball stays. Design prefers GPU; `--no-gpu` only on the CPU guest. Fallback if vulkan missing or bind fails.
+- Tongue **vibe**: VibeVoice Realtime 0.5B (`vibevoice-tts` + explicit Q4_K + Emma pack). Never `-m auto`. Options cycle off / vivian / design / vibe. Default stays design.
+- Measured on this **RX 5700 XT / RADV**: VoiceDesign short clause `Hi. I am Pixie.` → **1.6 s audio in 1.22 s (RTF 0.764)** vs CPU RTF 2.14. Codes 762 ms, codec 460 ms. Not RDNA4’s 0.5, still ~2.8× the CPU guest.
+
 ## v0.3.12 speak the intro, skip the sparkles (2026-10-30)
 
 - `check_whatsapp` `norm_args` keeps `caption`/`path`/`file`. `send_voice` speaks that caption. Confirm names the caption or “last speech”. Last wav only when caption/text/path are empty.

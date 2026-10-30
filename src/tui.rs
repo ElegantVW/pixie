@@ -240,12 +240,14 @@ fn toggle_speak(app: &mut App) {
 fn cycle_voice(app: &mut App, dir: i32) {
     let i = if !app.speak_on {
         0
-    } else if app.tongue == crate::speak::Tongue::Vivian {
-        1
     } else {
-        2
+        match app.tongue {
+            crate::speak::Tongue::Vivian => 1,
+            crate::speak::Tongue::Design => 2,
+            crate::speak::Tongue::Vibe => 3,
+        }
     };
-    match (i + dir).rem_euclid(3) {
+    match (i + dir).rem_euclid(4) {
         0 => {
             app.speak_on = false;
             persist_ui(app);
@@ -259,9 +261,15 @@ fn cycle_voice(app: &mut App, dir: i32) {
             persist_ui(app);
             apply_tongue(app);
         }
-        _ => {
+        2 => {
             app.speak_on = true;
             app.tongue = crate::speak::Tongue::Design;
+            persist_ui(app);
+            apply_tongue(app);
+        }
+        _ => {
+            app.speak_on = true;
+            app.tongue = crate::speak::Tongue::Vibe;
             persist_ui(app);
             apply_tongue(app);
         }
@@ -1617,16 +1625,20 @@ fn refresh_mouth_note(app: &mut App) {
     } else {
         "eye"
     };
-    let tongue = if crate::speak::ready_tongue(crate::speak::Tongue::Design)
-        && crate::speak::ready_tongue(crate::speak::Tongue::Vivian)
-    {
-        "tongue vivian+design"
-    } else if crate::speak::ready_tongue(crate::speak::Tongue::Vivian) {
-        "tongue vivian"
-    } else if crate::speak::ready_tongue(crate::speak::Tongue::Design) {
-        "tongue design"
+    let mut kinds = Vec::new();
+    if crate::speak::ready_tongue(crate::speak::Tongue::Vivian) {
+        kinds.push("vivian");
+    }
+    if crate::speak::ready_tongue(crate::speak::Tongue::Design) {
+        kinds.push("design");
+    }
+    if crate::speak::ready_tongue(crate::speak::Tongue::Vibe) {
+        kinds.push("vibe");
+    }
+    let tongue = if kinds.is_empty() {
+        "tongue asleep".into()
     } else {
-        "tongue asleep"
+        format!("tongue {}", kinds.join("+"))
     };
     app.mouth_note = format!(
         "pixie {p} {} {} · kur {k} · {eye} · {tongue}",

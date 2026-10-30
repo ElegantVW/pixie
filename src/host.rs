@@ -237,26 +237,30 @@ fn mouth_line() -> String {
 }
 
 fn tongue_line() -> String {
-    let v = crate::speak::ready_tongue(crate::speak::Tongue::Vivian);
-    let d = crate::speak::ready_tongue(crate::speak::Tongue::Design);
-    match (v, d) {
-        (true, true) => format!(
-            "tongue: vivian+design cpu :{} t={}",
-            crate::speak::PORT,
-            crate::speak::max_threads()
-        ),
-        (true, false) => format!(
-            "tongue: vivian cpu :{} t={}",
-            crate::speak::PORT,
-            crate::speak::max_threads()
-        ),
-        (false, true) => format!(
-            "tongue: design cpu :{} t={}",
-            crate::speak::PORT,
-            crate::speak::max_threads()
-        ),
-        (false, false) => "tongue: sleeping".into(),
+    let mut kinds = Vec::new();
+    if crate::speak::ready_tongue(crate::speak::Tongue::Vivian) {
+        kinds.push("vivian");
     }
+    if crate::speak::ready_tongue(crate::speak::Tongue::Design) {
+        kinds.push("design");
+    }
+    if crate::speak::ready_tongue(crate::speak::Tongue::Vibe) {
+        kinds.push("vibe");
+    }
+    if kinds.is_empty() {
+        return "tongue: sleeping".into();
+    }
+    let device = if crate::speak::vulkan_ready() {
+        "vulkan"
+    } else {
+        "cpu"
+    };
+    format!(
+        "tongue: {} {device} :{} t={}",
+        kinds.join("+"),
+        crate::speak::PORT,
+        crate::speak::max_threads()
+    )
 }
 
 fn uname(args: &[&str]) -> String {
@@ -414,6 +418,9 @@ VERSION_ID="12"
     fn tongue_line_names_cpu_or_sleep() {
         let t = tongue_line();
         assert!(t.starts_with("tongue:"), "{t}");
-        assert!(t.contains("cpu") || t.contains("sleeping"), "{t}");
+        assert!(
+            t.contains("cpu") || t.contains("vulkan") || t.contains("sleeping"),
+            "{t}"
+        );
     }
 }

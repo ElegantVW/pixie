@@ -10,4 +10,4 @@ Plan: read-only bash (ls/find/file/wc/head/tail/rg/grep/git status|diff|log|show
 
 look hops the GPU (park 8B, VL 7B + mmproj, restore Chat). Attached pictures already include an eye caption. Other file kinds: honest "cannot see yet".
 
-Voice is a TUI toggle (A-v / Options Voice: off, vivian, design). CPU CrispASR sidecar on :8084. Default design. Sentences play as they land. Not an 8B tool. No hop. Never Siren.
+Voice is a TUI toggle (A-v / Options Voice: off, vivian, design, vibe). Sidecar on :8084. Default design. Design prefers vulkan CrispASR; CPU is fallback. vibe is VibeVoice realtime (explicit GGUF). Not an 8B tool. No hop. Never Siren.

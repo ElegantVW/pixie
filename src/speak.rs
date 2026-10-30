@@ -38,6 +38,8 @@ pub fn thread_count(clip_chars: usize) -> u16 {
 const CODEC_NAME: &str = "qwen3-tts-tokenizer-12hz.gguf";
 const VIVIAN_TALKER: &str = "qwen3-tts-12hz-0.6b-customvoice-q8_0.gguf";
 const DESIGN_TALKER: &str = "qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf";
+const VIBE_TALKER: &str = "vibevoice-realtime-0.5b-q4_k.gguf";
+const VIBE_VOICE: &str = "vibevoice-voice-emma.gguf";
 
 const VIVIAN_INSTRUCT: &str =
     "Bright small all-ages fairy creature, quick and kind, high and light, not a child.";
@@ -50,12 +52,14 @@ pub const SPEAKER: &str = "vivian";
 pub enum Tongue {
     Vivian,
     Design,
+    Vibe,
 }
 
 impl Tongue {
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "vivian" | "custom" | "customvoice" => Tongue::Vivian,
+            "vibe" | "vibevoice" | "realtime" => Tongue::Vibe,
             _ => Tongue::Design,
         }
     }
@@ -64,6 +68,7 @@ impl Tongue {
         match self {
             Tongue::Vivian => "vivian",
             Tongue::Design => "design",
+            Tongue::Vibe => "vibe",
         }
     }
 
@@ -71,6 +76,7 @@ impl Tongue {
         match self {
             Tongue::Vivian => "qwen3-tts-customvoice",
             Tongue::Design => "qwen3-tts-1.7b-voicedesign",
+            Tongue::Vibe => "vibevoice-tts",
         }
     }
 
@@ -78,6 +84,7 @@ impl Tongue {
         match self {
             Tongue::Vivian => VIVIAN_TALKER,
             Tongue::Design => DESIGN_TALKER,
+            Tongue::Vibe => VIBE_TALKER,
         }
     }
 
@@ -85,20 +92,31 @@ impl Tongue {
         match self {
             Tongue::Vivian => VIVIAN_INSTRUCT,
             Tongue::Design => DESIGN_INSTRUCT,
+            Tongue::Vibe => "",
         }
+    }
+
+    pub fn needs_codec(self) -> bool {
+        !matches!(self, Tongue::Vibe)
+    }
+
+    pub fn has_instruct(self) -> bool {
+        !matches!(self, Tongue::Vibe)
     }
 
     pub fn voice(self) -> Option<&'static str> {
         match self {
             Tongue::Vivian => Some("vivian"),
             Tongue::Design => None,
+            Tongue::Vibe => Some("emma"),
         }
     }
 
     pub fn next(self) -> Self {
         match self {
             Tongue::Vivian => Tongue::Design,
-            Tongue::Design => Tongue::Vivian,
+            Tongue::Design => Tongue::Vibe,
+            Tongue::Vibe => Tongue::Vivian,
         }
     }
 }
@@ -118,12 +136,44 @@ fn sidecar_cell() -> &'static Mutex<Sidecar> {
     })
 }
 
-pub fn bin() -> PathBuf {
+pub fn cpu_bin() -> PathBuf {
     paths::home().join(".local/lib/crispasr/crispasr")
 }
 
+pub fn vulkan_bin() -> PathBuf {
+    paths::home().join(".local/lib/crispasr-vulkan/crispasr")
+}
+
+pub fn vulkan_ready() -> bool {
+    file_ok(&vulkan_bin(), 1_000_000)
+}
+
+/// Prefer the vulkan guest when it is parked. CPU tarball stays the fallback.
+pub fn bin() -> PathBuf {
+    if vulkan_ready() {
+        vulkan_bin()
+    } else {
+        cpu_bin()
+    }
+}
+
 pub fn lib_dir() -> PathBuf {
-    paths::home().join(".local/lib/crispasr")
+    lib_dir_for(&bin())
+}
+
+fn lib_dir_for(bin: &Path) -> PathBuf {
+    bin.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| paths::home().join(".local/lib/crispasr"))
+}
+
+fn guest_is_gpu(bin: &Path) -> bool {
+    bin.components()
+        .any(|c| c.as_os_str() == "crispasr-vulkan")
+}
+
+pub fn voice_pack() -> PathBuf {
+    paths::data_dir().join("models").join(VIBE_VOICE)
 }
 
 pub fn talker() -> PathBuf {
@@ -511,7 +561,22 @@ pub fn ready_from(bin: &Path, talker: &Path, codec: &Path) -> bool {
 }
 
 pub fn ready_tongue(tongue: Tongue) -> bool {
-    ready_from(&bin(), &talker_for(tongue), &codec())
+    let guest = file_ok(&vulkan_bin(), 1_000_000) || file_ok(&cpu_bin(), 1_000_000);
+    let talker_min = if matches!(tongue, Tongue::Vibe) {
+        500_000_000
+    } else {
+        1_000_000
+    };
+    if !guest || !file_ok(&talker_for(tongue), talker_min) {
+        return false;
+    }
+    if tongue.needs_codec() && !file_ok(&codec(), 1_000_000) {
+        return false;
+    }
+    if matches!(tongue, Tongue::Vibe) && !file_ok(&voice_pack(), 100_000) {
+        return false;
+    }
+    true
 }
 
 pub fn ready() -> bool {
@@ -542,7 +607,33 @@ pub fn sleeping_reason() -> String {
 }
 
 pub fn sleeping_reason_tongue(tongue: Tongue) -> String {
-    sleeping_reason_from(&bin(), &talker_for(tongue), &codec())
+    if !file_ok(&cpu_bin(), 1_000_000) && !file_ok(&vulkan_bin(), 1_000_000) {
+        return "tongue is still sleeping · next: park ~/.local/lib/crispasr/crispasr".into();
+    }
+    let talker_min = if matches!(tongue, Tongue::Vibe) {
+        500_000_000
+    } else {
+        1_000_000
+    };
+    if !file_ok(&talker_for(tongue), talker_min) {
+        return format!(
+            "tongue is still sleeping · next: park {}",
+            talker_for(tongue).display()
+        );
+    }
+    if matches!(tongue, Tongue::Vibe) && !file_ok(&voice_pack(), 100_000) {
+        return format!(
+            "tongue is still sleeping · next: park {}",
+            voice_pack().display()
+        );
+    }
+    if tongue.needs_codec() && !file_ok(&codec(), 1_000_000) {
+        return format!(
+            "tongue is still sleeping · next: park {}",
+            codec().display()
+        );
+    }
+    "tongue is still sleeping".into()
 }
 
 fn looks_like_tool(t: &str) -> bool {
@@ -918,23 +1009,36 @@ fn push_common(
     threads: u16,
 ) {
     argv.push(bin.display().to_string());
-    argv.push("--no-gpu".into());
+    if !guest_is_gpu(bin) {
+        argv.push("--no-gpu".into());
+    }
     argv.push("-t".into());
     argv.push(threads.to_string());
     argv.push("--backend".into());
     argv.push(tongue.backend().into());
     argv.push("-m".into());
     argv.push(talker.display().to_string());
-    argv.push("--codec-model".into());
-    argv.push(codec.display().to_string());
-    if let Some(voice) = tongue.voice() {
-        argv.push("--voice".into());
-        argv.push(voice.into());
+    if tongue.needs_codec() {
+        argv.push("--codec-model".into());
+        argv.push(codec.display().to_string());
+    }
+    match tongue {
+        Tongue::Vivian => {
+            argv.push("--voice".into());
+            argv.push("vivian".into());
+        }
+        Tongue::Vibe => {
+            argv.push("--voice".into());
+            argv.push(voice_pack().display().to_string());
+        }
+        Tongue::Design => {}
     }
     argv.push("--speaker-identity".into());
     argv.push("synthetic".into());
-    argv.push("--instruct".into());
-    argv.push(tongue.instruct().into());
+    if tongue.has_instruct() {
+        argv.push("--instruct".into());
+        argv.push(tongue.instruct().into());
+    }
 }
 
 pub fn sidecar_argv_for(bin: &Path, talker: &Path, codec: &Path) -> Vec<String> {
@@ -1014,12 +1118,12 @@ pub fn sidecar_up() -> bool {
     TcpStream::connect_timeout(&tongue_addr(), Duration::from_millis(250)).is_ok()
 }
 
-fn apply_guest_env(cmd: &mut Command, threads: u16) {
+fn apply_guest_env(cmd: &mut Command, threads: u16, lib: &Path) {
     cmd.env("PATH", paths::house_path());
-    cmd.env("LD_LIBRARY_PATH", lib_dir());
+    cmd.env("LD_LIBRARY_PATH", lib);
     cmd.env("OMP_NUM_THREADS", threads.to_string());
     cmd.env("OPENBLAS_NUM_THREADS", threads.to_string());
-    cmd.current_dir(lib_dir());
+    cmd.current_dir(lib);
     cmd.stdin(Stdio::null());
 }
 
@@ -1061,10 +1165,10 @@ fn kill_child(child: &mut Child) {
 
 fn steal_port() {
     let _ = Command::new("pkill")
-        .args([
-            "-f",
-            "crispasr --server --no-gpu --host 127.0.0.1 --port 8084",
-        ])
+        .args(["-f", "crispasr --server .*--port 8084"])
+        .status();
+    let _ = Command::new("pkill")
+        .args(["-f", "--host 127.0.0.1 --port 8084"])
         .status();
     for _ in 0..25 {
         if !sidecar_up() {
@@ -1089,18 +1193,26 @@ pub fn stop_sidecar() {
     }
 }
 
-fn spawn_sidecar(tongue: Tongue) -> Result<Child, String> {
+fn spawn_sidecar(tongue: Tongue, gpu: bool) -> Result<Child, String> {
     if !ready_tongue(tongue) {
+        return Err(sleeping_reason_tongue(tongue));
+    }
+    let guest = if gpu && vulkan_ready() {
+        vulkan_bin()
+    } else {
+        cpu_bin()
+    };
+    if !file_ok(&guest, 1_000_000) {
         return Err(sleeping_reason_tongue(tongue));
     }
     let dir = paths::cache_dir().join("speak");
     fs::create_dir_all(&dir).map_err(|e| format!("pixie: tongue cache: {e}"))?;
     let log_path = sidecar_log();
     let log = fs::File::create(&log_path).map_err(|e| format!("pixie: tongue log: {e}"))?;
-    let argv = sidecar_argv_tongue(tongue, &bin(), &talker_for(tongue), &codec());
+    let argv = sidecar_argv_tongue(tongue, &guest, &talker_for(tongue), &codec());
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    apply_guest_env(&mut cmd, max_threads());
+    apply_guest_env(&mut cmd, max_threads(), &lib_dir_for(&guest));
     cmd.stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?));
     cmd.stderr(Stdio::from(log));
     #[cfg(unix)]
@@ -1161,11 +1273,36 @@ pub fn ensure_tongue(tongue: Tongue) -> Result<(), String> {
     let wait = match tongue {
         Tongue::Vivian => Duration::from_secs(90),
         Tongue::Design => Duration::from_secs(120),
+        Tongue::Vibe => Duration::from_secs(90),
     };
-    let mut child = spawn_sidecar(tongue)?;
+    let mut last_err = None;
+    if vulkan_ready() {
+        match spawn_sidecar(tongue, true) {
+            Ok(mut child) => match wait_sidecar(&mut child, wait) {
+                Ok(()) => {
+                    let mut g = sidecar_cell().lock().unwrap_or_else(|e| e.into_inner());
+                    g.child = Some(child);
+                    g.tongue = Some(tongue);
+                    return Ok(());
+                }
+                Err(e) => {
+                    kill_child(&mut child);
+                    last_err = Some(e);
+                    if sidecar_up() {
+                        steal_port();
+                    }
+                }
+            },
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let mut child = match spawn_sidecar(tongue, false) {
+        Ok(c) => c,
+        Err(e) => return Err(last_err.unwrap_or(e)),
+    };
     if let Err(e) = wait_sidecar(&mut child, wait) {
         kill_child(&mut child);
-        return Err(e);
+        return Err(last_err.unwrap_or(e));
     }
     let mut g = sidecar_cell().lock().unwrap_or_else(|e| e.into_inner());
     g.child = Some(child);
@@ -1181,12 +1318,16 @@ fn synth_http(tongue: Tongue, clip: &str, wav: &Path) -> Result<(), String> {
     let mut body = json!({
         "model": tongue.backend(),
         "input": clip,
-        "instructions": tongue.instruct(),
-        "instruct": tongue.instruct(),
         "response_format": "wav",
     });
-    if let Some(voice) = tongue.voice() {
-        body["voice"] = json!(voice);
+    if tongue.has_instruct() {
+        body["instructions"] = json!(tongue.instruct());
+        body["instruct"] = json!(tongue.instruct());
+    }
+    match tongue {
+        Tongue::Vivian => body["voice"] = json!("vivian"),
+        Tongue::Vibe => body["voice"] = json!(voice_pack().display().to_string()),
+        Tongue::Design => {}
     }
     let body = body.to_string();
     let url = format!("http://127.0.0.1:{PORT}/v1/audio/speech");
@@ -1232,9 +1373,10 @@ fn synth_http(tongue: Tongue, clip: &str, wav: &Path) -> Result<(), String> {
 }
 
 fn synth_oneshot(tongue: Tongue, clip: &str, wav: &Path) -> Result<(), String> {
+    let guest = bin();
     let argv = oneshot_argv_tongue(
         tongue,
-        &bin(),
+        &guest,
         &talker_for(tongue),
         &codec(),
         clip,
@@ -1242,7 +1384,11 @@ fn synth_oneshot(tongue: Tongue, clip: &str, wav: &Path) -> Result<(), String> {
     );
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    apply_guest_env(&mut cmd, thread_count(clip.chars().count()));
+    apply_guest_env(
+        &mut cmd,
+        thread_count(clip.chars().count()),
+        &lib_dir_for(&guest),
+    );
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
     let out = cmd
@@ -1441,8 +1587,43 @@ mod tests {
     fn tongue_from_str_defaults_design() {
         assert_eq!(Tongue::from_str("vivian"), Tongue::Vivian);
         assert_eq!(Tongue::from_str("design"), Tongue::Design);
+        assert_eq!(Tongue::from_str("vibe"), Tongue::Vibe);
+        assert_eq!(Tongue::from_str("vibevoice"), Tongue::Vibe);
         assert_eq!(Tongue::from_str(""), Tongue::Design);
         assert_eq!(Tongue::from_str("pixie"), Tongue::Design);
+    }
+
+    #[test]
+    fn vibe_argv_is_explicit_tts_not_asr() {
+        let argv = sidecar_argv_tongue(
+            Tongue::Vibe,
+            Path::new("/tmp/crispasr"),
+            Path::new("/tmp/vibevoice-realtime-0.5b-q4_k.gguf"),
+            Path::new("/tmp/codec.gguf"),
+        );
+        let joined = argv.join(" ");
+        assert!(joined.contains("vibevoice-tts"), "{joined}");
+        assert!(joined.contains("--voice"), "{joined}");
+        assert!(joined.contains("vibevoice-voice-emma.gguf"), "{joined}");
+        assert!(!joined.contains("-m auto"), "{joined}");
+        assert!(!joined.contains("vibevoice-asr"), "{joined}");
+        assert!(!joined.contains("--codec-model"), "{joined}");
+        assert!(!joined.contains("--instruct"), "{joined}");
+        assert!(joined.contains("--no-gpu"), "{joined}");
+    }
+
+    #[test]
+    fn vulkan_guest_drops_no_gpu() {
+        let argv = sidecar_argv_tongue(
+            Tongue::Design,
+            Path::new("/home/evenweaker/.local/lib/crispasr-vulkan/crispasr"),
+            Path::new("/tmp/design.gguf"),
+            Path::new("/tmp/codec.gguf"),
+        );
+        let joined = argv.join(" ");
+        assert!(!joined.contains("--no-gpu"), "{joined}");
+        assert!(joined.contains("qwen3-tts-1.7b-voicedesign"), "{joined}");
+        assert!(joined.contains("--codec-model"), "{joined}");
     }
 
     #[test]
