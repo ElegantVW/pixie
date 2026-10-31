@@ -1,5 +1,13 @@
 # Pixie changelog
 
+## v0.3.14 WhatsApp Auto (2026-10-30)
+
+- Options **Auto** (off by default). Starts user unit `pixie-auto.service` (`pixie --auto`). Quitting the TUI leaves it watching. Flip Auto off to stop the unit.
+- New inbound DMs prompt Pixie as away. House sends the words: text/media/file → text (she says she cannot view files yet, then continues); voice notes and missed/unanswered inbound calls → voice note. No tool calls; hallucinated JSON is stripped.
+- Owns `wacli sync --follow --presence-mode quiet`. Chat `check_whatsapp` still never `--follow`. Sends delegate to that follow process.
+- Whisper transcript when `~/.local/share/pixie/models/ggml-small.bin` (or base/tiny) is on disk. CPU oneshot, never `--backend vibevoice` / `-m auto`. Missing model: still reply, no transcript.
+- Tests never start wacli, CrispASR, paplay, or ffmpeg.
+
 ## v0.3.13 design on Vulkan, vibe as the fast tongue (2026-10-30)
 
 - Park CrispASR 0.8.48 **vulkan** at `~/.local/lib/crispasr-vulkan/`. CPU tarball stays. Design prefers GPU; `--no-gpu` only on the CPU guest. Fallback if vulkan missing or bind fails.

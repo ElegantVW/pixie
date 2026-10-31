@@ -2,7 +2,7 @@
 
 **Role:** Local AI familiar with tools (files, shell, house spells), fully offline. `pixie` / `pixie "…"`; llama-server on `127.0.0.1:8080` via `menagerie`.
 
-**Status:** Rust engine (v0.3.13). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
+**Status:** Rust engine (v0.3.14). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
 
 ## Current
 
@@ -10,7 +10,7 @@
 - Model: Huihui Qwen3-8B abliterated v2 Q4_K_M on this box (menagerie). Live mouth is GPU (`-ngl 99`), ctx **16384**. Native GGUF window is 40k.
 - Bare `pixie` holds the house-star splash until `menagerie ensure pixie` succeeds, then the dashboard. Failure stays on a loading line and retries. `r` rename, `d` delete. Esc on an empty prompt returns home; **C-q** quits. `pixie --new` / `-n` and `--resume [id]` skip the home screen after wake. Title bar shows a grok-style meter of the 24k prompt window (compact at 70%). Tool-loop guard is 64 rounds per turn.
 - Options **Role** chat/code/vision hops the GPU (one tenant). **Sudo** is a sitting: RAM secret or a live ticket, never written to disk. Confirm still gates `execute_bash`, mail/WhatsApp writes, and `generate_image`. Path gate stays for file tools.
-- Chat `check_mail` / `check_whatsapp` rows carry `date` and `age`. Quiet bubbles are human titles (`mail`, `whatsapp`, `forge`) with green/red borders. Host card carries `now:`. Never `wacli sync --follow`.
+- Chat `check_mail` / `check_whatsapp` rows carry `date` and `age`. Quiet bubbles are human titles (`mail`, `whatsapp`, `forge`) with green/red borders. Host card carries `now:`. Chat `check_whatsapp` never `wacli sync --follow`. Options **Auto** (off by default) starts user unit `pixie-auto.service` (`pixie --auto`). Quitting the TUI leaves Auto running. DMs only. House sends text vs voice. Hallucinated tool JSON is stripped. Inbound files: she says she cannot view them yet, then continues. Whisper ASR is CPU oneshot when `~/.local/share/pixie/models/ggml-small.bin` is on disk.
 - `generate_image` hops the GPU and calls sd-cli the way Imp does: GGUF + prompt + size + steps + cfg + seed. SDXL 1024 / 20 / cfg 7. No extra CLIP/VAE/rng/offload flags. Confirm names the braid, the hop, and the folder. The chat paints the PNG with kitty graphics (half-blocks on a plain TTY).
 - **C-u** clips a file via Spellbook `--pick`. Paste a home path to clip. Images auto-`look` (GPU hop to the VL 7B + mmproj, then Chat 8B). UTF-8 text is excerpted. PDF and other kinds stay honest stubs.
 - File tools canonicalize the home directory and the nearest existing path ancestor before authorizing a target, so a new file under an external symlink is refused. The gate fails closed if `HOME` is missing or relative.
@@ -64,7 +64,9 @@ you → pixie TUI  --HTTP-->  llama-server :8080  (llama.cpp)
 | `~/.cache/pixie/sessions/*.jsonl` | transcripts |
 | `~/.cache/pixie/sessions/*.meta.json` | session name / renamed / named_from |
 | `~/.config/pixie/persona.md` | optional persona overlay |
-| `~/.config/pixie/ui.json` | verbose / sparkle / speak_on / speak_kind / default rune / enhance_image / art_dir |
+| `~/.config/pixie/ui.json` | verbose / sparkle / speak_on / speak_kind / auto_on / default rune / enhance_image / art_dir |
+| `~/.config/systemd/user/pixie-auto.service` | Auto linger (`pixie --auto`) |
+| `~/.cache/pixie/wa-auto.json` | Auto checkpoint (MsgIDs, no names) |
 | `~/.cache/pixie/speak/last.wav` | last spoken clip |
 | `~/.local/lib/crispasr/crispasr` | CPU TTS guest |
 | `$XDG_RUNTIME_DIR/pixie/askpass*` | sitting sudo helper (not config) |

@@ -11,6 +11,7 @@ use crate::prefs;
 use crate::privilege;
 use crate::runes::{self, RuneKey};
 use crate::tools;
+use crate::wa_auto;
 use crossterm::{
     event::{
         self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
@@ -149,6 +150,7 @@ struct App {
     sparkle: bool,
     speak_on: bool,
     tongue: crate::speak::Tongue,
+    auto_on: bool,
     default_rune: RuneKey,
     build_audit_rounds: bool,
     sudo_less_safe: bool,
@@ -313,6 +315,7 @@ fn persist_ui(app: &App) {
         sparkle: app.sparkle,
         speak_on: app.speak_on,
         speak_kind: app.tongue.as_str().into(),
+        auto_on: app.auto_on,
         rune: app.default_rune,
         build_audit_rounds: app.build_audit_rounds,
         sudo_less_safe: app.sudo_less_safe,
@@ -359,6 +362,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         sparkle: ui.sparkle,
         speak_on: ui.speak_on,
         tongue: crate::speak::Tongue::from_str(&ui.speak_kind),
+        auto_on: ui.auto_on,
         default_rune: ui.rune,
         build_audit_rounds: ui.build_audit_rounds,
         sudo_less_safe: ui.sudo_less_safe,
@@ -418,6 +422,11 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
     };
     if app.speak_on {
         warm_tongue(&app);
+    }
+    if app.auto_on {
+        if let Err(e) = wa_auto::apply_enabled(true) {
+            app.status = format!("auto: {e}");
+        }
     }
     if app.waking {
         let tx = app.tx.clone();
@@ -1342,7 +1351,7 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 }
 
 fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
-    const N: usize = 16;
+    const N: usize = 17;
     match k.code {
         KeyCode::Esc => {
             app.options = false;
@@ -1402,27 +1411,28 @@ fn cycle_option(app: &mut App, dir: i32) {
             persist_ui(app);
         }
         7 => cycle_voice(app, dir),
-        8 => {
+        8 => toggle_auto(app),
+        9 => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        11 => {
+        12 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
         }
-        12 => cycle_art_dir(app, dir),
-        13 => {
+        13 => cycle_art_dir(app, dir),
+        14 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
         }
-        14 => {
+        15 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
         }
-        15 => toggle_sudo(app),
+        16 => toggle_sudo(app),
         _ => {}
     }
 }
@@ -1440,22 +1450,23 @@ fn activate_option(app: &mut App) {
             persist_ui(app);
         }
         7 => cycle_voice(app, 1),
-        8 => {
+        8 => toggle_auto(app),
+        9 => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        9 => {
+        10 => {
             app.status = if prefs::eye_asleep() {
                 "eye is sleeping — no mmproj on disk".into()
             } else {
                 "look hops the GPU (park 8B, VL 7B, restore Chat)".into()
             };
         }
-        10 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
-        11 => {
+        11 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
+        12 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
             app.status = format!(
@@ -1463,11 +1474,11 @@ fn activate_option(app: &mut App) {
                 if app.enhance_image { "on" } else { "off" }
             );
         }
-        12 => {
+        13 => {
             cycle_art_dir(app, 1);
             app.status = format!("art folder: {}", app.art_dir);
         }
-        13 => {
+        14 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
             app.status = format!(
@@ -1475,7 +1486,7 @@ fn activate_option(app: &mut App) {
                 if app.build_audit_rounds { "on" } else { "off" }
             );
         }
-        14 => {
+        15 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
             app.status = format!(
@@ -1483,8 +1494,32 @@ fn activate_option(app: &mut App) {
                 if app.sudo_less_safe { "on" } else { "off" }
             );
         }
-        15 => toggle_sudo(app),
+        16 => toggle_sudo(app),
         _ => {}
+    }
+}
+
+fn toggle_auto(app: &mut App) {
+    let want = !app.auto_on;
+    app.auto_on = want;
+    persist_ui(app);
+    match wa_auto::apply_enabled(want) {
+        Ok(()) => {
+            app.status = if want {
+                if wa_auto::unit_active() {
+                    "auto on · watching".into()
+                } else {
+                    "auto on".into()
+                }
+            } else {
+                "auto off".into()
+            };
+        }
+        Err(e) => {
+            app.auto_on = !want;
+            persist_ui(app);
+            app.status = format!("auto: {e}");
+        }
     }
 }
 
@@ -2685,6 +2720,7 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         ("Sparkle", sparkle),
         ("Verbose", verbose),
         ("Voice", voice.as_str()),
+        ("Auto", if app.auto_on { "on" } else { "off" }),
         ("Rune", app.default_rune.as_str()),
         ("Eye", eye),
         ("Imp", "hop · one GPU tenant"),
@@ -3527,6 +3563,8 @@ mod tests {
         assert!(src.contains("C-s sessions"), "help must teach C-s sessions");
         assert!(src.contains("n new"), "dashboard must offer New");
         assert!(src.contains("Options"), "dashboard must offer Options");
+        assert!(src.contains("(\"Auto\""), "Options must offer Auto");
+        assert!(src.contains("const N: usize = 17"), "Options has Auto under Voice");
         assert!(src.contains("r rename"), "session list must teach r rename");
         assert!(src.contains("d delete"), "dashboard must teach d delete");
         assert!(src.contains("esc home"), "help must teach esc home");

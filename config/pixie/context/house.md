@@ -8,7 +8,7 @@ Creatures (ask them via the house tool, do not invent foreign CLIs):
 - Bulwark — the wall / Aegis
 - Magpie — browser. Deep rune may search; Chat does not wake Magpie
 - Goblin — mail (`check_mail`; dates on every row)
-- Wacli — WhatsApp (`check_whatsapp`; local store; never `sync --follow`)
+- Wacli — WhatsApp (`check_whatsapp`; local store; never `sync --follow`). Options Auto is a user unit (`pixie --auto`), not a Chat tool.
 - Menagerie — llama guests on loopback ports (pixie 8080). One GPU tenant: hop parks Pixie, runs the other mouth, restores Pixie.
 - Imp — terminal art
 - Reflection — screenshots

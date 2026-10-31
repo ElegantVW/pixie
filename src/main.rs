@@ -18,6 +18,7 @@ mod think;
 mod tools;
 mod tui;
 mod voice;
+mod wa_auto;
 
 use crate::agent::ChatEntry;
 use crate::llm::Abort;
@@ -47,6 +48,9 @@ struct Cli {
     /// sudo askpass helper (stdout only). Hidden.
     #[arg(long, hide = true)]
     askpass: bool,
+    /// Headless WhatsApp auto secretary (user unit pixie-auto.service)
+    #[arg(long)]
+    auto: bool,
     /// One-shot prompt
     prompt: Vec<String>,
 }
@@ -70,6 +74,9 @@ fn real_main() -> Result<i32> {
     let cli = Cli::parse();
     if cli.askpass {
         return Ok(crate::privilege::askpass_client());
+    }
+    if cli.auto {
+        return crate::wa_auto::run();
     }
     if cli.chats {
         println!("{}", mind::format_chat_list(None));

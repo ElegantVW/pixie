@@ -206,7 +206,17 @@ pub fn probe() -> String {
     s.push_str(&mouth_line());
     s.push('\n');
     s.push_str(&tongue_line());
+    s.push('\n');
+    s.push_str(&auto_line());
     s
+}
+
+fn auto_line() -> String {
+    if crate::prefs::auto_on() {
+        "auto: on".into()
+    } else {
+        "auto: off".into()
+    }
 }
 
 pub fn now_line() -> String {
@@ -422,5 +432,11 @@ VERSION_ID="12"
             t.contains("cpu") || t.contains("vulkan") || t.contains("sleeping"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn auto_line_defaults_off() {
+        let a = auto_line();
+        assert!(a.starts_with("auto:"), "{a}");
     }
 }

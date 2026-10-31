@@ -50,6 +50,13 @@ if [[ "$HOUSE" -eq 1 ]]; then
   done
 fi
 
+UNIT_SRC="$ROOT/systemd/pixie-auto.service"
+if [[ -f "$UNIT_SRC" ]]; then
+  mkdir -p "$HOME/.config/systemd/user"
+  cp -f "$UNIT_SRC" "$HOME/.config/systemd/user/pixie-auto.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+fi
+
 echo "installed engine → $LIB/pixie"
 echo "launcher        → $HOME/bin/pixie"
 if ! ls "$HOME/.local/share/pixie/models/"*.gguf >/dev/null 2>&1; then

@@ -1699,7 +1699,6 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
     pub start: usize,
-    #[allow(dead_code)]
     pub end: usize,
 }
 

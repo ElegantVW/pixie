@@ -12,6 +12,7 @@ pub struct UiPrefs {
     pub sparkle: bool,
     pub speak_on: bool,
     pub speak_kind: String,
+    pub auto_on: bool,
     pub rune: RuneKey,
     pub build_audit_rounds: bool,
     pub sudo_less_safe: bool,
@@ -26,6 +27,7 @@ impl Default for UiPrefs {
             sparkle: true,
             speak_on: false,
             speak_kind: "design".into(),
+            auto_on: false,
             rune: RuneKey::Chat,
             build_audit_rounds: true,
             sudo_less_safe: false,
@@ -61,6 +63,7 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
             .and_then(|x| x.as_str())
             .unwrap_or("design")
             .to_string(),
+        auto_on: v.get("auto_on").and_then(|x| x.as_bool()).unwrap_or(false),
         rune,
         build_audit_rounds: v
             .get("build_audit_rounds")
@@ -92,6 +95,7 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
         "sparkle": p.sparkle,
         "speak_on": p.speak_on,
         "speak_kind": p.speak_kind,
+        "auto_on": p.auto_on,
         "rune": p.rune.as_str(),
         "build_audit_rounds": p.build_audit_rounds,
         "sudo_less_safe": p.sudo_less_safe,
@@ -105,6 +109,10 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
 
 pub fn enhance_image() -> bool {
     load_ui().map(|p| p.enhance_image).unwrap_or(true)
+}
+
+pub fn auto_on() -> bool {
+    load_ui().map(|p| p.auto_on).unwrap_or(false)
 }
 
 pub fn art_dir() -> std::path::PathBuf {
@@ -307,6 +315,7 @@ mod tests {
         assert!(p.sparkle);
         assert!(!p.speak_on);
         assert_eq!(p.speak_kind, "design");
+        assert!(!p.auto_on);
         assert!(p.enhance_image);
         assert_eq!(p.art_dir, "~/pixie_art");
         assert_eq!(p.rune, RuneKey::Chat);

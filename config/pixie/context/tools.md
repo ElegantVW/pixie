@@ -11,3 +11,5 @@ Plan: read-only bash (ls/find/file/wc/head/tail/rg/grep/git status|diff|log|show
 look hops the GPU (park 8B, VL 7B + mmproj, restore Chat). Attached pictures already include an eye caption. Other file kinds: honest "cannot see yet".
 
 Voice is a TUI toggle (A-v / Options Voice: off, vivian, design, vibe). Sidecar on :8084. Default design. Design prefers vulkan CrispASR; CPU is fallback. vibe is VibeVoice realtime (explicit GGUF). Not an 8B tool. No hop. Never Siren.
+
+Options Auto (off by default) is the WhatsApp away secretary. It lives in user unit pixie-auto.service; quitting the TUI leaves it on. Auto turns have no tools — words only, house sends text or a voice note. Never wacli sync --follow from Chat.

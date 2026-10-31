@@ -1,0 +1,15 @@
+[Unit]
+Description=Pixie WhatsApp auto secretary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/faeos/pixie --auto
+Restart=on-failure
+RestartSec=5
+Environment=PATH=%h/.local/bin:%h/bin:/usr/bin
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target
