@@ -1,5 +1,11 @@
 # Pixie changelog
 
+## v0.3.15 Auto self-chat (2026-10-31)
+
+- Auto keeps Gil's **Message yourself** notes (`FromMe` + linked account). Messages he sends to other people stay skipped. Auto's own sends are recorded so self-chat cannot loop.
+- Poll no longer uses `--from-them`. Send to self adds `--allow-self`.
+- `pixie --self-test` runs keep/skip + tool-strip fixtures (no follow, no send, no model).
+
 ## v0.3.14 WhatsApp Auto (2026-10-30)
 
 - Options **Auto** (off by default). Starts user unit `pixie-auto.service` (`pixie --auto`). Quitting the TUI leaves it watching. Flip Auto off to stop the unit.

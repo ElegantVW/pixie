@@ -68,8 +68,35 @@ struct State {
     seen: Vec<String>,
 }
 
+pub fn norm_jid(jid: &str) -> String {
+    let j = jid.trim().to_ascii_lowercase();
+    if let Some(at) = j.find('@') {
+        let user = j[..at].split(':').next().unwrap_or(&j[..at]);
+        format!("{user}{}", &j[at..])
+    } else {
+        j.split(':').next().unwrap_or(&j).to_string()
+    }
+}
+
+pub fn is_self_chat(chat_jid: &str, own_jid: &str) -> bool {
+    let a = norm_jid(chat_jid);
+    let b = norm_jid(own_jid);
+    !a.is_empty() && !b.is_empty() && a == b
+}
+
+/// Keep DMs from others, and Gil's Message-yourself notes. Skip Gil→others
+/// and Auto's own sends (`already_sent`). Empty `own_jid` skips every FromMe.
+pub fn keep_inbound(from_me: bool, chat_jid: &str, own_jid: &str, already_sent: bool) -> bool {
+    if already_sent || is_group_jid(chat_jid) {
+        return false;
+    }
+    if from_me {
+        return is_self_chat(chat_jid, own_jid);
+    }
+    true
+}
+
 pub fn classify_message(
-    from_me: bool,
     chat_jid: &str,
     media_type: &str,
     mime: &str,
@@ -77,7 +104,7 @@ pub fn classify_message(
     revoked: bool,
     deleted: bool,
 ) -> Option<InboundKind> {
-    if from_me || revoked || deleted {
+    if revoked || deleted {
         return None;
     }
     if is_group_jid(chat_jid) {
@@ -248,6 +275,42 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
     })
 }
 
+/// Classify + strip fixtures. No follow, no send, no menagerie.
+pub fn self_test() -> anyhow::Result<i32> {
+    let me = "me@s.whatsapp.net";
+    let them = "them@s.whatsapp.net";
+    let mut failed = 0u8;
+    let mut check = |ok: bool, label: &str| {
+        if !ok {
+            eprintln!("auto: self-test fail · {label}");
+            failed += 1;
+        }
+    };
+    check(keep_inbound(false, them, me, false), "other inbound");
+    check(!keep_inbound(true, them, me, false), "from-me to others");
+    check(keep_inbound(true, me, me, false), "self-chat from-me");
+    check(
+        keep_inbound(true, "me:12@s.whatsapp.net", me, false),
+        "self-chat device suffix",
+    );
+    check(!keep_inbound(true, me, me, true), "already sent");
+    check(!keep_inbound(false, "x@g.us", me, false), "group");
+    check(!keep_inbound(true, them, "", false), "no linked jid");
+    check(
+        classify_message(them, "", "", "", false, false) == Some(InboundKind::Text),
+        "text kind",
+    );
+    check(
+        spoken_reply(r#"{"name":"execute_bash","arguments":{}}"#) == FALLBACK,
+        "strip tools",
+    );
+    if failed > 0 {
+        anyhow::bail!("auto self-test: {failed} checks failed");
+    }
+    println!("auto: self-test ok");
+    Ok(0)
+}
+
 /// Headless loop. systemd `pixie --auto`. TUI quit leaves this running.
 pub fn run() -> anyhow::Result<i32> {
     if !prefs::auto_on() {
@@ -275,6 +338,7 @@ struct Watcher {
     follow: Option<Child>,
     pending: HashMap<String, Pending>,
     state: State,
+    own: String,
 }
 
 impl Watcher {
@@ -288,10 +352,15 @@ impl Watcher {
         if follow.is_none() {
             log_line("follow did not start (store busy?)");
         }
+        let own = linked_jid().unwrap_or_default();
+        if own.is_empty() {
+            log_line("no linked account; FromMe stays skipped");
+        }
         Ok(Self {
             follow,
             pending: HashMap::new(),
             state,
+            own,
         })
     }
 
@@ -312,7 +381,7 @@ impl Watcher {
                     newest = ts.to_string();
                 }
             }
-            if let Some(inb) = inbound_from_msg(&m) {
+            if let Some(inb) = inbound_from_msg(&m, &self.own, &self.state.seen) {
                 self.note(inb);
             }
         }
@@ -370,8 +439,14 @@ impl Watcher {
             .collect();
         for k in ready {
             if let Some(p) = self.pending.remove(&k) {
-                if let Err(e) = handle_burst(&p.burst) {
-                    log_line(&format!("send: {e}"));
+                match handle_burst(&p.burst, &self.own) {
+                    Ok(ids) => {
+                        for id in ids {
+                            remember(&mut self.state, &id);
+                        }
+                        save_state(&self.state);
+                    }
+                    Err(e) => log_line(&format!("send: {e}")),
                 }
             }
         }
@@ -384,22 +459,13 @@ impl Drop for Watcher {
     }
 }
 
-fn inbound_from_msg(m: &Value) -> Option<Inbound> {
+fn inbound_from_msg(m: &Value, own: &str, seen: &[String]) -> Option<Inbound> {
     let from_me = m.get("FromMe").and_then(|x| x.as_bool()).unwrap_or(false);
     let chat = m
         .get("ChatJID")
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    let media = m.get("MediaType").and_then(|x| x.as_str()).unwrap_or("");
-    let mime = m.get("MimeType").and_then(|x| x.as_str()).unwrap_or("");
-    let reaction = m.get("ReactionToID").and_then(|x| x.as_str()).unwrap_or("");
-    let revoked = m.get("Revoked").and_then(|x| x.as_bool()).unwrap_or(false);
-    let deleted = m
-        .get("DeletedForMe")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    let kind = classify_message(from_me, &chat, media, mime, reaction, revoked, deleted)?;
     let id = m
         .get("MsgID")
         .and_then(|x| x.as_str())
@@ -408,6 +474,19 @@ fn inbound_from_msg(m: &Value) -> Option<Inbound> {
     if id.is_empty() || chat.is_empty() {
         return None;
     }
+    let already = seen.iter().any(|s| s == &id);
+    if !keep_inbound(from_me, &chat, own, already) {
+        return None;
+    }
+    let media = m.get("MediaType").and_then(|x| x.as_str()).unwrap_or("");
+    let mime = m.get("MimeType").and_then(|x| x.as_str()).unwrap_or("");
+    let reaction = m.get("ReactionToID").and_then(|x| x.as_str()).unwrap_or("");
+    let revoked = m.get("Revoked").and_then(|x| x.as_bool()).unwrap_or(false);
+    let deleted = m
+        .get("DeletedForMe")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    let kind = classify_message(&chat, media, mime, reaction, revoked, deleted)?;
     let text = m
         .get("Text")
         .or_else(|| m.get("DisplayText"))
@@ -462,12 +541,12 @@ fn inbound_from_call(c: &Value) -> Option<Inbound> {
     })
 }
 
-fn handle_burst(burst: &Burst) -> Result<(), String> {
+fn handle_burst(burst: &Burst, own: &str) -> Result<Vec<String>, String> {
     if cfg!(test) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if burst.items.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let kind = reply_kind(&burst.items);
     let sid = chat_key(&burst.chat);
@@ -489,10 +568,11 @@ fn handle_burst(burst: &Burst) -> Result<(), String> {
         .iter()
         .rev()
         .find_map(|i| i.reply_to.clone());
-    match kind {
-        ReplyKind::Text => send_text(&burst.chat, &raw, reply_to.as_deref()),
-        ReplyKind::Voice => send_voice(&burst.chat, &raw, reply_to.as_deref()),
-    }
+    let sent = match kind {
+        ReplyKind::Text => send_text(&burst.chat, &raw, reply_to.as_deref(), own)?,
+        ReplyKind::Voice => send_voice(&burst.chat, &raw, reply_to.as_deref(), own)?,
+    };
+    Ok(sent.into_iter().collect())
 }
 
 fn inbound_prompt(burst: &Burst, first_in_chat: bool) -> String {
@@ -654,17 +734,30 @@ fn download_media(id: &str, chat: &str, dest: &Path) -> Result<(), String> {
     Err("media missing".into())
 }
 
-fn send_text(to: &str, text: &str, reply_to: Option<&str>) -> Result<(), String> {
+fn send_text(
+    to: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    own: &str,
+) -> Result<Option<String>, String> {
     let mut extra = vec!["send", "text", "--to", to, "--message", text];
+    if is_self_chat(to, own) {
+        extra.push("--allow-self");
+    }
     if let Some(id) = reply_to {
         extra.extend(["--reply-to", id]);
     }
-    wacli(&extra, false, Duration::from_secs(60))?;
+    let raw = wacli(&extra, false, Duration::from_secs(60))?;
     log_line("sent text");
-    Ok(())
+    Ok(sent_id(&raw))
 }
 
-fn send_voice(to: &str, text: &str, reply_to: Option<&str>) -> Result<(), String> {
+fn send_voice(
+    to: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    own: &str,
+) -> Result<Option<String>, String> {
     let tongue = auto_tongue();
     let wav = cache_dir().join("out.wav");
     speak::synth_to(tongue, text, &wav).map_err(|e| e)?;
@@ -674,12 +767,51 @@ fn send_voice(to: &str, text: &str, reply_to: Option<&str>) -> Result<(), String
     let note = wav_to_opus(&wav)?;
     let note_s = note.display().to_string();
     let mut extra = vec!["send", "voice", "--to", to, "--file", note_s.as_str()];
+    if is_self_chat(to, own) {
+        extra.push("--allow-self");
+    }
     if let Some(id) = reply_to {
         extra.extend(["--reply-to", id]);
     }
-    wacli(&extra, false, Duration::from_secs(90))?;
+    let raw = wacli(&extra, false, Duration::from_secs(90))?;
     log_line("sent voice");
-    Ok(())
+    Ok(sent_id(&raw))
+}
+
+fn sent_id(v: &Value) -> Option<String> {
+    const KEYS: [&str; 8] = [
+        "/data/id",
+        "/data/MsgID",
+        "/data/message_id",
+        "/data/msg_id",
+        "/id",
+        "/MsgID",
+        "/message_id",
+        "/msg_id",
+    ];
+    for k in KEYS {
+        if let Some(s) = v.pointer(k).and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn linked_jid() -> Option<String> {
+    let raw = wacli(&["auth", "status"], true, Duration::from_secs(15)).ok()?;
+    let j = raw
+        .pointer("/data/linked_jid")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if j.is_empty() {
+        None
+    } else {
+        Some(j.to_string())
+    }
 }
 
 fn auto_tongue() -> Tongue {
@@ -730,15 +862,7 @@ fn wav_to_opus(wav: &Path) -> Result<PathBuf, String> {
 
 fn list_new_messages(since: &str) -> Result<Vec<Value>, String> {
     let raw = wacli(
-        &[
-            "messages",
-            "list",
-            "--from-them",
-            "--after",
-            since,
-            "--limit",
-            "20",
-        ],
+        &["messages", "list", "--after", since, "--limit", "20"],
         true,
         Duration::from_secs(20),
     )?;
@@ -1064,12 +1188,11 @@ mod tests {
     #[test]
     fn classifies_text_voice_media_and_skips() {
         assert_eq!(
-            classify_message(false, "1@s.whatsapp.net", "", "", "", false, false),
+            classify_message("1@s.whatsapp.net", "", "", "", false, false),
             Some(InboundKind::Text)
         );
         assert_eq!(
             classify_message(
-                false,
                 "1@s.whatsapp.net",
                 "audio",
                 "audio/ogg; codecs=opus",
@@ -1080,39 +1203,16 @@ mod tests {
             Some(InboundKind::VoiceNote)
         );
         assert_eq!(
-            classify_message(
-                false,
-                "1@s.whatsapp.net",
-                "image",
-                "image/jpeg",
-                "",
-                false,
-                false
-            ),
+            classify_message("1@s.whatsapp.net", "image", "image/jpeg", "", false, false),
             Some(InboundKind::Media)
         );
         assert_eq!(
-            classify_message(
-                false,
-                "1@s.whatsapp.net",
-                "gif",
-                "video/mp4",
-                "",
-                false,
-                false
-            ),
+            classify_message("1@s.whatsapp.net", "gif", "video/mp4", "", false, false),
             Some(InboundKind::Media)
         );
+        assert_eq!(classify_message("x@g.us", "", "", "", false, false), None);
         assert_eq!(
-            classify_message(true, "1@s.whatsapp.net", "", "", "", false, false),
-            None
-        );
-        assert_eq!(
-            classify_message(false, "x@g.us", "", "", "", false, false),
-            None
-        );
-        assert_eq!(
-            classify_message(false, "1@s.whatsapp.net", "", "", "ABC", false, false),
+            classify_message("1@s.whatsapp.net", "", "", "ABC", false, false),
             None
         );
         assert_eq!(
@@ -1178,8 +1278,24 @@ mod tests {
         assert!(src.contains("sync\", \"--follow\""));
         assert!(src.contains("presence-mode"));
         assert!(src.contains("pixie-auto.service"));
+        assert!(src.contains("--allow-self"));
+        assert!(!src.contains("list\", \"--from-them\""));
         let err = wacli(&["sync", "--follow"], true, Duration::from_secs(1));
         assert!(err.is_err(), "{err:?}");
+    }
+
+    #[test]
+    fn keep_inbound_self_chat_only() {
+        let me = "me@s.whatsapp.net";
+        let them = "them@s.whatsapp.net";
+        assert!(keep_inbound(false, them, me, false));
+        assert!(!keep_inbound(true, them, me, false));
+        assert!(keep_inbound(true, me, me, false));
+        assert!(keep_inbound(true, "ME:3@s.whatsapp.net", me, false));
+        assert!(!keep_inbound(true, me, me, true));
+        assert!(!keep_inbound(false, "room@g.us", me, false));
+        assert!(!keep_inbound(true, them, "", false));
+        assert_eq!(self_test().unwrap(), 0);
     }
 
     #[test]

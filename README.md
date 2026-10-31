@@ -1,8 +1,10 @@
 ![Pixie hero](assets/hero/pixie.svg)
 
-# Pixie — local AI agent ✨
+# Pixie — the helper ✨
 
-Offline-first local familiar: **pixie** (Rust engine — files + house spells + runes), **imp** (terminal art), **menagerie** (llama-server control plane). No cloud, no telemetry.
+A Rust familiar on your computer: pink bubbles, Tab runes, no cloud.
+She can cover WhatsApp when you step away. Source-only —
+`./build.sh install --house`.
 
 ```
 git clone git@github.com:ElegantVW/pixie.git ~/pixie
@@ -10,7 +12,7 @@ cd ~/pixie && ./build.sh install --house
 # models → ~/.local/share/pixie/models/*.gguf
 ```
 
-Then: `menagerie status all` and `pixie "hello"`. Bare `pixie` opens the dashboard (threads, New, Options). Tab / Shift-Tab cycle Runes, house-star wait glyph, a prompt that grows as you type, file cards with C-l look / C-o open. Tools: `list_dir`, in-tree `grep_files`, `edit_local_file` in Build. Vision (`look`) is still sleeping — no extra model download.
+Then: `menagerie status all` and `pixie "hello"`. Bare `pixie` opens the dashboard (threads, New, Options). Tab / Shift-Tab cycle Runes. **C-l** look hops to a local vision mouth. Options **Auto** watches WhatsApp while the TUI is gone (`pixie --auto`). Living plan: [`docs/pixie.md`](docs/pixie.md).
 
 ## Look
 

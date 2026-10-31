@@ -51,6 +51,9 @@ struct Cli {
     /// Headless WhatsApp auto secretary (user unit pixie-auto.service)
     #[arg(long)]
     auto: bool,
+    /// Auto classify fixtures. No follow, no send, no model.
+    #[arg(long)]
+    self_test: bool,
     /// One-shot prompt
     prompt: Vec<String>,
 }
@@ -74,6 +77,9 @@ fn real_main() -> Result<i32> {
     let cli = Cli::parse();
     if cli.askpass {
         return Ok(crate::privilege::askpass_client());
+    }
+    if cli.self_test {
+        return crate::wa_auto::self_test();
     }
     if cli.auto {
         return crate::wa_auto::run();
