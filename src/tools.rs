@@ -432,6 +432,17 @@ pub fn run_tool(
     cancel: Option<&AtomicBool>,
 ) -> Value {
     let fname = alias(fname).to_string();
+    let contact_session = crate::wa_contact::has_contact_session_prefix(session_id);
+    let contact = if contact_session {
+        match crate::wa_contact::for_session(session_id) {
+            Some(profile) => Some(profile),
+            None => {
+                return json!({"error": "contact session profile is missing or invalid; reopen it with `pixie --contact <name>`"})
+            }
+        }
+    } else {
+        None
+    };
     let allowed = known_for(rune);
     if !allowed.contains(&fname.as_str()) {
         return json!({
@@ -439,7 +450,13 @@ pub fn run_tool(
         });
     }
     let _ = take_touch();
-    let fargs = norm_args(&fname, fargs);
+    let mut fargs = norm_args(&fname, fargs);
+    if let Some(profile) = contact.as_ref() {
+        fargs = match crate::wa_contact::constrain_tool(&fname, &fargs, profile) {
+            Ok(args) => args,
+            Err(error) => return json!({"error": error}),
+        };
+    }
     if needs_confirm_args(&fname, rune, &fargs) {
         match confirm {
             None => {
@@ -748,10 +765,33 @@ pub fn run_tool(
                 }
             }
         }
-        "remember" => mind::remember(
-            fargs.get("fact").and_then(|x| x.as_str()).unwrap_or(""),
-            None,
-        ),
+        "remember" => {
+            let memory = contact
+                .as_ref()
+                .map(crate::wa_contact::ContactProfile::memory_path);
+            if let Some(profile) = contact.as_ref() {
+                if let Err(error) = crate::wa_contact::ensure_private_dir(
+                    &profile
+                        .memory_path()
+                        .parent()
+                        .unwrap_or_else(|| Path::new(".")),
+                ) {
+                    return json!({"error": format!("could not protect contact memory: {error}")});
+                }
+            }
+            let result = mind::remember(
+                fargs.get("fact").and_then(|x| x.as_str()).unwrap_or(""),
+                memory.as_deref(),
+            );
+            if let Some(path) = memory.as_deref() {
+                if path.is_file() {
+                    if let Err(error) = crate::wa_contact::protect_private_file(path) {
+                        return json!({"error": format!("could not protect contact memory: {error}")});
+                    }
+                }
+            }
+            result
+        }
         "search_house" => {
             let r = mind::search_house(
                 fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
@@ -1291,7 +1331,11 @@ fn check_whatsapp(fargs: &Value) -> Value {
             if q.trim().is_empty() {
                 return json!({"error": "search needs query"});
             }
-            let extra = ["messages", "search", q, "--limit", limit_s.as_str()];
+            let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
+            let mut extra = vec!["messages", "search", q, "--limit", limit_s.as_str()];
+            if !chat.is_empty() {
+                extra.extend(["--chat", chat]);
+            }
             let raw = wacli_run(&extra, true);
             let rows = wa_rows_from_json(&raw, limit);
             json!({"action": "search", "query": q, "count": rows.len(), "rows": rows})
@@ -1301,7 +1345,11 @@ fn check_whatsapp(fargs: &Value) -> Value {
             if id.trim().is_empty() {
                 return json!({"error": "show needs id"});
             }
-            let extra = ["messages", "show", "--id", id];
+            let mut extra = vec!["messages", "show", "--id", id];
+            let chat = fargs.get("chat").and_then(|x| x.as_str()).unwrap_or("");
+            if !chat.is_empty() {
+                extra.extend(["--chat", chat]);
+            }
             let raw = wacli_run(&extra, true);
             let rows = wa_rows_from_json(&raw, 1);
             json!({"action": "show", "id": id, "rows": rows, "raw": cmd_text(&raw).chars().take(800).collect::<String>()})
@@ -1957,8 +2005,24 @@ pub fn confirm_line(name: &str, args: &Value) -> String {
         }
         "check_whatsapp" => {
             let a = args.get("action").and_then(|x| x.as_str()).unwrap_or("write");
+            if a == "send" && args.get("contact_name").is_some() {
+                let to = args
+                    .get("contact_name")
+                    .or_else(|| args.get("to"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("someone");
+                if a == "send" {
+                    let text = args.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                    let clip: String = text.chars().take(80).collect();
+                    return format!("send WhatsApp text to {to}?  {clip}  [y/N]");
+                }
+            }
             if a == "send_file" || a == "send_voice" {
-                let to = args.get("to").and_then(|x| x.as_str()).unwrap_or("someone");
+                let to = args
+                    .get("contact_name")
+                    .or_else(|| args.get("to"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("someone");
                 let path = args
                     .get("path")
                     .or_else(|| args.get("file"))
@@ -2359,6 +2423,17 @@ mod tests {
         );
         assert!(line.contains("send this file"), "{line}");
         assert!(line.contains("Ada"), "{line}");
+        let contact_text_line = confirm_line(
+            "check_whatsapp",
+            &json!({
+                "action": "send",
+                "contact_name": "Ada",
+                "to": "351@s.whatsapp.net",
+                "text": "hello"
+            }),
+        );
+        assert!(contact_text_line.contains("Ada"), "{contact_text_line}");
+        assert!(contact_text_line.contains("hello"), "{contact_text_line}");
         let denied = check_whatsapp(&json!({
             "action": "send_file",
             "to": "Ada",
@@ -2498,6 +2573,25 @@ mod tests {
         assert!(
             msg.contains("Unknown tool") || msg.contains("web_research"),
             "{r}"
+        );
+    }
+
+    #[test]
+    fn invalid_contact_session_fails_closed_before_tools() {
+        let result = run_tool(
+            "execute_bash",
+            &json!({"command": "true"}),
+            RuneKey::Chat,
+            "wa-contact-invalid",
+            None,
+            None,
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("profile is missing or invalid"),
+            "{result}"
         );
     }
 

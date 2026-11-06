@@ -1,0 +1,19 @@
+# Copy to ~/.config/pixie/auto-contacts.toml and chmod 600.
+# wacli is the contact's name as stored in the local address book.
+# Never put a JID or a live name in git.
+# kind = shop  → numbered Bay / Pixie / Korda menu
+# kind = chat  → isolated 8B, optional persona overlay
+
+[[priority]]
+label = "Shop"
+wacli = ""
+kind = "shop"
+enabled = false
+persona = ""
+
+[[priority]]
+label = "VIP"
+wacli = ""
+kind = "chat"
+enabled = false
+persona = ""

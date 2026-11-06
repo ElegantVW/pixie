@@ -1,5 +1,27 @@
 # Pixie changelog
 
+## v0.3.19 no echo loop + priority contacts (2026-11-06)
+
+- Auto stamps every send (echo ledger + MsgID) and skips FromMe that match a house template or a recent echo, so Message yourself cannot eat its own tail. `pixie --wa-self -- <text>` is the stamped Korda door. Menu tokens (`1`/`2`/`3`/…) are not enqueued as Korda body.
+- Options **Auto** plus one row per local **priority contact** (`~/.config/pixie/auto-contacts.toml`, 0600). `kind = shop` keeps the numbered Bay router. `kind = chat` is isolated 8B plus optional persona overlay. No live names in the crate. Each chat keeps its own session jsonl.
+
+## v0.3.18 Gil house remote (2026-11-06)
+
+- Message yourself is the owner's menu: **1 Casa** (status / bay / radio, no model), **2 Pixie** (8B who knows this is the owner), **3 Korda** (this Grok TUI if the session presence file is fresh, else the jsonl queue).
+- Self-chat no longer uses the away prompt. Lookup-shaped texts still hit Bay. Shop-kind menu unchanged.
+
+## v0.3.17 Auto + shop + chat VIP (2026-11-05)
+
+- Options is three switches: **Auto** (everyone else, Qwen3-0.6B CPU ctx 32768 on `:8085`, no tools), **shop** (1 Pixie / 2 Bay / 3 Grok), **chat VIP** (8B, no tools, isolated memory). FromMe to other people stays skipped.
+- Message yourself is a house remote while the unit runs: same 1 / 2 / 3, lookup-shaped texts hit Bay. Route 3 `from: self` in the Korda inbox.
+- Auto generic does not steal the GPU from the 8B.
+
+## v0.3.16 dual Auto + Bay (2026-11-05)
+
+- Options splits Auto into a **chat VIP** row and a **shop** row (label from `~/.config/pixie/auto-contacts.toml`, mode 0600). Either flag starts `pixie-auto.service`. Other DMs stay silent.
+- Shop first ping is a numbered menu: 1 local Pixie, 2 house search (`keep-bay`, no model), 3 Grok queue (`~/.cache/keep/korda-inbox.jsonl`). Lookup-shaped texts (aperto, torque, Nm, parafuso, fluido, óleo, procedimento) skip the menu and hit Bay. Bay never invents a number.
+- Message yourself still works for house tests. Shop Auto needs `shop.wacli` in the local toml. Live JIDs stay off git.
+
 ## v0.3.15 Auto self-chat (2026-10-31)
 
 - Auto keeps Gil's **Message yourself** notes (`FromMe` + linked account). Messages he sends to other people stay skipped. Auto's own sends are recorded so self-chat cannot loop.

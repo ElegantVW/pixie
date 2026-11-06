@@ -231,8 +231,17 @@ fn required_for(name: &str) -> &'static [&'static str] {
 }
 
 pub fn openai_tools(rune: &Rune) -> serde_json::Value {
+    openai_tools_filtered(rune, None)
+}
+
+pub fn openai_tools_filtered(rune: &Rune, only: Option<&[&str]>) -> serde_json::Value {
     let mut arr = Vec::new();
     for (name, schema) in &rune.tools {
+        if let Some(allow) = only {
+            if !allow.contains(name) {
+                continue;
+            }
+        }
         let raw: serde_json::Value = serde_json::from_str(schema).unwrap_or(serde_json::json!({}));
         let mut props = serde_json::Map::new();
         if let Some(obj) = raw.as_object() {

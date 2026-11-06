@@ -69,8 +69,19 @@ impl Clone for Abort {
     }
 }
 
+pub const AWAY_PORT: u16 = 8085;
+pub const AWAY_APP: &str = "pixie-auto";
+
 pub fn llm_up() -> bool {
-    let Some(endpoint) = configured_endpoint() else {
+    llm_up_at_addr(configured_endpoint())
+}
+
+pub fn llm_up_at(port: u16) -> bool {
+    llm_up_at_addr(endpoint(&host(), Some(port)))
+}
+
+fn llm_up_at_addr(ep: Option<std::net::SocketAddr>) -> bool {
+    let Some(endpoint) = ep else {
         return false;
     };
     let addr = endpoint.to_string();
@@ -120,6 +131,30 @@ pub fn ensure_llm_up() -> bool {
     llm_up()
 }
 
+pub fn ensure_app(app: &str, port: u16) -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    if llm_up_at(port) {
+        return true;
+    }
+    let menagerie = crate::paths::home().join("bin/menagerie");
+    let _ = Command::new(if menagerie.is_file() {
+        menagerie.as_os_str()
+    } else {
+        std::ffi::OsStr::new("menagerie")
+    })
+    .args(["ensure", app])
+    .output();
+    for _ in 0..60 {
+        if llm_up_at(port) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    llm_up_at(port)
+}
+
 pub fn unload() {
     let menagerie = crate::paths::home().join("bin/menagerie");
     let _ = Command::new(if menagerie.is_file() {
@@ -140,15 +175,41 @@ pub fn stream_chat(
     messages: &[Value],
     tools: Option<Value>,
     abort: &Abort,
-    mut on_chunk: impl FnMut(&str),
+    on_chunk: impl FnMut(&str),
 ) -> StreamOut {
-    let payload = chat_payload(messages, tools).to_string();
     let Some(sock_addr) = configured_endpoint() else {
         return StreamOut {
             text: String::new(),
             err: Some("invalid PIXIE_LLM_HOST or PIXIE_LLM_PORT".into()),
         };
     };
+    stream_chat_to(sock_addr, messages, tools, abort, on_chunk)
+}
+
+pub fn stream_chat_at(
+    port: u16,
+    messages: &[Value],
+    tools: Option<Value>,
+    abort: &Abort,
+    on_chunk: impl FnMut(&str),
+) -> StreamOut {
+    let Some(sock_addr) = endpoint(&host(), Some(port)) else {
+        return StreamOut {
+            text: String::new(),
+            err: Some("invalid PIXIE_LLM_HOST".into()),
+        };
+    };
+    stream_chat_to(sock_addr, messages, tools, abort, on_chunk)
+}
+
+fn stream_chat_to(
+    sock_addr: std::net::SocketAddr,
+    messages: &[Value],
+    tools: Option<Value>,
+    abort: &Abort,
+    mut on_chunk: impl FnMut(&str),
+) -> StreamOut {
+    let payload = chat_payload(messages, tools).to_string();
     let addr = sock_addr.to_string();
     let mut stream = match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5)) {
         Ok(s) => s,

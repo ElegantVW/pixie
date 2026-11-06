@@ -212,11 +212,17 @@ pub fn probe() -> String {
 }
 
 fn auto_line() -> String {
-    if crate::prefs::auto_on() {
-        "auto: on".into()
-    } else {
-        "auto: off".into()
+    let g = crate::prefs::auto_generic();
+    let p = crate::prefs::auto_personal();
+    let s = crate::prefs::auto_shop();
+    if !g && !p && !s {
+        return "auto: off".into();
     }
+    format!(
+        "auto: everyone {} · vip {}",
+        if g { "on" } else { "off" },
+        if p || s { "on" } else { "off" }
+    )
 }
 
 pub fn now_line() -> String {

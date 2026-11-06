@@ -19,6 +19,7 @@ mod tools;
 mod tui;
 mod voice;
 mod wa_auto;
+mod wa_contact;
 
 use crate::agent::ChatEntry;
 use crate::llm::Abort;
@@ -42,6 +43,21 @@ struct Cli {
     /// Resume a chat in the TUI (latest if omitted)
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     resume: Option<String>,
+    /// Open an isolated WhatsApp conversation workflow for an exact local contact
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "resume",
+            "new",
+            "prompt",
+            "auto",
+            "chats",
+            "chat",
+            "self_test",
+            "askpass"
+        ]
+    )]
+    contact: Option<String>,
     /// Start a fresh TUI session instead of resuming the latest
     #[arg(short = 'n', long = "new", conflicts_with = "resume")]
     new: bool,
@@ -54,6 +70,9 @@ struct Cli {
     /// Auto classify fixtures. No follow, no send, no model.
     #[arg(long)]
     self_test: bool,
+    /// Send to Message yourself with Auto echo stamp (Korda door)
+    #[arg(long = "wa-self", conflicts_with_all = ["auto", "self_test", "contact", "chats", "chat", "resume", "new"])]
+    wa_self: bool,
     /// One-shot prompt
     prompt: Vec<String>,
 }
@@ -81,8 +100,16 @@ fn real_main() -> Result<i32> {
     if cli.self_test {
         return crate::wa_auto::self_test();
     }
+    if cli.wa_self {
+        return crate::wa_auto::wa_self_send(&cli.prompt.join(" "));
+    }
     if cli.auto {
         return crate::wa_auto::run();
+    }
+    if let Some(query) = cli.contact {
+        let contact = wa_contact::resolve(&query)?;
+        tui::run_contact(contact, cli.verbose)?;
+        return Ok(0);
     }
     if cli.chats {
         println!("{}", mind::format_chat_list(None));
@@ -106,6 +133,10 @@ fn real_main() -> Result<i32> {
         return Ok(0);
     }
     if let Some(id) = cli.resume {
+        if id.starts_with("wa-contact-") {
+            eprintln!("pixie: contact sessions must be opened with `pixie --contact <name>`");
+            return Ok(1);
+        }
         let name = if id.is_empty() {
             None
         } else {
@@ -203,4 +234,19 @@ fn oneshot(prompt: &str, verbose: bool) -> Result<i32> {
         )
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_mode_rejects_competing_workflows() {
+        assert!(Cli::try_parse_from(["pixie", "--contact", "Ada"]).is_ok());
+        assert!(Cli::try_parse_from(["pixie", "--contact", "Ada", "--auto"]).is_err());
+        assert!(Cli::try_parse_from(["pixie", "--contact", "Ada", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["pixie", "--contact", "Ada", "--resume"]).is_err());
+        assert!(Cli::try_parse_from(["pixie", "--wa-self", "--", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["pixie", "--wa-self", "--auto"]).is_err());
+    }
 }

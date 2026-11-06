@@ -12,4 +12,6 @@ gallery.json
 *credentials*
 *password*
 auth.json
+auto-contacts.toml
+!auto-contacts.toml.example
 .DS_Store

@@ -12,6 +12,7 @@ use crate::privilege;
 use crate::runes::{self, RuneKey};
 use crate::tools;
 use crate::wa_auto;
+use crate::wa_contact::ContactProfile;
 use crossterm::{
     event::{
         self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
@@ -146,11 +147,16 @@ struct App {
     rune_idx: usize,
     session_id: String,
     session_name: String,
+    contact: Option<ContactProfile>,
     verbose: bool,
     sparkle: bool,
     speak_on: bool,
     tongue: crate::speak::Tongue,
     auto_on: bool,
+    auto_generic: bool,
+    auto_personal: bool,
+    auto_shop: bool,
+    priorities: Vec<wa_auto::Priority>,
     default_rune: RuneKey,
     build_audit_rounds: bool,
     sudo_less_safe: bool,
@@ -315,7 +321,16 @@ fn persist_ui(app: &App) {
         sparkle: app.sparkle,
         speak_on: app.speak_on,
         speak_kind: app.tongue.as_str().into(),
-        auto_on: app.auto_on,
+        auto_on: app.auto_generic || app.priorities.iter().any(|p| p.enabled),
+        auto_generic: app.auto_generic,
+        auto_personal: app
+            .priorities
+            .iter()
+            .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Chat),
+        auto_shop: app
+            .priorities
+            .iter()
+            .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Shop),
         rune: app.default_rune,
         build_audit_rounds: app.build_audit_rounds,
         sudo_less_safe: app.sudo_less_safe,
@@ -327,12 +342,39 @@ fn persist_ui(app: &App) {
 }
 
 pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Result<()> {
-    mind::seed_memory(None)?;
+    run_inner(verbose, resume, show_door, None)
+}
+
+pub fn run_contact(contact: ContactProfile, verbose: bool) -> anyhow::Result<()> {
+    contact.save()?;
+    let session_id = contact.session_id();
+    run_inner(verbose, Some(session_id), false, Some(contact))
+}
+
+fn run_inner(
+    verbose: bool,
+    resume: Option<String>,
+    show_door: bool,
+    contact: Option<ContactProfile>,
+) -> anyhow::Result<()> {
+    if contact.is_none() {
+        mind::seed_memory(None)?;
+    }
     let (tx, rx) = mpsc::channel();
     let (hear_tx, hear_rx) = mpsc::channel();
     crate::speak::set_hear(hear_tx);
     let ui = prefs::load_ui()?;
-    let (chat, rune_idx, session_id, session_name, door) = if let Some(id) = resume {
+    let (chat, rune_idx, session_id, session_name, door) = if let Some(profile) = contact.as_ref() {
+        let id = profile.session_id();
+        let (chat, _) = agent::from_session(&id);
+        (
+            chat,
+            runes::idx_of(RuneKey::Chat),
+            id,
+            format!("WhatsApp · {}", profile.name),
+            false,
+        )
+    } else if let Some(id) = resume {
         let (c, k) = agent::from_session(&id);
         let idx = runes::all()
             .iter()
@@ -358,11 +400,23 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
         rune_idx,
         session_id,
         session_name,
+        contact: contact.clone(),
         verbose: verbose || ui.verbose,
         sparkle: ui.sparkle,
         speak_on: ui.speak_on,
         tongue: crate::speak::Tongue::from_str(&ui.speak_kind),
-        auto_on: ui.auto_on,
+        auto_on: {
+            let pri = wa_auto::load_priorities();
+            ui.auto_generic || pri.iter().any(|p| p.enabled)
+        },
+        auto_generic: ui.auto_generic,
+        auto_personal: wa_auto::load_priorities()
+            .iter()
+            .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Chat),
+        auto_shop: wa_auto::load_priorities()
+            .iter()
+            .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Shop),
+        priorities: wa_auto::load_priorities(),
         default_rune: ui.rune,
         build_audit_rounds: ui.build_audit_rounds,
         sudo_less_safe: ui.sudo_less_safe,
@@ -423,7 +477,7 @@ pub fn run(verbose: bool, resume: Option<String>, show_door: bool) -> anyhow::Re
     if app.speak_on {
         warm_tongue(&app);
     }
-    if app.auto_on {
+    if app.auto_on && app.contact.is_none() {
         if let Err(e) = wa_auto::apply_enabled(true) {
             app.status = format!("auto: {e}");
         }
@@ -895,6 +949,14 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
     if app.options {
         return handle_options_key(app, k);
     }
+    if app.contact.is_some()
+        && (crate::grove_keys::is_cycle_next(k.code, k.modifiers)
+            || crate::grove_keys::is_cycle_previous(k.code, k.modifiers)
+            || (k.code == KeyCode::Char('s') && ctrl(k)))
+    {
+        app.status = "contact sessions stay in Chat and cannot switch threads".into();
+        return Ok(KeyOut::Continue);
+    }
     if app.session_menu {
         match k.code {
             KeyCode::Esc => app.session_menu = false,
@@ -1126,6 +1188,8 @@ fn handle_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             } else if app.buf.is_empty() {
                 if app.busy {
                     app.abort.cancel();
+                } else if app.contact.is_some() {
+                    return Ok(KeyOut::Quit);
                 } else {
                     open_dashboard(app);
                 }
@@ -1350,8 +1414,16 @@ fn handle_sudo_prompt(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
     Ok(KeyOut::Continue)
 }
 
+fn options_n(app: &App) -> usize {
+    8 + 1 + app.priorities.len() + 8
+}
+
+fn rest_base(app: &App) -> usize {
+    9 + app.priorities.len()
+}
+
 fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
-    const N: usize = 17;
+    let n = options_n(app);
     match k.code {
         KeyCode::Esc => {
             app.options = false;
@@ -1360,8 +1432,8 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
             return Ok(KeyOut::Quit);
         }
         KeyCode::Char('q') if ctrl(k) => return Ok(KeyOut::Quit),
-        KeyCode::Char('j') | KeyCode::Down => app.opt_idx = (app.opt_idx + 1) % N,
-        KeyCode::Char('k') | KeyCode::Up => app.opt_idx = (app.opt_idx + N - 1) % N,
+        KeyCode::Char('j') | KeyCode::Down => app.opt_idx = (app.opt_idx + 1) % n,
+        KeyCode::Char('k') | KeyCode::Up => app.opt_idx = (app.opt_idx + n - 1) % n,
         KeyCode::Char('o') if ctrl(k) => open_persona(app),
         KeyCode::Left => cycle_option(app, -1),
         KeyCode::Right => cycle_option(app, 1),
@@ -1372,7 +1444,9 @@ fn handle_options_key(app: &mut App, k: KeyEvent) -> anyhow::Result<KeyOut> {
 }
 
 fn cycle_option(app: &mut App, dir: i32) {
-    match app.opt_idx {
+    let idx = app.opt_idx;
+    let rest = rest_base(app);
+    match idx {
         0 => {
             const ROLES: [&str; 3] = ["chat", "code", "vision"];
             let i = ROLES.iter().position(|r| *r == app.mouth_role).unwrap_or(0) as i32;
@@ -1411,34 +1485,37 @@ fn cycle_option(app: &mut App, dir: i32) {
             persist_ui(app);
         }
         7 => cycle_voice(app, dir),
-        8 => toggle_auto(app),
-        9 => {
+        8 => toggle_auto_generic(app),
+        _ if idx > 8 && idx < rest => toggle_priority(app, idx - 9),
+        _ if idx == rest => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        12 => {
+        _ if idx == rest + 3 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
         }
-        13 => cycle_art_dir(app, dir),
-        14 => {
+        _ if idx == rest + 4 => cycle_art_dir(app, dir),
+        _ if idx == rest + 5 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
         }
-        15 => {
+        _ if idx == rest + 6 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
         }
-        16 => toggle_sudo(app),
+        _ if idx == rest + 7 => toggle_sudo(app),
         _ => {}
     }
 }
 
 fn activate_option(app: &mut App) {
-    match app.opt_idx {
+    let idx = app.opt_idx;
+    let rest = rest_base(app);
+    match idx {
         0..=3 => apply_mouth_async(app),
         4 => open_persona(app),
         5 => {
@@ -1450,23 +1527,26 @@ fn activate_option(app: &mut App) {
             persist_ui(app);
         }
         7 => cycle_voice(app, 1),
-        8 => toggle_auto(app),
-        9 => {
+        8 => toggle_auto_generic(app),
+        _ if idx > 8 && idx < rest => toggle_priority(app, idx - 9),
+        _ if idx == rest => {
             app.default_rune = app.default_rune.next();
             if app.door {
                 app.rune_idx = runes::idx_of(app.default_rune);
             }
             persist_ui(app);
         }
-        10 => {
+        _ if idx == rest + 1 => {
             app.status = if prefs::eye_asleep() {
                 "eye is sleeping — no mmproj on disk".into()
             } else {
                 "look hops the GPU (park 8B, VL 7B, restore Chat)".into()
             };
         }
-        11 => app.status = "Imp hops the GPU; generate_image parks Pixie first".into(),
-        12 => {
+        _ if idx == rest + 2 => {
+            app.status = "Imp hops the GPU; generate_image parks Pixie first".into();
+        }
+        _ if idx == rest + 3 => {
             app.enhance_image = !app.enhance_image;
             persist_ui(app);
             app.status = format!(
@@ -1474,11 +1554,11 @@ fn activate_option(app: &mut App) {
                 if app.enhance_image { "on" } else { "off" }
             );
         }
-        13 => {
+        _ if idx == rest + 4 => {
             cycle_art_dir(app, 1);
             app.status = format!("art folder: {}", app.art_dir);
         }
-        14 => {
+        _ if idx == rest + 5 => {
             app.build_audit_rounds = !app.build_audit_rounds;
             persist_ui(app);
             app.status = format!(
@@ -1486,7 +1566,7 @@ fn activate_option(app: &mut App) {
                 if app.build_audit_rounds { "on" } else { "off" }
             );
         }
-        15 => {
+        _ if idx == rest + 6 => {
             app.sudo_less_safe = !app.sudo_less_safe;
             persist_ui(app);
             app.status = format!(
@@ -1494,30 +1574,59 @@ fn activate_option(app: &mut App) {
                 if app.sudo_less_safe { "on" } else { "off" }
             );
         }
-        16 => toggle_sudo(app),
+        _ if idx == rest + 7 => toggle_sudo(app),
         _ => {}
     }
 }
 
-fn toggle_auto(app: &mut App) {
-    let want = !app.auto_on;
-    app.auto_on = want;
+fn toggle_auto_generic(app: &mut App) {
+    app.auto_generic = !app.auto_generic;
+    sync_auto(app);
+}
+
+fn toggle_priority(app: &mut App, i: usize) {
+    if i >= app.priorities.len() {
+        return;
+    }
+    if !app.priorities[i].enabled && app.priorities[i].wacli.is_empty() {
+        app.status = format!(
+            "{} needs wacli in ~/.config/pixie/auto-contacts.toml",
+            app.priorities[i].label
+        );
+        return;
+    }
+    app.priorities[i].enabled = !app.priorities[i].enabled;
+    if let Err(e) = wa_auto::save_priorities(&app.priorities) {
+        app.status = format!("auto: {e}");
+        app.priorities[i].enabled = !app.priorities[i].enabled;
+        return;
+    }
+    sync_auto(app);
+}
+
+fn sync_auto(app: &mut App) {
+    app.auto_personal = app
+        .priorities
+        .iter()
+        .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Chat);
+    app.auto_shop = app
+        .priorities
+        .iter()
+        .any(|p| p.enabled && p.kind == wa_auto::PriorityKind::Shop);
+    app.auto_on = app.auto_generic || app.priorities.iter().any(|p| p.enabled);
     persist_ui(app);
-    match wa_auto::apply_enabled(want) {
+    match wa_auto::apply_enabled(app.auto_on) {
         Ok(()) => {
-            app.status = if want {
-                if wa_auto::unit_active() {
-                    "auto on · watching".into()
-                } else {
-                    "auto on".into()
-                }
-            } else {
-                "auto off".into()
-            };
+            let watching = app.auto_on && wa_auto::unit_active();
+            let n = app.priorities.iter().filter(|p| p.enabled).count();
+            app.status = format!(
+                "Auto {} · priority {}{}",
+                if app.auto_generic { "on" } else { "off" },
+                n,
+                if watching { " · watching" } else { "" }
+            );
         }
         Err(e) => {
-            app.auto_on = !want;
-            persist_ui(app);
             app.status = format!("auto: {e}");
         }
     }
@@ -1624,6 +1733,10 @@ fn maybe_compact(app: &mut App) {
 }
 
 fn open_dashboard(app: &mut App) {
+    if app.contact.is_some() {
+        app.status = "contact sessions stay in their private thread".into();
+        return;
+    }
     app.door = true;
     app.options = false;
     app.session_menu = false;
@@ -2711,7 +2824,13 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
     let audit = if app.build_audit_rounds { "on" } else { "off" };
     let less_safe = if app.sudo_less_safe { "on" } else { "off" };
     let enhance = if app.enhance_image { "on" } else { "off" };
-    let rows = [
+    let auto_on = if app.auto_generic { "on" } else { "off" };
+    let pri_vals: Vec<String> = app
+        .priorities
+        .iter()
+        .map(|p| if p.enabled { "on".into() } else { "off".into() })
+        .collect();
+    let mut rows: Vec<(&str, &str)> = vec![
         ("Role", app.mouth_role.as_str()),
         ("Model", app.mouth.model.as_str()),
         ("Backend", app.mouth.backend.as_str()),
@@ -2720,7 +2839,12 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         ("Sparkle", sparkle),
         ("Verbose", verbose),
         ("Voice", voice.as_str()),
-        ("Auto", if app.auto_on { "on" } else { "off" }),
+        ("Auto", auto_on),
+    ];
+    for (i, p) in app.priorities.iter().enumerate() {
+        rows.push((p.label.as_str(), pri_vals[i].as_str()));
+    }
+    rows.extend([
         ("Rune", app.default_rune.as_str()),
         ("Eye", eye),
         ("Imp", "hop · one GPU tenant"),
@@ -2729,7 +2853,7 @@ fn draw_options_card(f: &mut Frame, area: Rect, app: &mut App) {
         ("Audit", audit),
         ("LessSafe", less_safe),
         ("Sudo", privilege::status_label()),
-    ];
+    ]);
     let mut t = String::from(
         "mouse/sliders-like ◀▶ or click  ·  enter toggle/apply\nSudo: off/ticket/sitting (less-safe optional)\n\n",
     );
@@ -3563,8 +3687,15 @@ mod tests {
         assert!(src.contains("C-s sessions"), "help must teach C-s sessions");
         assert!(src.contains("n new"), "dashboard must offer New");
         assert!(src.contains("Options"), "dashboard must offer Options");
-        assert!(src.contains("(\"Auto\""), "Options must offer Auto");
-        assert!(src.contains("const N: usize = 17"), "Options has Auto under Voice");
+        assert!(src.contains("(\"Auto\""), "Options must offer Auto for everyone else");
+        assert!(
+            src.contains("fn options_n"),
+            "Options length follows Auto plus priority rows"
+        );
+        assert!(
+            src.contains("app.priorities.iter()"),
+            "Options VIP rows come from the local priority list"
+        );
         assert!(src.contains("r rename"), "session list must teach r rename");
         assert!(src.contains("d delete"), "dashboard must teach d delete");
         assert!(src.contains("esc home"), "help must teach esc home");

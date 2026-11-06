@@ -536,9 +536,13 @@ impl Default for SessionRec {
 }
 
 pub fn session_path(id: &str, dir: Option<&Path>) -> PathBuf {
-    dir.map(|d| d.to_path_buf())
-        .unwrap_or_else(paths::sessions_dir)
-        .join(format!("{id}.jsonl"))
+    if let Some(dir) = dir {
+        return dir.join(format!("{id}.jsonl"));
+    }
+    if let Some(path) = crate::wa_contact::session_path_for_id(id) {
+        return path;
+    }
+    paths::sessions_dir().join(format!("{id}.jsonl"))
 }
 
 pub fn append_transition(
@@ -606,16 +610,28 @@ pub fn last_transition(id: &str, dir: Option<&Path>) -> Option<(String, String, 
 
 pub fn append_session(id: &str, rec: &SessionRec, dir: Option<&Path>) {
     let result = (|| -> anyhow::Result<()> {
-        let dir = dir
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(paths::sessions_dir);
-        fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-        let p = dir.join(format!("{id}.jsonl"));
+        let p = session_path(id, dir);
+        let dir = p
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("session path has no parent"))?;
+        if crate::wa_contact::is_contact_session(id)
+            && dir == crate::wa_contact::contact_storage_dir()
+        {
+            crate::wa_contact::ensure_private_dir(dir)?;
+        } else {
+            fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
+        }
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&p)
             .map_err(|e| anyhow::anyhow!("opening {}: {e}", p.display()))?;
+        if crate::wa_contact::is_contact_session(id)
+            && dir == crate::wa_contact::contact_storage_dir()
+        {
+            crate::wa_contact::protect_private_file(&p)?;
+        }
         let mut rec = rec.clone();
         rec.text = cap_str(&rec.text, SESSION_TEXT_CAP);
         rec.raw = cap_str(&rec.raw, SESSION_TOOL_CAP);
@@ -897,7 +913,15 @@ pub fn load_meta(id: &str, dir: Option<&Path>) -> SessionMeta {
 pub fn save_meta(id: &str, meta: &SessionMeta, dir: Option<&Path>) {
     let p = meta_path(id, dir);
     if let Some(d) = p.parent() {
-        if let Err(error) = fs::create_dir_all(d) {
+        let create = if crate::wa_contact::is_contact_session(id)
+            && d == crate::wa_contact::contact_storage_dir()
+        {
+            crate::wa_contact::ensure_private_dir(d)
+        } else {
+            fs::create_dir_all(d)
+                .map_err(|error| anyhow::anyhow!("creating {}: {error}", d.display()))
+        };
+        if let Err(error) = create {
             eprintln!(
                 "pixie: could not create session metadata directory {}: {error}",
                 d.display()
@@ -912,6 +936,13 @@ pub fn save_meta(id: &str, meta: &SessionMeta, dir: Option<&Path>) {
                     "pixie: could not save session metadata {}: {error}",
                     p.display()
                 );
+            } else if crate::wa_contact::is_contact_session(id) {
+                if let Err(error) = crate::wa_contact::protect_private_file(&p) {
+                    eprintln!(
+                        "pixie: could not protect contact session metadata {}: {error}",
+                        p.display()
+                    );
+                }
             }
         }
         Err(error) => eprintln!("pixie: could not encode session metadata: {error}"),
@@ -2101,6 +2132,7 @@ mod tests {
         for _ in 0..10 {
             bump_named_from("t1", Some(&dir));
         }
+
         // renamed already, so retitle stays off
         assert!(!should_retitle("t1", Some(&dir)));
         append_session(
@@ -2135,6 +2167,15 @@ mod tests {
         assert!(delete_session("t2", Some(&dir)));
         assert!(read_session("t2", Some(&dir)).is_empty());
         assert!(!delete_session("../etc", Some(&dir)));
+    }
+
+    #[test]
+    fn contact_sessions_use_separate_private_storage_path() {
+        let id = "wa-contact-0123456789abcdef";
+        assert_eq!(
+            session_path(id, None).parent(),
+            Some(crate::wa_contact::contact_storage_dir().as_path())
+        );
     }
 
     #[test]

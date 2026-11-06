@@ -42,6 +42,10 @@ pub fn ui_path() -> PathBuf {
     config_dir().join("ui.json")
 }
 
+pub fn auto_contacts_path() -> PathBuf {
+    config_dir().join("auto-contacts.toml")
+}
+
 pub fn persona_path() -> PathBuf {
     config_dir().join("persona.md")
 }

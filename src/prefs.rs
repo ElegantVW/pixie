@@ -13,6 +13,9 @@ pub struct UiPrefs {
     pub speak_on: bool,
     pub speak_kind: String,
     pub auto_on: bool,
+    pub auto_generic: bool,
+    pub auto_personal: bool,
+    pub auto_shop: bool,
     pub rune: RuneKey,
     pub build_audit_rounds: bool,
     pub sudo_less_safe: bool,
@@ -28,6 +31,9 @@ impl Default for UiPrefs {
             speak_on: false,
             speak_kind: "design".into(),
             auto_on: false,
+            auto_generic: false,
+            auto_personal: false,
+            auto_shop: false,
             rune: RuneKey::Chat,
             build_audit_rounds: true,
             sudo_less_safe: false,
@@ -63,7 +69,30 @@ fn load_ui_from(path: &std::path::Path) -> anyhow::Result<UiPrefs> {
             .and_then(|x| x.as_str())
             .unwrap_or("design")
             .to_string(),
-        auto_on: v.get("auto_on").and_then(|x| x.as_bool()).unwrap_or(false),
+        auto_on: {
+            let legacy = v.get("auto_on").and_then(|x| x.as_bool()).unwrap_or(false);
+            let generic = v
+                .get("auto_generic")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let personal = v
+                .get("auto_personal")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(legacy);
+            let shop = v.get("auto_shop").and_then(|x| x.as_bool()).unwrap_or(false);
+            generic || personal || shop
+        },
+        auto_generic: v
+            .get("auto_generic")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        auto_personal: {
+            let legacy = v.get("auto_on").and_then(|x| x.as_bool()).unwrap_or(false);
+            v.get("auto_personal")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(legacy)
+        },
+        auto_shop: v.get("auto_shop").and_then(|x| x.as_bool()).unwrap_or(false),
         rune,
         build_audit_rounds: v
             .get("build_audit_rounds")
@@ -95,7 +124,10 @@ pub fn save_ui(p: &UiPrefs) -> anyhow::Result<()> {
         "sparkle": p.sparkle,
         "speak_on": p.speak_on,
         "speak_kind": p.speak_kind,
-        "auto_on": p.auto_on,
+        "auto_on": p.auto_generic || p.auto_personal || p.auto_shop,
+        "auto_generic": p.auto_generic,
+        "auto_personal": p.auto_personal,
+        "auto_shop": p.auto_shop,
         "rune": p.rune.as_str(),
         "build_audit_rounds": p.build_audit_rounds,
         "sudo_less_safe": p.sudo_less_safe,
@@ -113,6 +145,18 @@ pub fn enhance_image() -> bool {
 
 pub fn auto_on() -> bool {
     load_ui().map(|p| p.auto_on).unwrap_or(false)
+}
+
+pub fn auto_generic() -> bool {
+    load_ui().map(|p| p.auto_generic).unwrap_or(false)
+}
+
+pub fn auto_personal() -> bool {
+    load_ui().map(|p| p.auto_personal).unwrap_or(false)
+}
+
+pub fn auto_shop() -> bool {
+    load_ui().map(|p| p.auto_shop).unwrap_or(false)
 }
 
 pub fn art_dir() -> std::path::PathBuf {
@@ -316,6 +360,9 @@ mod tests {
         assert!(!p.speak_on);
         assert_eq!(p.speak_kind, "design");
         assert!(!p.auto_on);
+        assert!(!p.auto_generic);
+        assert!(!p.auto_personal);
+        assert!(!p.auto_shop);
         assert!(p.enhance_image);
         assert_eq!(p.art_dir, "~/pixie_art");
         assert_eq!(p.rune, RuneKey::Chat);

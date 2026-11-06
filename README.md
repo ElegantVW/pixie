@@ -12,7 +12,7 @@ cd ~/pixie && ./build.sh install --house
 # models → ~/.local/share/pixie/models/*.gguf
 ```
 
-Then: `menagerie status all` and `pixie "hello"`. Bare `pixie` opens the dashboard (threads, New, Options). Tab / Shift-Tab cycle Runes. **C-l** look hops to a local vision mouth. Options **Auto** watches WhatsApp while the TUI is gone (`pixie --auto`). Living plan: [`docs/pixie.md`](docs/pixie.md).
+Then: `menagerie status all` and `pixie "hello"`. Bare `pixie` opens the dashboard (threads, New, Options). Tab / Shift-Tab cycle Runes. **C-l** look hops to a local vision mouth. Use `pixie --contact <name>` for an isolated, contact-scoped WhatsApp session with private memory and confirmation-gated sends. Options **Auto** plus local **priority** rows watch WhatsApp while the TUI is gone (`pixie --auto`). Auto answers everyone else on a small CPU mouth. Living plan: [`docs/pixie.md`](docs/pixie.md).
 
 ## Look
 
