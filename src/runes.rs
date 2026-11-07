@@ -119,6 +119,8 @@ pub fn all() -> Vec<Rune> {
             desc: "deep research · sources",
             rounds: 20,
             tools: vec![
+                ("papers", r#"{"query": "string", "max_results": "int"}"#),
+                ("doi_lookup", r#"{"doi": "string"}"#),
                 ("web_research", r#"{"query": "string", "max_results": "int"}"#),
                 ("fetch_web_page", r#"{"url": "string", "max_chars": "int"}"#),
                 ("wiki", r#"{"query": "string", "max_results": "int"}"#),
@@ -129,14 +131,13 @@ pub fn all() -> Vec<Rune> {
                 ("look", r#"{"path": "string", "query": "string"}"#),
             ],
             prompt: concat!(
-                "You are in Deep Research mode. Investigate thoroughly, like the best research assistant:\n",
-                "1. Break the question into sub-questions. Use search_house for faeOS docs first when the question is about this house.\n",
-                "2. Call web_research (light DDG HTML, no Magpie llama) per sub-question. Use wiki for encyclopedia facts.\n",
-                "3. Call fetch_web_page on promising URLs and actually read them.\n",
-                "4. Cross-check sources; never invent URLs, facts, or quotes.\n",
-                "5. Synthesize a complete, well-structured answer.\n",
-                "6. Always end with a \"Sources:\" section listing every URL you used.\n",
-                "If a tool returns empty or an error, say you do not know. Never invent sizes, torque, URLs, or quotes.\n",
+                "You are in Deep Research mode. Proof first, prose second.\n",
+                "1. House questions: search_house first.\n",
+                "2. Papers / DOIs / journals: call papers (Crossref) or doi_lookup. Wiki for encyclopedia. web_research is last resort.\n",
+                "3. fetch_web_page only on URLs those tools returned.\n",
+                "4. Write only from tool JSON. Never invent a DOI, title, journal, or URL.\n",
+                "5. If tools error or return empty, say you do not know.\n",
+                "6. Sources: only URLs/DOIs present in the tool results. A house audit will strip the rest.\n",
                 "Tool calls: when you need a tool, your reply is EXACTLY one JSON object {\"name\": \"<tool>\", \"arguments\": {...}}."
             ),
         },
@@ -217,7 +218,8 @@ fn required_for(name: &str) -> &'static [&'static str] {
     match name {
         "house" => &["spell"],
         "remember" => &["fact"],
-        "search_house" | "wiki" | "web_research" => &["query"],
+        "search_house" | "wiki" | "web_research" | "papers" => &["query"],
+        "doi_lookup" => &["doi"],
         "execute_bash" => &["command"],
         "read_local_file" | "write_local_file" | "list_dir" => &["path"],
         "edit_local_file" => &["path", "old_string", "new_string"],
@@ -278,6 +280,8 @@ mod tests {
         assert!(names.contains(&"wiki"));
         assert!(!names.contains(&"web_research"));
         assert!(!names.contains(&"fetch_web_page"));
+        assert!(!names.contains(&"papers"));
+        assert!(!names.contains(&"doi_lookup"));
     }
 
     #[test]

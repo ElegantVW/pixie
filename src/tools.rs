@@ -54,6 +54,8 @@ pub fn alias(name: &str) -> &str {
         "search_web" | "web_search" => "web_research",
         "fetch_url" | "open_url" | "read_page" => "fetch_web_page",
         "wikipedia" | "wiki_search" => "wiki",
+        "paper" | "crossref" | "scholar" => "papers",
+        "doi" | "lookup_doi" | "check_doi" => "doi_lookup",
         "grep_house" | "search_docs" => "search_house",
         "save_plan" | "plan" => "write_plan",
         "systemctl" => "manage_systemd_service",
@@ -114,9 +116,12 @@ pub fn norm_args(fname: &str, fargs: &Value) -> Value {
             "start_line": m.get("start_line"),
             "end_line": m.get("end_line"),
         }),
-        "web_research" => json!({
+        "web_research" | "papers" => json!({
             "query": first_str(m, &["query", "q", "search"]),
             "max_results": m.get("max_results").and_then(|x| x.as_i64()).unwrap_or(5),
+        }),
+        "doi_lookup" => json!({
+            "doi": first_str(m, &["doi", "id", "query"]),
         }),
         "check_mail" => {
             let b = first_str(m, &["box", "folder", "mailbox"]);
@@ -230,6 +235,8 @@ pub fn known_for(rune: RuneKey) -> &'static [&'static str] {
             "look",
         ],
         RuneKey::Deep => &[
+            "papers",
+            "doi_lookup",
             "web_research",
             "fetch_web_page",
             "wiki",
@@ -836,6 +843,38 @@ pub fn run_tool(
                             item.get("title").and_then(|x| x.as_str()).unwrap_or(""),
                         );
                     }
+                }
+            }
+            r
+        }
+        "papers" => {
+            let r = mind::papers(
+                fargs.get("query").and_then(|x| x.as_str()).unwrap_or(""),
+                fargs
+                    .get("max_results")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(5),
+            );
+            if !session_id.is_empty() {
+                if let Some(arr) = r.get("results").and_then(|x| x.as_array()) {
+                    for item in arr {
+                        let url = item.get("url").and_then(|x| x.as_str()).unwrap_or("");
+                        let title = item.get("title").and_then(|x| x.as_str()).unwrap_or("");
+                        mind::note_source(session_id, url, title);
+                    }
+                }
+            }
+            r
+        }
+        "doi_lookup" => {
+            let r = mind::doi_lookup(fargs.get("doi").and_then(|x| x.as_str()).unwrap_or(""));
+            if !session_id.is_empty() {
+                if let Some(work) = r.get("work") {
+                    mind::note_source(
+                        session_id,
+                        work.get("url").and_then(|x| x.as_str()).unwrap_or(""),
+                        work.get("title").and_then(|x| x.as_str()).unwrap_or(""),
+                    );
                 }
             }
             r
@@ -1976,6 +2015,8 @@ pub fn tool_label(name: &str) -> &str {
         "remember" => "remembering",
         "manage_systemd_service" => "service",
         "web_research" => "research",
+        "papers" => "papers",
+        "doi_lookup" => "doi",
         "fetch_web_page" => "fetch",
         "write_plan" => "plan",
         _ => name,
@@ -2573,6 +2614,19 @@ mod tests {
         assert!(
             msg.contains("Unknown tool") || msg.contains("web_research"),
             "{r}"
+        );
+        let p = run_tool(
+            "papers",
+            &json!({"query": "tau"}),
+            RuneKey::Chat,
+            "",
+            None,
+            None,
+        );
+        let pm = p["error"].as_str().unwrap_or("");
+        assert!(
+            pm.contains("Unknown tool") || pm.contains("papers"),
+            "{p}"
         );
     }
 

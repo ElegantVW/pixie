@@ -2,7 +2,7 @@
 
 **Role:** Local AI familiar with tools (files, shell, house spells), fully offline. `pixie` / `pixie "…"`; llama-server on `127.0.0.1:8080` via `menagerie`.
 
-**Status:** Rust engine (v0.3.19). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
+**Status:** Rust engine (v0.3.20). Python `bin/pixie` retired. Menagerie / ask / imp stay Python in this pass.
 
 ## Current
 
@@ -20,7 +20,7 @@
 - Bubbled TUI, Runes **Tab / Shift-Tab** from the Grove `cycle_next` /
   `cycle_previous` catalog (Ctrl-R remains a compatibility alias):
   - **Chat** (12) — house, remember, search_house, wiki, list_dir, grep_files, bash (`sh -c`, confirm), files, systemd, mail. **No Magpie search**.
-  - **Deep** (20) — light DDG HTML `web_research`, `fetch_web_page`, wiki, search_house, list_dir, grep_files. Never `menagerie ensure magpie`.
+  - **Deep** (20) — `papers` (Crossref), `doi_lookup`, wiki, `web_research` (DDG last), `fetch_web_page` (Magpie dump or curl). A Rust cite-audit strips unsourced DOIs/URLs before the reply is shown. Never `menagerie ensure magpie`.
   - **Build** (20) — inspect `~/pixie` first; `edit_local_file` / `write_local_file`; search_house.
   - **Plan** (20) — read-only bash allowlist + inspect + `write_plan` (cache only). Overlay shows the plan. y → Build in `~/pixie`.
 - Tool results are tagged `<tool_result>` (not llama `role: tool`). Kur `:8081` titles the first 10 user lines and adds the cute sparkle; the 8B does JSON, facts, and mid-thread compact. Sparkle is an Options toggle.

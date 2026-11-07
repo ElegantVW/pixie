@@ -540,7 +540,7 @@ pub fn run_turn(
         {
             deep_nudged = true;
             msgs.push(json!({"role": "assistant", "content": first}));
-            msgs.push(json!({"role": "user", "content": "<harness>That answer has no fetched page. Call fetch_web_page on a URL from the search results, then answer with Sources. This line is not the human.</harness>"}));
+            msgs.push(json!({"role": "user", "content": "<harness>That answer has no tool proof. Call papers, doi_lookup, or wiki first. Do not invent a DOI. This line is not the human.</harness>"}));
             continue;
         }
         if tool_calls.is_empty()
@@ -700,7 +700,7 @@ pub fn run_turn(
         }
 
         return TurnOut {
-            text: first,
+            text: mind::cite_audit(&first, session_id, &[]),
             think: think_txt,
             cancelled: false,
             err: None,

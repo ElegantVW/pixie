@@ -1400,6 +1400,272 @@ fn parse_ddg(html: &str, max: usize) -> Vec<Value> {
     items
 }
 
+pub const CANARY_DOI: &str = "10.1038/s41536-023-00289-0";
+
+pub fn papers(query: &str, max_results: i64) -> Value {
+    let query = query.trim();
+    if query.is_empty() {
+        return json!({"error": "empty query"});
+    }
+    let n = max_results.max(1).min(8);
+    let url = format!(
+        "https://api.crossref.org/works?query={}&rows={}&select=DOI,title,container-title,issued,URL",
+        urlencode(query),
+        n
+    );
+    match curl_get(&url, 25) {
+        Err(e) => json!({
+            "query": query,
+            "engine": "crossref",
+            "results": [],
+            "count": 0,
+            "error": e
+        }),
+        Ok(body) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+            let items = parse_crossref_list(&v);
+            json!({
+                "query": query,
+                "engine": "crossref",
+                "results": items,
+                "count": items.len()
+            })
+        }
+    }
+}
+
+pub fn doi_lookup(doi: &str) -> Value {
+    let doi = doi
+        .trim()
+        .trim_start_matches("https://doi.org/")
+        .trim_start_matches("http://doi.org/");
+    if doi.is_empty() {
+        return json!({"error": "empty doi"});
+    }
+    let url = format!("https://api.crossref.org/works/{}", urlencode(doi));
+    match curl_get(&url, 20) {
+        Err(e) => json!({"doi": doi, "found": false, "error": e}),
+        Ok(body) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+            if let Some(msg) = v.get("message") {
+                json!({
+                    "doi": doi,
+                    "found": true,
+                    "work": parse_crossref_work(msg)
+                })
+            } else {
+                json!({"doi": doi, "found": false, "error": "not a work"})
+            }
+        }
+    }
+}
+
+pub fn parse_crossref_list(v: &Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(arr) = v.pointer("/message/items").and_then(|x| x.as_array()) {
+        for it in arr {
+            items.push(parse_crossref_work(it));
+        }
+    }
+    items
+}
+
+pub fn parse_crossref_work(it: &Value) -> Value {
+    let doi = it.get("DOI").and_then(|x| x.as_str()).unwrap_or("");
+    let title = it
+        .get("title")
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let container = it
+        .get("container-title")
+        .and_then(|x| x.as_array())
+        .and_then(|a| a.first())
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let year = it
+        .pointer("/issued/date-parts/0/0")
+        .and_then(|x| x.as_i64());
+    let url = it
+        .get("URL")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if doi.is_empty() {
+                String::new()
+            } else {
+                format!("https://doi.org/{doi}")
+            }
+        });
+    json!({
+        "doi": doi,
+        "title": title,
+        "container": container,
+        "year": year,
+        "url": url
+    })
+}
+
+pub fn extract_dois(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let Some(i) = text[offset..].find("10.") else {
+            break;
+        };
+        let abs = offset + i;
+        if let Some(doi) = parse_doi_at(&text[abs..]) {
+            if !out.iter().any(|d| d == &doi) {
+                out.push(doi.clone());
+            }
+            offset = abs + doi.len();
+        } else {
+            offset = abs + 3;
+        }
+    }
+    out
+}
+
+fn parse_doi_at(s: &str) -> Option<String> {
+    if !s.starts_with("10.") {
+        return None;
+    }
+    let after = &s[3..];
+    let mut n_digits = 0usize;
+    for c in after.chars() {
+        if c.is_ascii_digit() {
+            n_digits += 1;
+        } else {
+            break;
+        }
+    }
+    if !(4..=9).contains(&n_digits) {
+        return None;
+    }
+    let rest = &after[n_digits..];
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let suffix = &rest[1..];
+    let mut len = 0usize;
+    for c in suffix.chars() {
+        if c.is_ascii_alphanumeric() || "-._;()/:".contains(c) {
+            len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if len == 0 {
+        return None;
+    }
+    let mut doi = format!("10.{}/{}", &after[..n_digits], &suffix[..len]);
+    while doi.ends_with('.') || doi.ends_with(',') || doi.ends_with(';') {
+        doi.pop();
+    }
+    Some(doi)
+}
+
+pub fn extract_http_urls(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for prefix in ["https://", "http://"] {
+        let mut offset = 0usize;
+        while offset < text.len() {
+            let Some(i) = text[offset..].find(prefix) else {
+                break;
+            };
+            let abs = offset + i;
+            let rest = &text[abs..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || "<>\"')]" .contains(c))
+                .unwrap_or(rest.len());
+            let mut url = rest[..end].trim_end_matches(['.', ',', ';']).to_string();
+            if url.ends_with(')') && !url.contains('(') {
+                url.pop();
+            }
+            if url.len() > prefix.len() && !out.iter().any(|u| u == &url) {
+                out.push(url);
+            }
+            offset = abs + end.max(1);
+        }
+    }
+    out
+}
+
+fn allowed_has(allowed: &[String], cite: &str) -> bool {
+    let c = cite.to_lowercase();
+    let c_doi = c.trim_start_matches("https://doi.org/");
+    allowed.iter().any(|a| {
+        let a = a.to_lowercase();
+        let a_doi = a.trim_start_matches("https://doi.org/");
+        a.contains(&c) || c.contains(&a) || a_doi == c_doi || a.contains(c_doi)
+    })
+}
+
+fn strip_cite(text: &str, cite: &str) -> String {
+    let mut out = text.to_string();
+    if let Some(i) = out.find(cite) {
+        let before = &out[..i];
+        if let Some(lb) = before.rfind('[') {
+            if before[lb..].contains("](") {
+                if let Some(rb) = out[i..].find(')') {
+                    out.replace_range(lb..i + rb + 1, "");
+                    return out;
+                }
+            }
+        }
+    }
+    out.replace(cite, "")
+}
+
+fn looks_empty_after_audit(text: &str) -> bool {
+    let t = text
+        .replace("cite-audit:", "")
+        .replace("Sources:", "")
+        .replace("sources:", "");
+    t.chars().filter(|c| c.is_alphanumeric()).count() < 24
+}
+
+/// Drop DOIs/URLs that no tool put in the session proof pack.
+pub fn cite_audit(text: &str, session_id: &str, extra: &[String]) -> String {
+    let mut allowed: Vec<String> = extra.to_vec();
+    for v in listed_sources(session_id) {
+        for k in ["url", "doi", "title"] {
+            if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    allowed.push(s.to_string());
+                }
+            }
+        }
+    }
+    let mut drop_n = 0usize;
+    let mut out = text.to_string();
+    for doi in extract_dois(&out) {
+        if !allowed_has(&allowed, &doi) {
+            out = strip_cite(&out, &doi);
+            out = strip_cite(&out, &format!("https://doi.org/{doi}"));
+            drop_n += 1;
+        }
+    }
+    for url in extract_http_urls(&out) {
+        if url.to_lowercase().contains("doi.org/") {
+            continue;
+        }
+        if !allowed_has(&allowed, &url) {
+            out = strip_cite(&out, &url);
+            drop_n += 1;
+        }
+    }
+    let trimmed = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if drop_n == 0 {
+        return text.to_string();
+    }
+    if looks_empty_after_audit(&trimmed) {
+        return "I do not have a source for that. I will not invent a paper.".into();
+    }
+    format!("{trimmed}\n\ncite-audit: dropped {drop_n} unsourced DOI/URL.")
+}
+
 pub fn read_page(url: &str, max_chars: usize) -> Value {
     let url = url.trim();
     if url.is_empty() {
@@ -1410,20 +1676,29 @@ pub fn read_page(url: &str, max_chars: usize) -> Value {
         .args(["browse", "--dump", url])
         .env("PATH", paths::house_path())
         .output();
-    match out {
-        Err(e) => json!({"error": format!("magpie: {e}"), "url": url}),
+    let mut text = match out {
         Ok(o) => {
-            let mut text = String::from_utf8_lossy(&o.stdout).to_string();
-            if text.trim().is_empty() {
-                text = String::from_utf8_lossy(&o.stderr).to_string();
+            let mut t = String::from_utf8_lossy(&o.stdout).to_string();
+            if t.trim().is_empty() {
+                t = String::from_utf8_lossy(&o.stderr).to_string();
             }
-            if text.len() > max_chars {
-                text.truncate(max_chars);
-                text.push('…');
+            t
+        }
+        Err(_) => String::new(),
+    };
+    if text.trim().is_empty() {
+        match curl_get(url, 25) {
+            Ok(body) => text = strip_tags(&body),
+            Err(e) => {
+                return json!({"error": format!("fetch failed: {e}"), "url": url});
             }
-            json!({"url": url, "title": "", "text": text})
         }
     }
+    if text.len() > max_chars {
+        text.truncate(max_chars);
+        text.push('…');
+    }
+    json!({"url": url, "title": "", "text": text})
 }
 
 pub fn note_source(session_id: &str, url: &str, title: &str) {
@@ -1434,7 +1709,16 @@ pub fn note_source(session_id: &str, url: &str, title: &str) {
     let _ = fs::create_dir_all(&dir);
     let p = dir.join(format!("{session_id}.jsonl"));
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(f, "{}", json!({"url": url, "title": title}));
+        let doi = if url.contains("doi.org/") {
+            url.rsplit("doi.org/").next().unwrap_or("")
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            f,
+            "{}",
+            json!({"url": url, "title": title, "doi": doi})
+        );
     }
 }
 
@@ -2229,5 +2513,46 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(matches!(task.join().unwrap(), SpawnOut::Err(message) if message == "cancelled"));
+    }
+
+    #[test]
+    fn cite_audit_drops_canary_doi_without_proof() {
+        let draft = format!(
+            "See Nature Neuroscience doi:{CANARY_DOI} https://doi.org/{CANARY_DOI}"
+        );
+        let out = cite_audit(&draft, "no-such-session", &[]);
+        assert!(
+            !out.contains(CANARY_DOI),
+            "unsourced canary must not survive: {out}"
+        );
+        assert!(
+            out.contains("will not invent") || out.contains("cite-audit"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cite_audit_keeps_doi_in_the_pack() {
+        let draft = format!("Paper {CANARY_DOI} is in the pack.");
+        let out = cite_audit(&draft, "no-such-session", &[CANARY_DOI.to_string()]);
+        assert!(out.contains(CANARY_DOI), "{out}");
+        assert!(!out.contains("cite-audit"), "{out}");
+    }
+
+    #[test]
+    fn extract_doi_and_crossref_fixture() {
+        assert_eq!(
+            extract_dois("doi: 10.1038/s41536-023-00289-0."),
+            vec![CANARY_DOI.to_string()]
+        );
+        let work = parse_crossref_work(&json!({
+            "DOI": CANARY_DOI,
+            "title": ["Not Nature Neuroscience"],
+            "container-title": ["npj Regenerative Medicine"],
+            "issued": {"date-parts": [[2023]]},
+            "URL": format!("https://doi.org/{CANARY_DOI}")
+        }));
+        assert_eq!(work["container"], "npj Regenerative Medicine");
+        assert_ne!(work["container"], "Nature Neuroscience");
     }
 }

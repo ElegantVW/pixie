@@ -1,5 +1,11 @@
 # Pixie changelog
 
+## v0.3.20 research cite-audit (2026-11-07)
+
+- Deep stays. New programmed tools: `papers` (Crossref) and `doi_lookup`. `fetch_web_page` falls back to curl if Magpie dump is empty.
+- **cite-audit** (Rust, no model) strips DOIs/URLs that no tool put in the session proof pack, on TUI and Auto. Invented papers cannot leave the house.
+- Chat-kind Auto may call `wiki` / `papers` / `doi_lookup` only. Chat rune still has no live web.
+
 ## v0.3.19 no echo loop + priority contacts (2026-11-06)
 
 - Auto stamps every send (echo ledger + MsgID) and skips FromMe that match a house template or a recent echo, so Message yourself cannot eat its own tail. `pixie --wa-self -- <text>` is the stamped Korda door. Menu tokens (`1`/`2`/`3`/…) are not enqueued as Korda body.
